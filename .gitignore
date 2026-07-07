@@ -1,0 +1,16 @@
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+runs/*
+!runs/training-mining-known/
+runs/training-mining-known/*
+!runs/training-mining-known/public-sanitized/
+!runs/training-mining-known/public-sanitized/training_examples.jsonl
+.env
+.env.local
+*.pem
+*.key

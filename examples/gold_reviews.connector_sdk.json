@@ -1,0 +1,79 @@
+{
+  "schema_version": "0.1",
+  "description": "Synthetic regression expectations for connector review behavior.",
+  "pattern_catalog": [
+    {
+      "id": "oauth_doc_drift",
+      "source_reviews": ["sample-sdk-migration"],
+      "category": "api_auth_correctness",
+      "summary": "Auth fields, README, and release notes must not claim OAuth support when executable code is token-only.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "sparse_output_models",
+      "source_reviews": ["sample-sdk-migration"],
+      "category": "output_schema_mismatch",
+      "summary": "SDK output models built from raw API dictionaries must tolerate optional and sparse fields.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "live_only_tests",
+      "source_reviews": ["sample-sdk-migration"],
+      "category": "missing_tests",
+      "summary": "SDK migration tests that require live tenant credentials do not replace offline tests for model construction, endpoint building, and error payloads.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "request_timeouts",
+      "source_reviews": ["sample-legacy-connector"],
+      "category": "api_auth_correctness",
+      "summary": "Direct request/helper/session calls need explicit timeouts so API failures do not hang workers.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "unsafe_debug_data",
+      "source_reviews": ["sample-legacy-connector"],
+      "category": "unsafe_logging",
+      "summary": "Debug data should not include full response text, response headers, tokens, tenant data, or full payloads.",
+      "bot_coverage": ["deterministic", "prompt"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "sample-sdk-migration",
+      "repo": "example-org/cloudstorage",
+      "pr_number": 36,
+      "artifacts_dir": "runs/example-org-cloudstorage-36",
+      "expected": [
+        {
+          "id": "token-auth-doc-drift",
+          "terms": ["token-only", "OAuth"]
+        },
+        {
+          "id": "sparse-output-fields",
+          "terms": ["output models", "omit"]
+        },
+        {
+          "id": "sdk-migration-tests-missing",
+          "terms": ["SDK migration", "tests"]
+        }
+      ]
+    },
+    {
+      "id": "sample-legacy-connector",
+      "repo": "example-org/threatintel",
+      "pr_number": 2,
+      "artifacts_dir": "runs/example-org-threatintel-2",
+      "expected": [
+        {
+          "id": "request-timeouts",
+          "terms": ["Direct requests call", "timeout"]
+        },
+        {
+          "id": "unsafe-debug-data",
+          "terms": ["Debug data", "headers"]
+        }
+      ]
+    }
+  ]
+}

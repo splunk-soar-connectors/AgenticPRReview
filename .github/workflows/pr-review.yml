@@ -1,0 +1,135 @@
+name: PR Review Bot
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: Repository to review in owner/name form.
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number to review.
+        required: true
+        type: string
+      circuit_base_url:
+        description: Full CIRCUIT chat completions endpoint.
+        required: true
+        type: string
+      circuit_model:
+        description: CIRCUIT model name.
+        required: true
+        type: string
+      circuit_token_url:
+        description: CIRCUIT OAuth token endpoint.
+        required: true
+        type: string
+      publish_comments:
+        description: Publish GitHub comments and apply the ai-reviewed label.
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AI_REVIEW_APP_ID:
+        required: true
+      AI_REVIEW_INSTALLATION_ID:
+        required: true
+      AI_REVIEW_PRIVATE_KEY:
+        required: true
+      CIRCUIT_CLIENT_ID:
+        required: true
+      CIRCUIT_CLIENT_SECRET:
+        required: true
+      CIRCUIT_APP_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  review:
+    name: Review pull request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AI_REVIEW_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEW_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            AgenticPRReview
+            ${{ github.event.repository.name }}
+
+      - name: Checkout review bot
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/AgenticPRReview
+          path: AgenticPRReview
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install review bot
+        working-directory: AgenticPRReview
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Ensure ai-reviewed label exists
+        if: inputs.publish_comments
+        env:
+          # gh expects this variable name; the value is the GitHub App installation token, not a PAT.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ inputs.repo }}
+        run: |
+          gh api "repos/${GH_REPO}/labels/ai-reviewed" --silent >/dev/null 2>&1 || \
+            gh api "repos/${GH_REPO}/labels" \
+              -f name='ai-reviewed' \
+              -f color='5319e7' \
+              -f description='Reviewed by the agentic PR review bot' >/dev/null
+
+      - name: Run PR review bot
+        working-directory: AgenticPRReview
+        env:
+          AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
+          AI_REVIEW_INSTALLATION_ID: ${{ secrets.AI_REVIEW_INSTALLATION_ID }}
+          AI_REVIEW_PRIVATE_KEY: ${{ secrets.AI_REVIEW_PRIVATE_KEY }}
+          MODEL_PROVIDER: circuit
+          CIRCUIT_BASE_URL: ${{ inputs.circuit_base_url }}
+          CIRCUIT_MODEL: ${{ inputs.circuit_model }}
+          CIRCUIT_TOKEN_URL: ${{ inputs.circuit_token_url }}
+          CIRCUIT_CLIENT_ID: ${{ secrets.CIRCUIT_CLIENT_ID }}
+          CIRCUIT_CLIENT_SECRET: ${{ secrets.CIRCUIT_CLIENT_SECRET }}
+          CIRCUIT_APP_KEY: ${{ secrets.CIRCUIT_APP_KEY }}
+          REVIEW_REPO: ${{ inputs.repo }}
+          REVIEW_PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_OUTPUT_DIR: ${{ github.workspace }}/AgenticPRReview/runs
+        run: |
+          args=(
+            review "${REVIEW_REPO}" "${REVIEW_PR_NUMBER}"
+            --output-dir "${REVIEW_OUTPUT_DIR}"
+          )
+          if [[ "${{ inputs.publish_comments }}" == "true" ]]; then
+            args+=(--publish-comments)
+          fi
+          python -m agentic_pr_review.cli "${args[@]}"
+
+      - name: Upload review artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-review-${{ inputs.pr_number }}
+          path: AgenticPRReview/runs/
+          if-no-files-found: ignore
+
+# This workflow intentionally does not pass --enable-sdk-manifest. It may run
+# from pull_request_target callers with repository secrets, so it must not
+# execute untrusted PR code.

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-pr-review"
+version = "0.1.0"
+description = "Local dry-run prototype for SOAR connector PR review using a CIRCUIT-compatible model gateway."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyJWT[crypto]>=2.8",
+]
+
+[project.scripts]
+agentic-pr-review = "agentic_pr_review.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
