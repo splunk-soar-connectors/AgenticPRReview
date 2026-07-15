@@ -9,7 +9,7 @@ import unittest
 
 from agentic_pr_review.gateway_claude import GatewayClaudeReviewer, extract_chat_completion_text, mask_secret_for_github_actions
 from agentic_pr_review.config import RuntimeConfig
-from agentic_pr_review.secret_redactor import REDACTED_AUTH, REDACTED_SECRET, secret_fingerprint
+from agentic_pr_review.secret_redactor import REDACTED_AUTH, REDACTED_SECRET
 
 
 class GatewayClaudeTest(unittest.TestCase):
@@ -134,8 +134,7 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
-        self.assertEqual(json.loads(model_payload["user"]), {"appkey_fingerprint": secret_fingerprint("app-key-test")})
-        self.assertNotIn("app-key-test", model_body)
+        self.assertEqual(json.loads(model_payload["user"]), {"appkey": "app-key-test"})
         self.assertNotIn("model", model_payload)
         self.assertEqual(model_payload["max_tokens"], 123)
         self.assertEqual(model_payload["messages"][0]["role"], "system")
@@ -346,7 +345,7 @@ class GatewayClaudeTest(unittest.TestCase):
         model_body = bodies[1]
         self.assertIn(REDACTED_SECRET, model_body)
         self.assertNotIn("canary-direct-secret", model_body)
-        self.assertNotIn("canary-app-key-direct", model_body)
+        self.assertEqual(json.loads(json.loads(model_body)["user"]), {"appkey": "canary-app-key-direct"})
 
     def test_extract_chat_completion_text(self):
         payload = {"choices": [{"message": {"content": "{\"summary\":\"ok\"}"}}]}

@@ -18,7 +18,7 @@ from .json_utils import extract_json_object
 from .models import normalize_review_output
 from .progress import AdaptiveETA, format_duration
 from .prompt import SYSTEM_PROMPT, build_synthesis_prompt, build_user_prompt
-from .secret_redactor import redact_obj, redact_text, secret_fingerprint
+from .secret_redactor import redact_obj, redact_text
 
 
 GATEWAY_HEARTBEAT_SECONDS = 60
@@ -150,7 +150,9 @@ class GatewayClaudeReviewer:
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "user": json.dumps({"appkey_fingerprint": secret_fingerprint(self.config.gateway_app_key)}),
+            # CIRCUIT validates this exact JSON string metadata field.
+            # It is auth metadata, not part of the chat prompt.
+            "user": json.dumps({"appkey": self.config.gateway_app_key}),
         }
         if should_include_model_in_body(str(self.config.gateway_base_url or "")):
             body["model"] = self.config.gateway_model

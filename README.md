@@ -54,8 +54,8 @@ memory, refreshes it before expiry, and retries once after a 401 or 403 model
 response. The generic `GATEWAY_*` names are also supported for local testing,
 but the reusable workflow keeps the existing `CIRCUIT_*` interface.
 Runtime credential values are redacted from model prompts, errors, saved
-artifacts, and published comments. The CIRCUIT app key is represented in model
-request metadata by a non-reversible fingerprint rather than the raw secret.
+artifacts, and published comments. The CIRCUIT app key is sent only as required
+gateway request metadata in the `user` JSON string, not inside the chat prompt.
 
 The CLI does not auto-load credential files. For local development only, you
 can point `AGENTIC_PR_REVIEW_ENV_FILE` at an ignored env file.
