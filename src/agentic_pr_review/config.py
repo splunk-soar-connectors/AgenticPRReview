@@ -10,6 +10,9 @@ from pathlib import Path
 DEFAULT_MAX_PATCH_CHARS = 50_000
 DEFAULT_MAX_FILE_CHARS = 650_000
 DEFAULT_MAX_MODEL_INPUT_CHARS = 145_000
+DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECONDS = 300
+DEFAULT_GATEWAY_REQUEST_MAX_ATTEMPTS = 3
+DEFAULT_GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS = 5.0
 DEFAULT_ENV_FILES: tuple[str, ...] = ()
 
 
@@ -46,6 +49,9 @@ class RuntimeConfig:
     gateway_client_id: str | None
     gateway_client_secret: str | None
     gateway_token_url: str | None
+    gateway_request_timeout_seconds: int = DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECONDS
+    gateway_request_max_attempts: int = DEFAULT_GATEWAY_REQUEST_MAX_ATTEMPTS
+    gateway_request_retry_backoff_seconds: float = DEFAULT_GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS
     max_patch_chars: int = DEFAULT_MAX_PATCH_CHARS
     max_file_chars: int = DEFAULT_MAX_FILE_CHARS
     max_model_input_chars: int = DEFAULT_MAX_MODEL_INPUT_CHARS
@@ -84,6 +90,21 @@ class RuntimeConfig:
             gateway_client_id=os.getenv("GATEWAY_CLIENT_ID") or os.getenv("CIRCUIT_CLIENT_ID"),
             gateway_client_secret=os.getenv("GATEWAY_CLIENT_SECRET") or os.getenv("CIRCUIT_CLIENT_SECRET"),
             gateway_token_url=os.getenv("GATEWAY_TOKEN_URL") or os.getenv("CIRCUIT_TOKEN_URL"),
+            gateway_request_timeout_seconds=parse_positive_int_env(
+                "GATEWAY_REQUEST_TIMEOUT_SECONDS",
+                "CIRCUIT_REQUEST_TIMEOUT_SECONDS",
+                default=DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECONDS,
+            ),
+            gateway_request_max_attempts=parse_positive_int_env(
+                "GATEWAY_REQUEST_MAX_ATTEMPTS",
+                "CIRCUIT_REQUEST_MAX_ATTEMPTS",
+                default=DEFAULT_GATEWAY_REQUEST_MAX_ATTEMPTS,
+            ),
+            gateway_request_retry_backoff_seconds=parse_nonnegative_float_env(
+                "GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS",
+                "CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS",
+                default=DEFAULT_GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS,
+            ),
             max_patch_chars=max_patch_chars,
             max_file_chars=max_file_chars,
             max_model_input_chars=max_model_input_chars,
@@ -134,3 +155,29 @@ def normalize_model_provider(value: str) -> str:
         "gateway-api": "gateway",
     }
     return aliases.get(provider, provider)
+
+
+def parse_positive_int_env(*names: str, default: int) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return max(1, value)
+    return default
+
+
+def parse_nonnegative_float_env(*names: str, default: float) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        return max(0.0, value)
+    return default

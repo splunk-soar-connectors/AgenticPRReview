@@ -194,15 +194,31 @@ class GatewayClaudeReviewer:
         return normalized
 
     def _post_model_json(self, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return self._post_model_json_once(body)
-        except HTTPError as exc:
-            if exc.code not in GATEWAY_AUTH_RETRY_STATUS_CODES:
-                raise
-            self.progress("Gateway model auth failed; refreshing token and retrying once.")
-            self._access_token = None
-            self._access_token_expires_at = 0.0
-            return self._post_model_json_once(body)
+        max_attempts = max(1, int(self.config.gateway_request_max_attempts))
+        attempt = 1
+        auth_refreshed = False
+        while True:
+            try:
+                return self._post_model_json_once(body)
+            except HTTPError as exc:
+                if exc.code not in GATEWAY_AUTH_RETRY_STATUS_CODES or auth_refreshed:
+                    raise
+                self.progress("Gateway model auth failed; refreshing token and retrying once.")
+                self._access_token = None
+                self._access_token_expires_at = 0.0
+                auth_refreshed = True
+                continue
+            except (TimeoutError, URLError, OSError) as exc:
+                if attempt >= max_attempts:
+                    raise
+                delay = self.config.gateway_request_retry_backoff_seconds * attempt
+                self.progress(
+                    f"Gateway model request failed transiently on attempt {attempt}/{max_attempts}: "
+                    f"{redact_text(format_http_error(exc))}. Retrying in {format_duration(delay)}."
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                attempt += 1
 
     def _post_model_json_once(self, body: dict[str, Any]) -> dict[str, Any]:
         request = Request(
@@ -211,7 +227,7 @@ class GatewayClaudeReviewer:
             headers=self._model_headers(),
             method="POST",
         )
-        with urlopen(request, timeout=180) as response:
+        with urlopen(request, timeout=self.config.gateway_request_timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _model_headers(self) -> dict[str, str]:

@@ -46,13 +46,19 @@ export CIRCUIT_APP_KEY="<app key>"
 export CIRCUIT_CLIENT_ID="<oauth client id>"
 export CIRCUIT_CLIENT_SECRET="<oauth client secret>"
 export CIRCUIT_TOKEN_URL="<oauth token endpoint>"
+export CIRCUIT_REQUEST_TIMEOUT_SECONDS="300"
+export CIRCUIT_REQUEST_MAX_ATTEMPTS="3"
+export CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS="5"
 ```
 
 The provider exchanges `CIRCUIT_CLIENT_ID` and
 `CIRCUIT_CLIENT_SECRET` at `CIRCUIT_TOKEN_URL`, caches the returned token in
 memory, refreshes it before expiry, and retries once after a 401 or 403 model
-response. The generic `GATEWAY_*` names are also supported for local testing,
-but the reusable workflow keeps the existing `CIRCUIT_*` interface.
+response. Model requests use a 300-second read timeout by default and retry
+transient timeout/network failures up to three total attempts without shrinking
+the prompt or chunks. The generic `GATEWAY_*` names are also supported for
+local testing, but the reusable workflow keeps the existing `CIRCUIT_*`
+interface.
 Runtime credential values are redacted from model prompts, errors, saved
 artifacts, and published comments. The CIRCUIT app key is sent only as required
 gateway request metadata in the `user` JSON string, not inside the chat prompt.
@@ -189,6 +195,9 @@ jobs:
       circuit_base_url: ${{ vars.CIRCUIT_BASE_URL }}
       circuit_model: ${{ vars.CIRCUIT_MODEL }}
       circuit_token_url: ${{ vars.CIRCUIT_TOKEN_URL }}
+      circuit_request_timeout_seconds: "300"
+      circuit_request_max_attempts: "3"
+      circuit_request_retry_backoff_seconds: "5"
     secrets:
       AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
       AI_REVIEW_INSTALLATION_ID: ${{ secrets.AI_REVIEW_INSTALLATION_ID }}

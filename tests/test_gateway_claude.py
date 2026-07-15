@@ -30,7 +30,31 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(config.model_provider, "gateway")
         self.assertEqual(config.gateway_model, "claude-sonnet-4-6")
+        self.assertEqual(config.gateway_request_timeout_seconds, 300)
+        self.assertEqual(config.gateway_request_max_attempts, 3)
         config.require_model()
+
+    def test_runtime_config_accepts_gateway_retry_settings(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+            "GATEWAY_REQUEST_TIMEOUT_SECONDS": "420",
+            "GATEWAY_REQUEST_MAX_ATTEMPTS": "4",
+            "GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS": "0.25",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+
+        self.assertEqual(config.gateway_request_timeout_seconds, 420)
+        self.assertEqual(config.gateway_request_max_attempts, 4)
+        self.assertEqual(config.gateway_request_retry_backoff_seconds, 0.25)
 
     def test_runtime_config_accepts_legacy_circuit_env_names(self):
         env = {
@@ -130,7 +154,7 @@ class GatewayClaudeTest(unittest.TestCase):
         model_request, model_timeout, model_body = calls[1]
         model_headers = {key.lower(): value for key, value in model_request.header_items()}
         model_payload = json.loads(model_body)
-        self.assertEqual(model_timeout, 180)
+        self.assertEqual(model_timeout, 300)
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
@@ -214,6 +238,75 @@ class GatewayClaudeTest(unittest.TestCase):
         final_headers = {key.lower(): value for key, value in calls[-1][0].header_items()}
         self.assertEqual(final_headers["authorization"], "Bearer access-token-2")
         self.assertEqual(final_headers["api-key"], "access-token-2")
+
+    def test_gateway_review_retries_transient_model_timeout(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+            "GATEWAY_REQUEST_TIMEOUT_SECONDS": "420",
+            "GATEWAY_REQUEST_MAX_ATTEMPTS": "3",
+            "GATEWAY_REQUEST_RETRY_BACKOFF_SECONDS": "0",
+        }
+        calls = []
+        model_attempt = 0
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            nonlocal model_attempt
+            calls.append((request, timeout))
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-retry", "expires_in": 3600})
+            model_attempt += 1
+            if model_attempt == 1:
+                raise TimeoutError("timed out")
+            return Response(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "ok",
+                                        "overall_status": "looks_good",
+                                        "safe_to_publish": True,
+                                        "findings": [],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+            output = reviewer._invoke_review("review this", [])
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual([call[0].full_url.endswith("/token") for call in calls], [True, False, False])
+        self.assertEqual([call[1] for call in calls], [60, 420, 420])
 
     def test_gateway_token_refreshes_when_expiry_is_inside_skew_window(self):
         env = {

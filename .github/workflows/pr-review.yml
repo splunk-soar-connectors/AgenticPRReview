@@ -23,6 +23,21 @@ on:
         description: CIRCUIT OAuth token endpoint.
         required: true
         type: string
+      circuit_request_timeout_seconds:
+        description: Per-request CIRCUIT model timeout in seconds.
+        required: false
+        type: string
+        default: "300"
+      circuit_request_max_attempts:
+        description: Maximum CIRCUIT model attempts for transient timeout/network failures.
+        required: false
+        type: string
+        default: "3"
+      circuit_request_retry_backoff_seconds:
+        description: Base delay between CIRCUIT model retries.
+        required: false
+        type: string
+        default: "5"
       publish_comments:
         description: Publish GitHub comments and apply the ai-reviewed label.
         required: false
@@ -135,6 +150,9 @@ jobs:
           CIRCUIT_BASE_URL: ${{ inputs.circuit_base_url }}
           CIRCUIT_MODEL: ${{ inputs.circuit_model }}
           CIRCUIT_TOKEN_URL: ${{ inputs.circuit_token_url }}
+          CIRCUIT_REQUEST_TIMEOUT_SECONDS: ${{ inputs.circuit_request_timeout_seconds }}
+          CIRCUIT_REQUEST_MAX_ATTEMPTS: ${{ inputs.circuit_request_max_attempts }}
+          CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS: ${{ inputs.circuit_request_retry_backoff_seconds }}
           CIRCUIT_CLIENT_ID: ${{ secrets.CIRCUIT_CLIENT_ID }}
           CIRCUIT_CLIENT_SECRET: ${{ secrets.CIRCUIT_CLIENT_SECRET }}
           CIRCUIT_APP_KEY: ${{ secrets.CIRCUIT_APP_KEY }}
