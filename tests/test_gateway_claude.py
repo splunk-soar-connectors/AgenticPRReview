@@ -7,7 +7,12 @@ from urllib.parse import parse_qs
 from unittest.mock import patch
 import unittest
 
-from agentic_pr_review.gateway_claude import GatewayClaudeReviewer, extract_chat_completion_text, mask_secret_for_github_actions
+from agentic_pr_review.gateway_claude import (
+    GatewayClaudeReviewer,
+    GatewayModelFormatError,
+    extract_chat_completion_text,
+    mask_secret_for_github_actions,
+)
 from agentic_pr_review.config import RuntimeConfig
 from agentic_pr_review.secret_redactor import REDACTED_AUTH, REDACTED_SECRET
 
@@ -160,6 +165,9 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(model_headers["api-key"], "access-token-test")
         self.assertEqual(json.loads(model_payload["user"]), {"appkey": "app-key-test"})
         self.assertNotIn("model", model_payload)
+        self.assertEqual(model_payload["response_format"]["type"], "json_schema")
+        self.assertEqual(model_payload["response_format"]["json_schema"]["name"], "agentic_pr_review_output")
+        self.assertTrue(model_payload["response_format"]["json_schema"]["strict"])
         self.assertEqual(model_payload["max_tokens"], 123)
         self.assertEqual(model_payload["messages"][0]["role"], "system")
         self.assertEqual(model_payload["messages"][1]["content"], "review this")
@@ -308,6 +316,76 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual([call[0].full_url.endswith("/token") for call in calls], [True, False, False])
         self.assertEqual([call[1] for call in calls], [60, 420, 420])
 
+    def test_gateway_downgrades_response_format_when_gateway_rejects_schema_mode(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        model_response_formats = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-test", "expires_in": 3600})
+            model_payload = json.loads(request.data.decode("utf-8"))
+            model_response_formats.append(model_payload.get("response_format"))
+            if model_payload.get("response_format", {}).get("type") == "json_schema":
+                raise HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    {},
+                    BytesIO(b'{"error":"unsupported response_format json_schema"}'),
+                )
+            return Response(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "ok",
+                                        "overall_status": "looks_good",
+                                        "safe_to_publish": True,
+                                        "findings": [],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+            output = reviewer._invoke_review("review this", [])
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual([item["type"] for item in model_response_formats], ["json_schema", "json_object"])
+        self.assertEqual(reviewer._response_format_mode, "json_object")
+
     def test_gateway_token_refreshes_when_expiry_is_inside_skew_window(self):
         env = {
             "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
@@ -439,6 +517,235 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertIn(REDACTED_SECRET, model_body)
         self.assertNotIn("canary-direct-secret", model_body)
         self.assertEqual(json.loads(json.loads(model_body)["user"]), {"appkey": "canary-app-key-direct"})
+
+    def test_gateway_repairs_non_json_model_response(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        bodies = []
+        model_attempt = 0
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            nonlocal model_attempt
+            body = request.data.decode("utf-8")
+            bodies.append(body)
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-test", "expires_in": 3600})
+            model_attempt += 1
+            if model_attempt == 1:
+                return Response({"choices": [{"message": {"content": "I found no concrete issue here."}}]})
+            return Response(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "ok",
+                                        "overall_status": "looks_good",
+                                        "safe_to_publish": True,
+                                        "findings": [],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+            output = reviewer._invoke_review("review this", [])
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertIn("Recovered from a non-JSON model response", output["model_notes"])
+        self.assertEqual(len(bodies), 3)
+        repair_body = json.loads(bodies[2])
+        self.assertIn("Your previous response was not valid JSON", repair_body["messages"][1]["content"])
+        self.assertIn("I found no concrete issue here.", repair_body["messages"][1]["content"])
+
+    def test_gateway_retries_original_review_when_json_repair_fails(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        bodies = []
+        model_attempt = 0
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            nonlocal model_attempt
+            body = request.data.decode("utf-8")
+            bodies.append(body)
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-test", "expires_in": 3600})
+            model_attempt += 1
+            if model_attempt < 3:
+                return Response({"choices": [{"message": {"content": "still not json"}}]})
+            return Response(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "strict retry ok",
+                                        "overall_status": "looks_good",
+                                        "safe_to_publish": True,
+                                        "findings": [],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+            output = reviewer._invoke_review("review this exact chunk", [])
+
+        self.assertEqual(output["summary"], "strict retry ok")
+        self.assertIn("strict JSON retry", output["model_notes"])
+        self.assertEqual(len(bodies), 4)
+        retry_body = json.loads(bodies[3])
+        self.assertIn("Retry the original review request", retry_body["messages"][1]["content"])
+        self.assertIn("review this exact chunk", retry_body["messages"][1]["content"])
+
+    def test_gateway_invalid_json_after_repair_raises_format_error(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "canary-format-secret",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        model_attempt = 0
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            nonlocal model_attempt
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-test", "expires_in": 3600})
+            model_attempt += 1
+            return Response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": f"still prose with canary-format-secret attempt {model_attempt}"
+                            }
+                        }
+                    ]
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+            reviewer = GatewayClaudeReviewer(config)
+            with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+                with self.assertRaises(GatewayModelFormatError) as caught:
+                    reviewer._invoke_review("review this", [])
+
+        self.assertIn("Gateway model did not return valid JSON after repair and strict retry", str(caught.exception))
+        self.assertIn(REDACTED_SECRET, str(caught.exception))
+        self.assertNotIn("canary-format-secret", str(caught.exception))
+
+    def test_deep_review_does_not_skip_chunks_when_format_recovery_fails(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {"number": 1, "title": "test"},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "chunk-1",
+                        "path": "__init__.py",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "-# 2025\n+# 2025-2026\n",
+                    }
+                ]
+            },
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(reviewer, "_invoke_review", side_effect=GatewayModelFormatError("bad json")):
+            with self.assertRaises(GatewayModelFormatError):
+                reviewer.review_deep(review_input, [])
 
     def test_extract_chat_completion_text(self):
         payload = {"choices": [{"message": {"content": "{\"summary\":\"ok\"}"}}]}

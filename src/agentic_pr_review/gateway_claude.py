@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
+from io import BytesIO
 import json
 import os
 import threading
@@ -14,7 +16,7 @@ from urllib.request import Request, urlopen
 
 from .config import RuntimeConfig
 from .deep_review import build_chunk_review_input, dedupe_findings, filter_findings_for_chunk
-from .json_utils import extract_json_object
+from .json_utils import extract_json_object, truncate_text
 from .models import normalize_review_output
 from .progress import AdaptiveETA, format_duration
 from .prompt import SYSTEM_PROMPT, build_synthesis_prompt, build_user_prompt
@@ -24,9 +26,83 @@ from .secret_redactor import redact_obj, redact_text
 GATEWAY_HEARTBEAT_SECONDS = 60
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
+GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
+
+REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "overall_status": {
+            "type": "string",
+            "enum": ["needs_review", "looks_good", "blocked_by_ci", "error"],
+        },
+        "safe_to_publish": {"type": "boolean"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "api_auth_correctness",
+                            "polling_checkpoint",
+                            "output_schema_mismatch",
+                            "unsafe_logging",
+                            "soar_metadata",
+                            "docs_pr_accuracy",
+                            "pagination",
+                            "validation",
+                            "missing_tests",
+                            "precommit",
+                            "merge_conflict",
+                            "ci_synthesis",
+                            "general",
+                        ],
+                    },
+                    "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "file": {"type": ["string", "null"]},
+                    "line": {"type": ["integer", "null"]},
+                    "code_reference": {"type": ["string", "null"]},
+                    "evidence": {"type": "string"},
+                    "why_it_matters": {"type": "string"},
+                    "suggested_fix": {"type": "string"},
+                    "suggested_code": {"type": ["string", "null"]},
+                    "source": {"type": "string"},
+                },
+                "required": [
+                    "id",
+                    "title",
+                    "category",
+                    "severity",
+                    "confidence",
+                    "file",
+                    "line",
+                    "code_reference",
+                    "evidence",
+                    "why_it_matters",
+                    "suggested_fix",
+                    "suggested_code",
+                    "source",
+                ],
+            },
+        },
+        "model_notes": {"type": "string"},
+    },
+    "required": ["summary", "overall_status", "safe_to_publish", "findings", "model_notes"],
+}
 
 
 class GatewayReviewError(RuntimeError):
+    pass
+
+
+class GatewayModelFormatError(GatewayReviewError):
     pass
 
 
@@ -50,6 +126,7 @@ class GatewayClaudeReviewer:
         # Generate it once per bot run and refresh it in memory before expiry.
         self._access_token: str | None = None
         self._access_token_expires_at = 0.0
+        self._response_format_mode: str | None = "json_schema"
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -142,21 +219,7 @@ class GatewayClaudeReviewer:
         return final_output
 
     def _invoke_review(self, user_prompt: str, deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
-        safe_user_prompt = redact_text(user_prompt)
-        body = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": safe_user_prompt},
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            # CIRCUIT validates this exact JSON string metadata field.
-            # It is auth metadata, not part of the chat prompt.
-            "user": json.dumps({"appkey": self.config.gateway_app_key}),
-        }
-        if should_include_model_in_body(str(self.config.gateway_base_url or "")):
-            body["model"] = self.config.gateway_model
-
+        body = self._model_body(user_prompt)
         heartbeat_stop = threading.Event()
         heartbeat_thread: threading.Thread | None = None
         request_started = time.monotonic()
@@ -183,15 +246,78 @@ class GatewayClaudeReviewer:
                 self.eta.complete_request(time.monotonic() - request_started)
 
         text = extract_chat_completion_text(response_payload)
+        recovery_note = ""
         try:
             raw_output = extract_json_object(text)
         except Exception as exc:  # noqa: BLE001 - keep raw model text for prototype debugging
-            raise GatewayReviewError(f"Gateway model did not return valid JSON: {redact_text(text[:2000])}") from exc
+            raw_output, response_payload, recovery_note = self._recover_non_json_response(text, user_prompt)
 
         normalized = normalize_review_output(raw_output, deterministic_findings=deterministic_findings)
+        if recovery_note:
+            existing_notes = str(normalized.get("model_notes") or "").strip()
+            normalized["model_notes"] = f"{existing_notes}\n{recovery_note}".strip() if existing_notes else recovery_note
         normalized["model"] = response_payload.get("model", self.config.gateway_model)
         normalized["usage"] = response_payload.get("usage")
         return normalized
+
+    def _recover_non_json_response(
+        self,
+        previous_text: str,
+        original_user_prompt: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        self.progress("Gateway model returned non-JSON; attempting one JSON repair request.")
+        try:
+            repair_payload = self._post_model_json(self._model_body(build_json_repair_prompt(previous_text)))
+            repair_text = extract_chat_completion_text(repair_payload)
+            raw_output = extract_json_object(repair_text)
+            return raw_output, repair_payload, "Recovered from a non-JSON model response with one JSON repair retry."
+        except Exception:
+            self.progress("Gateway JSON repair failed; retrying the original review with strict JSON-only instructions.")
+
+        try:
+            retry_payload = self._post_model_json(self._model_body(build_strict_json_retry_prompt(original_user_prompt)))
+            retry_text = extract_chat_completion_text(retry_payload)
+            raw_output = extract_json_object(retry_text)
+            return raw_output, retry_payload, "Recovered from a non-JSON model response with a strict JSON retry."
+        except Exception as retry_exc:  # noqa: BLE001 - retry can fail in several parser/provider ways
+            raise GatewayModelFormatError(
+                "Gateway model did not return valid JSON after repair and strict retry: "
+                f"{redact_text(previous_text[:2000])}"
+            ) from retry_exc
+
+    def _model_body(self, user_prompt: str) -> dict[str, Any]:
+        safe_user_prompt = redact_text(user_prompt)
+        body = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": safe_user_prompt},
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            # CIRCUIT validates this exact JSON string metadata field.
+            # It is auth metadata, not part of the chat prompt.
+            "user": json.dumps({"appkey": self.config.gateway_app_key}),
+        }
+        if should_include_model_in_body(str(self.config.gateway_base_url or "")):
+            body["model"] = self.config.gateway_model
+        response_format = self._response_format()
+        if response_format is not None:
+            body["response_format"] = response_format
+        return body
+
+    def _response_format(self) -> dict[str, Any] | None:
+        if self._response_format_mode == "json_schema":
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "agentic_pr_review_output",
+                    "strict": True,
+                    "schema": REVIEW_RESPONSE_SCHEMA,
+                },
+            }
+        if self._response_format_mode == "json_object":
+            return {"type": "json_object"}
+        return None
 
     def _post_model_json(self, body: dict[str, Any]) -> dict[str, Any]:
         max_attempts = max(1, int(self.config.gateway_request_max_attempts))
@@ -201,6 +327,10 @@ class GatewayClaudeReviewer:
             try:
                 return self._post_model_json_once(body)
             except HTTPError as exc:
+                downgraded_body = self._downgrade_response_format_after_rejection(exc, body)
+                if downgraded_body is not None:
+                    body = downgraded_body
+                    continue
                 if exc.code not in GATEWAY_AUTH_RETRY_STATUS_CODES or auth_refreshed:
                     raise
                 self.progress("Gateway model auth failed; refreshing token and retrying once.")
@@ -219,6 +349,34 @@ class GatewayClaudeReviewer:
                 if delay > 0:
                     time.sleep(delay)
                 attempt += 1
+
+    def _downgrade_response_format_after_rejection(
+        self,
+        exc: HTTPError,
+        body: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if exc.code not in GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES:
+            return None
+        if "response_format" not in body:
+            return None
+        error_body = read_error_body_preserving_stream(exc).lower()
+        error_text = f"{exc.reason} {error_body}".lower()
+        if not any(term in error_text for term in ("response_format", "json_schema", "json_object")):
+            return None
+
+        next_body = deepcopy(body)
+        current_mode = self._response_format_mode
+        if current_mode == "json_schema":
+            self._response_format_mode = "json_object"
+            next_body["response_format"] = self._response_format()
+            self.progress("Gateway rejected JSON schema response_format; retrying with JSON object mode.")
+            return next_body
+        if current_mode == "json_object":
+            self._response_format_mode = None
+            next_body.pop("response_format", None)
+            self.progress("Gateway rejected JSON object response_format; retrying without provider response_format.")
+            return next_body
+        return None
 
     def _post_model_json_once(self, body: dict[str, Any]) -> dict[str, Any]:
         request = Request(
@@ -307,6 +465,53 @@ def mask_secret_for_github_actions(value: str) -> None:
         print(f"::add-mask::{value}", flush=True)
 
 
+def build_json_repair_prompt(previous_response: str) -> str:
+    return (
+        "Your previous response was not valid JSON. Convert it into exactly one "
+        "valid JSON object using the schema below. Do not add Markdown, prose, "
+        "or code fences. If the previous response does not prove any concrete "
+        "actionable finding, return an empty findings array and overall_status "
+        "`looks_good`.\n\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "summary": "",\n'
+        '  "overall_status": "needs_review|looks_good|blocked_by_ci|error",\n'
+        '  "safe_to_publish": true,\n'
+        '  "findings": [\n'
+        "    {\n"
+        '      "id": "short-stable-id",\n'
+        '      "title": "clear finding title",\n'
+        '      "category": "api_auth_correctness|polling_checkpoint|output_schema_mismatch|unsafe_logging|soar_metadata|docs_pr_accuracy|pagination|validation|missing_tests|precommit|merge_conflict|ci_synthesis|general",\n'
+        '      "severity": "critical|high|medium|low|info",\n'
+        '      "confidence": "high|medium|low",\n'
+        '      "file": "path or null",\n'
+        '      "line": 123,\n'
+        '      "code_reference": "reference or null",\n'
+        '      "evidence": "specific evidence",\n'
+        '      "why_it_matters": "why this matters",\n'
+        '      "suggested_fix": "actionable fix",\n'
+        '      "suggested_code": null,\n'
+        '      "source": "claude"\n'
+        "    }\n"
+        "  ],\n"
+        '  "model_notes": "brief notes"\n'
+        "}\n\n"
+        "Previous response:\n"
+        f"{truncate_text(redact_text(previous_response), 8000)}"
+    )
+
+
+def build_strict_json_retry_prompt(original_user_prompt: str) -> str:
+    return (
+        "Retry the original review request below. The prior response was rejected because it was not valid JSON.\n"
+        "You must return exactly one valid JSON object and nothing else. Do not include Markdown, prose, "
+        "headings, explanations outside JSON, or code fences. Preserve review quality: inspect the same evidence "
+        "and include only concrete, high-confidence actionable findings.\n\n"
+        "Original review request:\n"
+        f"{original_user_prompt}"
+    )
+
+
 def extract_chat_completion_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:
@@ -351,6 +556,22 @@ def read_error_body(error: HTTPError) -> str:
     if isinstance(raw, bytes):
         return redact_text(raw.decode("utf-8", errors="replace")[:2000])
     return redact_text(str(raw)[:2000])
+
+
+def read_error_body_preserving_stream(error: HTTPError) -> str:
+    file_obj = getattr(error, "fp", None)
+    if file_obj is None:
+        return ""
+    try:
+        raw = file_obj.read()
+    except Exception:  # noqa: BLE001 - diagnostic best effort
+        return ""
+    if isinstance(raw, bytes):
+        error.fp = BytesIO(raw)
+        return raw.decode("utf-8", errors="replace")[:2000]
+    text = str(raw)
+    error.fp = BytesIO(text.encode("utf-8"))
+    return text[:2000]
 
 
 def fallback_deep_output(
