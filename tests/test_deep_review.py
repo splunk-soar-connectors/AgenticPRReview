@@ -1,6 +1,12 @@
 import unittest
 
-from agentic_pr_review.deep_review import DeepPRCollector, build_chunk_review_input, chunk_unified_diff, generate_unified_diff
+from agentic_pr_review.deep_review import (
+    DeepPRCollector,
+    build_chunk_review_input,
+    chunk_unified_diff,
+    generate_unified_diff,
+    split_chunk_for_adaptive_retry,
+)
 
 
 class DeepReviewHelpersTest(unittest.TestCase):
@@ -83,6 +89,64 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertNotIn("unrelated.txt", chunk_input["full_files"])
         self.assertEqual(chunk_input["historical_context"]["matched_example_count"], 2)
         self.assertEqual(chunk_input["historical_context"]["matches"][0]["path"], "connector.py")
+
+    def test_adaptive_retry_chunk_uses_smaller_context_window(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {
+                "connector.py": "x" * 1000,
+                "sample.json": "y" * 1000,
+            },
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+        }
+        chunk = {
+            "id": "connector.py:1:retry-1",
+            "parent_chunk_id": "connector.py:1",
+            "adaptive_retry": True,
+            "context_char_limit": 100,
+            "path": "connector.py",
+            "status": "modified",
+            "chunk_index": 1,
+            "chunk_total": 2,
+            "diff": "@@ -1 +1 @@\n-old\n+new",
+        }
+
+        chunk_input = build_chunk_review_input(review_input, chunk)
+
+        self.assertTrue(chunk_input["review_scope"]["adaptive_retry"])
+        self.assertEqual(chunk_input["review_scope"]["parent_chunk_id"], "connector.py:1")
+        self.assertLess(len(chunk_input["full_files"]["connector.py"]), 150)
+        self.assertIn("smaller retry slice", chunk_input["review_scope"]["instruction"])
+
+    def test_split_chunk_for_adaptive_retry_preserves_all_diff_lines(self):
+        diff = generate_unified_diff(
+            "\n".join(f"old_{idx}" for idx in range(40)),
+            "\n".join(f"new_{idx}" for idx in range(40)),
+            base_path="connector.py",
+            head_path="connector.py",
+        )
+        chunk = {
+            "id": "connector.py:1",
+            "path": "connector.py",
+            "status": "modified",
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "diff": diff,
+        }
+
+        retry_chunks = split_chunk_for_adaptive_retry(chunk, max_chars=350, context_char_limit=123)
+
+        self.assertGreater(len(retry_chunks), 1)
+        self.assertTrue(all(item["adaptive_retry"] for item in retry_chunks))
+        self.assertTrue(all(item["parent_chunk_id"] == "connector.py:1" for item in retry_chunks))
+        self.assertTrue(all(item["context_char_limit"] == 123 for item in retry_chunks))
+        joined = "\n".join(item["diff"] for item in retry_chunks)
+        self.assertIn("+new_0", joined)
+        self.assertIn("+new_39", joined)
 
     def test_build_chunk_review_input_includes_related_view_template_context(self):
         review_input = {

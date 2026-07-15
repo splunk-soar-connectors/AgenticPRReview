@@ -46,8 +46,8 @@ export CIRCUIT_APP_KEY="<app key>"
 export CIRCUIT_CLIENT_ID="<oauth client id>"
 export CIRCUIT_CLIENT_SECRET="<oauth client secret>"
 export CIRCUIT_TOKEN_URL="<oauth token endpoint>"
-export CIRCUIT_REQUEST_TIMEOUT_SECONDS="300"
-export CIRCUIT_REQUEST_MAX_ATTEMPTS="3"
+export CIRCUIT_REQUEST_TIMEOUT_SECONDS="180"
+export CIRCUIT_REQUEST_MAX_ATTEMPTS="2"
 export CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS="5"
 ```
 
@@ -104,13 +104,16 @@ excerpts, usernames, repository names, URLs, and other private context.
 
 Deep collection is enabled by default. The bot fetches base and head contents
 for changed text files, generates local diffs, splits large diffs into chunks,
-reviews each chunk, and then runs a synthesis pass.
+reviews each chunk, and then runs a synthesis pass. Independent chunks can run
+concurrently to reduce wall-clock time; concurrency does not skip chunks or
+change the final synthesis step.
 
 Useful controls:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m agentic_pr_review.cli review example-org/example-connector 1 \
-  --deep-chunk-chars 60000 \
+  --deep-chunk-chars 35000 \
+  --deep-concurrency 3 \
   --deep-max-file-bytes 5000000 \
   --deep-max-file-chars 250000
 ```
@@ -195,9 +198,10 @@ jobs:
       circuit_base_url: ${{ vars.CIRCUIT_BASE_URL }}
       circuit_model: ${{ vars.CIRCUIT_MODEL }}
       circuit_token_url: ${{ vars.CIRCUIT_TOKEN_URL }}
-      circuit_request_timeout_seconds: "300"
-      circuit_request_max_attempts: "3"
+      circuit_request_timeout_seconds: "180"
+      circuit_request_max_attempts: "2"
       circuit_request_retry_backoff_seconds: "5"
+      deep_concurrency: "3"
     secrets:
       AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
       AI_REVIEW_INSTALLATION_ID: ${{ secrets.AI_REVIEW_INSTALLATION_ID }}

@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from io import BytesIO
 from io import StringIO
 from urllib.error import HTTPError
@@ -10,6 +11,7 @@ import unittest
 from agentic_pr_review.gateway_claude import (
     GatewayClaudeReviewer,
     GatewayModelFormatError,
+    GatewayTransientModelError,
     extract_chat_completion_text,
     mask_secret_for_github_actions,
 )
@@ -35,8 +37,8 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(config.model_provider, "gateway")
         self.assertEqual(config.gateway_model, "claude-sonnet-4-6")
-        self.assertEqual(config.gateway_request_timeout_seconds, 300)
-        self.assertEqual(config.gateway_request_max_attempts, 3)
+        self.assertEqual(config.gateway_request_timeout_seconds, 180)
+        self.assertEqual(config.gateway_request_max_attempts, 2)
         config.require_model()
 
     def test_runtime_config_accepts_gateway_retry_settings(self):
@@ -159,7 +161,7 @@ class GatewayClaudeTest(unittest.TestCase):
         model_request, model_timeout, model_body = calls[1]
         model_headers = {key.lower(): value for key, value in model_request.header_items()}
         model_payload = json.loads(model_body)
-        self.assertEqual(model_timeout, 300)
+        self.assertEqual(model_timeout, 180)
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
@@ -746,6 +748,149 @@ class GatewayClaudeTest(unittest.TestCase):
         with patch.object(reviewer, "_invoke_review", side_effect=GatewayModelFormatError("bad json")):
             with self.assertRaises(GatewayModelFormatError):
                 reviewer.review_deep(review_input, [])
+
+    def test_deep_review_splits_chunk_after_transient_gateway_failure(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        large_diff = (
+            "--- a/connector.py\n"
+            "+++ b/connector.py\n"
+            "@@ -1,300 +1,300 @@\n"
+            + "\n".join(f"+def generated_{idx}(): return '{'x' * 160}'" for idx in range(300))
+        )
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def helper():\n    return 1\n" + "x" * 1000},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": large_diff,
+                    }
+                ]
+            },
+        }
+        subchunk_output = {
+            "summary": "subchunk ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+        invoke_count = 0
+
+        def fake_invoke(*args, **kwargs):
+            nonlocal invoke_count
+            invoke_count += 1
+            if invoke_count == 1:
+                raise GatewayTransientModelError("Gateway model invocation failed: timed out")
+            return dict(subchunk_output)
+
+        with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+            output = reviewer.review_deep(review_input, [])
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual(output["deep_review"]["reviewed_chunk_count"], 1)
+        self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+        self.assertGreaterEqual(invoke_count, 4)
+
+    def test_deep_review_runs_independent_chunks_concurrently(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {
+                "one.py": "def one():\n    return 1\n",
+                "two.py": "def two():\n    return 2\n",
+            },
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "one.py:1",
+                        "path": "one.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -1 +1 @@\n-return 0\n+return 1",
+                    },
+                    {
+                        "id": "two.py:1",
+                        "path": "two.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -1 +1 @@\n-return 0\n+return 2",
+                    },
+                ]
+            },
+        }
+        output_template = {
+            "summary": "ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        invoke_count = 0
+
+        def fake_invoke(*args, **kwargs):
+            nonlocal invoke_count
+            with lock:
+                invoke_count += 1
+                current_call = invoke_count
+            if current_call <= 2:
+                barrier.wait(timeout=2)
+            return dict(output_template)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with (
+            patch.object(reviewer, "_get_access_token", return_value="access-token-test"),
+            patch.object(reviewer, "_invoke_review", side_effect=fake_invoke),
+        ):
+            output = reviewer.review_deep(review_input, [], deep_concurrency=2)
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual(output["deep_review"]["reviewed_chunk_count"], 2)
+        self.assertEqual([item["chunk_path"] for item in output["chunk_review_outputs"]], ["one.py", "two.py"])
+        self.assertEqual(invoke_count, 3)
 
     def test_extract_chat_completion_text(self):
         payload = {"choices": [{"message": {"content": "{\"summary\":\"ok\"}"}}]}

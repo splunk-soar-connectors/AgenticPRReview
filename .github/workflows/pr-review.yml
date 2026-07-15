@@ -27,17 +27,22 @@ on:
         description: Per-request CIRCUIT model timeout in seconds.
         required: false
         type: string
-        default: "300"
+        default: "180"
       circuit_request_max_attempts:
         description: Maximum CIRCUIT model attempts for transient timeout/network failures.
         required: false
         type: string
-        default: "3"
+        default: "2"
       circuit_request_retry_backoff_seconds:
         description: Base delay between CIRCUIT model retries.
         required: false
         type: string
         default: "5"
+      deep_concurrency:
+        description: Concurrent deep model chunk reviews.
+        required: false
+        type: string
+        default: "3"
       publish_comments:
         description: Publish GitHub comments and apply the ai-reviewed label.
         required: false
@@ -163,6 +168,7 @@ jobs:
           args=(
             review "${REVIEW_REPO}" "${REVIEW_PR_NUMBER}"
             --output-dir "${REVIEW_OUTPUT_DIR}"
+            --deep-concurrency "${{ inputs.deep_concurrency }}"
           )
           if [[ "${{ inputs.publish_comments }}" == "true" ]]; then
             args+=(--publish-comments)

@@ -61,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--shallow", action="store_true", help="Disable deep base/head collection and chunked review.")
     review.add_argument("--deep-max-file-bytes", type=int, default=5_000_000)
     review.add_argument("--deep-max-file-chars", type=int, default=DEFAULT_MAX_FILE_CHARS)
-    review.add_argument("--deep-chunk-chars", type=int, default=60_000)
+    review.add_argument("--deep-chunk-chars", type=int, default=35_000)
+    review.add_argument("--deep-concurrency", type=int, default=3, help="Concurrent deep model chunk reviews.")
     review.add_argument("--deep-max-chunks", type=int, default=0, help="Limit deep model chunk reviews. 0 means all chunks.")
     review.add_argument(
         "--enable-sdk-manifest",
@@ -218,6 +219,7 @@ def run_review(args: argparse.Namespace) -> int:
                     review_input,
                     deterministic_findings,
                     max_chunks=args.deep_max_chunks,
+                    deep_concurrency=args.deep_concurrency,
                 )
             progress(f"Model review completed in {format_duration(time.monotonic() - stage_started)}.")
 

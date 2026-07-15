@@ -282,19 +282,28 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
     previous_path = str(chunk.get("previous_path") or path)
     full_files = review_input.get("full_files") or {}
     base_files = review_input.get("base_files") or {}
-    context_files = select_context_files(full_files, path)
-    base_context_files = select_context_files(base_files, previous_path)
+    context_char_limit = int(chunk.get("context_char_limit") or 80_000)
+    context_files = select_context_files(full_files, path, max_chars=context_char_limit)
+    base_context_files = select_context_files(base_files, previous_path, max_chars=context_char_limit)
+    instruction = "Only report concrete issues proven by this chunk plus supplied PR context."
+    if chunk.get("adaptive_retry"):
+        instruction += (
+            " This is a smaller retry slice of a larger file chunk after a transient model gateway failure; "
+            "review this slice fully and do not assume sibling slices are already represented here."
+        )
 
     return {
         "schema_version": "0.1",
         "review_scope": {
             "type": "deep_file_chunk",
             "chunk_id": chunk.get("id"),
+            "parent_chunk_id": chunk.get("parent_chunk_id"),
+            "adaptive_retry": bool(chunk.get("adaptive_retry")),
             "path": path,
             "previous_path": chunk.get("previous_path"),
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
-            "instruction": "Only report concrete issues proven by this chunk plus supplied PR context.",
+            "instruction": instruction,
         },
         "repo": review_input.get("repo"),
         "pr": review_input.get("pr"),
@@ -325,11 +334,13 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             **(review_input.get("collector_notes") or {}),
             "deep_chunk_review": True,
             "deep_chunk_id": chunk.get("id"),
+            "deep_parent_chunk_id": chunk.get("parent_chunk_id"),
+            "deep_adaptive_retry": bool(chunk.get("adaptive_retry")),
         },
     }
 
 
-def select_context_files(files: dict[str, str], primary_path: str) -> dict[str, str]:
+def select_context_files(files: dict[str, str], primary_path: str, *, max_chars: int = 80_000) -> dict[str, str]:
     output: dict[str, str] = {}
     for path, text in files.items():
         name = PurePosixPath(path).name
@@ -339,7 +350,48 @@ def select_context_files(files: dict[str, str], primary_path: str) -> dict[str, 
             or ("/" not in path and path.endswith(".json"))
             or is_related_view_context_file(path, primary_path)
         ):
-            output[path] = truncate_text(text, 80_000)
+            output[path] = truncate_text(text, max_chars)
+    return output
+
+
+def split_chunk_for_adaptive_retry(
+    chunk: dict[str, Any],
+    *,
+    max_chars: int = 18_000,
+    context_char_limit: int = 30_000,
+) -> list[dict[str, Any]]:
+    diff = str(chunk.get("diff") or "")
+    if not diff or len(diff) <= max_chars:
+        return []
+    headers, hunks = split_unified_diff(diff)
+    pieces: list[str] = []
+    for hunk in hunks or [diff]:
+        if len(f"{headers}\n{hunk}".strip()) <= max_chars:
+            pieces.append(f"{headers}\n{hunk}".strip() if headers else hunk)
+        else:
+            pieces.extend(split_large_hunk(headers, hunk, max_chars=max_chars))
+    pieces = [piece for piece in pieces if piece.strip()]
+    if len(pieces) <= 1:
+        return []
+
+    parent_id = str(chunk.get("id") or chunk.get("path") or "chunk")
+    output: list[dict[str, Any]] = []
+    total = len(pieces)
+    for index, piece in enumerate(pieces, start=1):
+        child = dict(chunk)
+        child.update(
+            {
+                "id": f"{parent_id}:retry-{index}",
+                "parent_chunk_id": parent_id,
+                "adaptive_retry": True,
+                "chunk_index": index,
+                "chunk_total": total,
+                "diff": piece,
+                "diff_chars": len(piece),
+                "context_char_limit": context_char_limit,
+            }
+        )
+        output.append(child)
     return output
 
 
