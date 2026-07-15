@@ -53,6 +53,9 @@ The provider exchanges `CIRCUIT_CLIENT_ID` and
 memory, refreshes it before expiry, and retries once after a 401 or 403 model
 response. The generic `GATEWAY_*` names are also supported for local testing,
 but the reusable workflow keeps the existing `CIRCUIT_*` interface.
+Runtime credential values are redacted from model prompts, errors, saved
+artifacts, and published comments. The CIRCUIT app key is represented in model
+request metadata by a non-reversible fingerprint rather than the raw secret.
 
 The CLI does not auto-load credential files. For local development only, you
 can point `AGENTIC_PR_REVIEW_ENV_FILE` at an ignored env file.
@@ -197,6 +200,28 @@ jobs:
 
 The workflow intentionally does not pass `--enable-sdk-manifest`, so it does
 not execute untrusted PR code from pull request workflows.
+
+For public repositories, keep org-level secrets scoped to selected repositories
+and run this through `pull_request_target` only when the workflow never checks
+out or executes the contributor branch. The caller passes explicit secrets
+rather than `secrets: inherit`; the reusable workflow validates that the caller
+and target repository belong to `splunk-soar-connectors`, grants `GITHUB_TOKEN`
+permissions at the job level, pins third-party actions by commit SHA, uses a
+30-minute timeout, and masks the just-in-time gateway token in GitHub Actions
+logs. Keep SDK manifest generation and any PR-code execution disabled in public
+PR workflows.
+
+Secret safety checks built into the bot:
+
+- Runtime secret values from GitHub App and CIRCUIT env vars are redacted before
+  model prompts, local `runs/` artifacts, stderr failure messages, and GitHub
+  comments are written.
+- Generated CIRCUIT access tokens are masked with GitHub Actions `add-mask`.
+- Common token literals found in PR diffs or CI logs, such as GitHub tokens,
+  bearer/basic auth headers, OpenAI-style keys, AWS access keys, JWTs, and
+  private-key blocks, are redacted before publication or artifact upload.
+- The reusable workflow does not enable SDK manifest generation because that
+  path can import PR code.
 
 ## What It Reviews
 

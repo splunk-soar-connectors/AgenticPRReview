@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from .json_utils import dump_json, truncate_text
+from .secret_redactor import redact_text
 from .sdk_analysis import build_sdk_review_inventory
 
 
@@ -287,7 +288,7 @@ Required JSON shape:
 
 def build_user_prompt(review_input: dict, deterministic_findings: list[dict], *, max_chars: int) -> str:
     payload = build_model_payload(review_input, deterministic_findings, max_chars=max_chars)
-    text = dump_json(payload)
+    text = redact_text(dump_json(payload))
     if len(text) > max_chars:
         text = truncate_text(text, max_chars)
     return (
@@ -338,14 +339,14 @@ def build_synthesis_prompt(
             limits={"patch": 1_500, "file": 3_500, "comment": 700, "review": 600},
         ),
     }
-    text = dump_json(payload)
+    text = redact_text(dump_json(payload))
     if len(text) > max_chars:
         payload["chunk_candidate_findings"] = candidate_findings[:120]
         payload["pr_context"] = compact_review_input_for_model(
             review_input,
             limits={"patch": 800, "file": 2_000, "comment": 350, "review": 300},
         )
-        text = dump_json(payload)
+        text = redact_text(dump_json(payload))
     if len(text) > max_chars:
         text = truncate_text(text, max_chars)
     return (

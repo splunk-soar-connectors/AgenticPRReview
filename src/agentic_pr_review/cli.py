@@ -23,6 +23,7 @@ from .progress import format_duration, ProgressReporter
 from .renderer import render_comment
 from .sdk_analysis import build_sdk_review_inventory
 from .sdk_manifest import enrich_with_sdk_manifest, mark_sdk_manifest_disabled
+from .secret_redactor import redact_obj, redact_text
 
 
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
@@ -250,18 +251,19 @@ def run_review(args: argparse.Namespace) -> int:
         progress("Writing review artifacts.")
         write_artifacts(run_dir, review_input, review_output, comment, comment_plan, publish_result)
     except (GitHubError, GatewayReviewError, RuntimeError, OSError, ValueError) as exc:
+        safe_error = redact_text(str(exc))
         error_payload = {
             "summary": "Review failed.",
             "overall_status": "error",
             "safe_to_publish": False,
             "findings": [],
             "deterministic_findings": [],
-            "model_notes": str(exc),
+            "model_notes": safe_error,
         }
         write_json(run_dir / "review_output.json", error_payload)
-        (run_dir / "comment.md").write_text(f"Review failed: {exc}\n", encoding="utf-8")
-        progress(f"Review failed after {format_duration(time.monotonic() - review_started)}: {exc}")
-        print(f"error: {exc}", file=sys.stderr)
+        (run_dir / "comment.md").write_text(f"Review failed: {safe_error}\n", encoding="utf-8")
+        progress(f"Review failed after {format_duration(time.monotonic() - review_started)}: {safe_error}")
+        print(f"error: {safe_error}", file=sys.stderr)
         print(f"artifacts: {run_dir}")
         return 1
 
@@ -305,16 +307,16 @@ def write_artifacts(
         write_json(run_dir / "sdk_manifest_result.json", sdk_manifest)
         if isinstance(sdk_manifest.get("manifest"), dict):
             write_json(run_dir / "generated_manifest.json", sdk_manifest["manifest"])
-    (run_dir / "comment.md").write_text(comment, encoding="utf-8")
+    (run_dir / "comment.md").write_text(redact_text(comment), encoding="utf-8")
     if comment_plan is not None:
         write_json(run_dir / "planned_comments.json", comment_plan)
-        (run_dir / "planned_comments.md").write_text(render_comment_plan(comment_plan), encoding="utf-8")
+        (run_dir / "planned_comments.md").write_text(redact_text(render_comment_plan(comment_plan)), encoding="utf-8")
     if publish_result is not None:
         write_json(run_dir / "publish_result.json", publish_result)
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(dump_json(data) + "\n", encoding="utf-8")
+    path.write_text(dump_json(redact_obj(data)) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

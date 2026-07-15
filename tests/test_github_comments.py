@@ -1,5 +1,7 @@
 import unittest
 from copy import deepcopy
+import os
+from unittest.mock import patch
 
 from agentic_pr_review.github_comments import (
     build_comment_plan as real_build_comment_plan,
@@ -7,6 +9,7 @@ from agentic_pr_review.github_comments import (
     parse_right_side_diff_lines,
     publish_comment_plan,
 )
+from agentic_pr_review.secret_redactor import REDACTED_SECRET
 
 
 def build_comment_plan(review_output, review_input, **kwargs):
@@ -365,6 +368,41 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(result["posted"], 1)
         self.assertEqual(result["label"]["status"], "applied")
         self.assertEqual(client.labels, [("owner/repo", 1, ["ai-reviewed"])])
+
+    def test_publish_redacts_secret_values_from_github_comment_body(self):
+        class FakeClient:
+            def __init__(self):
+                self.bodies = []
+
+            def create_issue_comment(self, repo, number, *, body):
+                self.bodies.append(body)
+                return {"html_url": f"https://github.example/{repo}/pull/{number}#issuecomment-1"}
+
+            def add_issue_labels(self, repo, number, labels):
+                return [{"name": labels[0], "url": f"https://github.example/{repo}/labels/{labels[0]}"}]
+
+        client = FakeClient()
+        plan = {
+            "repo": "owner/repo",
+            "pr_number": 1,
+            "head_sha": "abc",
+            "comments": [
+                {
+                    "id": "f1",
+                    "github_comment_type": "conversation",
+                    "body": "Issue: do not repeat canary-comment-secret",
+                    "marker": "<!-- agentic-pr-review:f1 -->",
+                }
+            ],
+        }
+
+        with patch.dict(os.environ, {"CIRCUIT_CLIENT_SECRET": "canary-comment-secret"}, clear=True):
+            result = publish_comment_plan(client, plan, {"comments": {}})
+
+        self.assertEqual(result["posted"], 1)
+        self.assertEqual(len(client.bodies), 1)
+        self.assertIn(REDACTED_SECRET, client.bodies[0])
+        self.assertNotIn("canary-comment-secret", client.bodies[0])
 
     def test_publish_skips_ai_reviewed_label_when_no_comment_was_posted(self):
         class FakeClient:

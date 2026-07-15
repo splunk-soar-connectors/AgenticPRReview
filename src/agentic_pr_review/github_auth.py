@@ -9,6 +9,8 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from .secret_redactor import redact_obj, redact_text
+
 
 class GitHubAuthError(RuntimeError):
     pass
@@ -65,14 +67,14 @@ class GitHubAppInstallationTokenProvider:
             with urlopen(request, timeout=45) as response:
                 raw = response.read()
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubAuthError(f"GitHub App token request failed {exc.code} for {url}: {body}") from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubAuthError(f"GitHub App token request failed {exc.code} for {redact_text(url)}: {body}") from exc
 
         payload = json.loads(raw.decode("utf-8"))
         token = str(payload.get("token") or "")
         expires_at_raw = str(payload.get("expires_at") or "")
         if not token or not expires_at_raw:
-            raise GitHubAuthError(f"GitHub App token response was missing token or expires_at: {payload}")
+            raise GitHubAuthError(f"GitHub App token response was missing token or expires_at: {redact_obj(payload)}")
         return token, parse_github_datetime(expires_at_raw)
 
 

@@ -1,6 +1,8 @@
 import os
+from io import BytesIO
 from unittest.mock import Mock, patch
 import unittest
+from urllib.error import HTTPError
 
 from agentic_pr_review.config import DEFAULT_ENV_FILES, RuntimeConfig
 from agentic_pr_review.github_auth import (
@@ -11,6 +13,7 @@ from agentic_pr_review.github_auth import (
 )
 from agentic_pr_review.github_client import GitHubClient, GitHubError
 from agentic_pr_review.github_client_factory import build_github_client
+from agentic_pr_review.secret_redactor import REDACTED_SECRET
 
 
 class GitHubAuthTest(unittest.TestCase):
@@ -148,6 +151,27 @@ class GitHubAuthTest(unittest.TestCase):
         redirected_headers = dict(redirected_requests[0].header_items())
         self.assertEqual(first_headers["Authorization"], "Bearer provider-token")
         self.assertNotIn("Authorization", redirected_headers)
+
+    def test_github_client_redacts_secret_values_from_error_bodies(self):
+        env = {"CIRCUIT_CLIENT_SECRET": "canary-github-error-secret"}
+        client = GitHubClient(token="provider-token")
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(
+                request.full_url,
+                500,
+                "Server Error",
+                {},
+                BytesIO(b'{"message":"canary-github-error-secret"}'),
+            )
+
+        with patch.dict(os.environ, env, clear=True), patch("agentic_pr_review.github_client.urlopen", fake_urlopen):
+            with self.assertRaises(GitHubError) as caught:
+                client.get("/repos/owner/repo/pulls/1")
+
+        message = str(caught.exception)
+        self.assertIn(REDACTED_SECRET, message)
+        self.assertNotIn("canary-github-error-secret", message)
 
     def test_runtime_config_auto_selects_github_app_auth(self):
         env = {

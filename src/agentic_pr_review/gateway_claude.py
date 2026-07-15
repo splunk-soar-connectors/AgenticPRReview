@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -17,6 +18,7 @@ from .json_utils import extract_json_object
 from .models import normalize_review_output
 from .progress import AdaptiveETA, format_duration
 from .prompt import SYSTEM_PROMPT, build_synthesis_prompt, build_user_prompt
+from .secret_redactor import redact_obj, redact_text, secret_fingerprint
 
 
 GATEWAY_HEARTBEAT_SECONDS = 60
@@ -125,8 +127,9 @@ class GatewayClaudeReviewer:
         try:
             final_output = self._invoke_review(synthesis_prompt, deterministic_findings)
         except GatewayReviewError as exc:
-            self.progress(f"Synthesis failed; using deduplicated chunk findings: {exc}")
-            final_output = fallback_deep_output(deterministic_findings, chunk_outputs, model_notes=str(exc))
+            safe_error = redact_text(str(exc))
+            self.progress(f"Synthesis failed; using deduplicated chunk findings: {safe_error}")
+            final_output = fallback_deep_output(deterministic_findings, chunk_outputs, model_notes=safe_error)
         synthesis_elapsed = format_duration(time.monotonic() - synthesis_started)
         self.progress(f"Synthesis completed in {synthesis_elapsed}.")
         final_output["deep_review"] = {
@@ -139,14 +142,15 @@ class GatewayClaudeReviewer:
         return final_output
 
     def _invoke_review(self, user_prompt: str, deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
+        safe_user_prompt = redact_text(user_prompt)
         body = {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": safe_user_prompt},
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "user": json.dumps({"appkey": self.config.gateway_app_key}),
+            "user": json.dumps({"appkey_fingerprint": secret_fingerprint(self.config.gateway_app_key)}),
         }
         if should_include_model_in_body(str(self.config.gateway_base_url or "")):
             body["model"] = self.config.gateway_model
@@ -168,7 +172,7 @@ class GatewayClaudeReviewer:
                 response_payload = self._post_model_json(body)
                 request_succeeded = True
             except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                raise GatewayReviewError(f"Gateway model invocation failed: {format_http_error(exc)}") from exc
+                raise GatewayReviewError(f"Gateway model invocation failed: {redact_text(format_http_error(exc))}") from exc
         finally:
             heartbeat_stop.set()
             if heartbeat_thread is not None:
@@ -180,7 +184,7 @@ class GatewayClaudeReviewer:
         try:
             raw_output = extract_json_object(text)
         except Exception as exc:  # noqa: BLE001 - keep raw model text for prototype debugging
-            raise GatewayReviewError(f"Gateway model did not return valid JSON: {text[:2000]}") from exc
+            raise GatewayReviewError(f"Gateway model did not return valid JSON: {redact_text(text[:2000])}") from exc
 
         normalized = normalize_review_output(raw_output, deterministic_findings=deterministic_findings)
         normalized["model"] = response_payload.get("model", self.config.gateway_model)
@@ -243,7 +247,7 @@ class GatewayClaudeReviewer:
             with urlopen(request, timeout=60) as response:
                 token_payload = json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            raise GatewayReviewError(f"Gateway token exchange failed: {format_http_error(exc)}") from exc
+            raise GatewayReviewError(f"Gateway token exchange failed: {redact_text(format_http_error(exc))}") from exc
 
         token = token_payload.get("access_token") or token_payload.get("token") or token_payload.get("id_token")
         if not token:
@@ -256,6 +260,7 @@ class GatewayClaudeReviewer:
             ttl = 3600
         self._access_token = str(token)
         self._access_token_expires_at = now + max(ttl, TOKEN_EXPIRY_SKEW_SECONDS)
+        mask_secret_for_github_actions(self._access_token)
         return self._access_token
 
     def _report_gateway_heartbeat(self, stop: threading.Event, request_started: float) -> None:
@@ -277,6 +282,11 @@ class GatewayClaudeReviewer:
 
 def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
+
+
+def mask_secret_for_github_actions(value: str) -> None:
+    if value and os.getenv("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{value}", flush=True)
 
 
 def extract_chat_completion_text(payload: dict[str, Any]) -> str:
@@ -302,14 +312,14 @@ def extract_chat_completion_text(payload: dict[str, Any]) -> str:
             return "\n".join(text_parts)
     if isinstance(payload.get("output_text"), str):
         return payload["output_text"]
-    raise GatewayReviewError(f"Gateway response did not include text content: {payload}")
+    raise GatewayReviewError(f"Gateway response did not include text content: {redact_obj(payload)}")
 
 
 def format_http_error(exc: BaseException) -> str:
     if isinstance(exc, HTTPError):
-        body = read_error_body(exc)
-        return f"HTTP {exc.code} {exc.reason}: {body}".strip()
-    return str(exc)
+        body = redact_text(read_error_body(exc))
+        return f"HTTP {exc.code} {redact_text(exc.reason)}: {body}".strip()
+    return redact_text(str(exc))
 
 
 def read_error_body(error: HTTPError) -> str:
@@ -321,8 +331,8 @@ def read_error_body(error: HTTPError) -> str:
     except Exception:  # noqa: BLE001 - diagnostic best effort
         return ""
     if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")[:2000]
-    return str(raw)[:2000]
+        return redact_text(raw.decode("utf-8", errors="replace")[:2000])
+    return redact_text(str(raw)[:2000])
 
 
 def fallback_deep_output(
@@ -341,7 +351,7 @@ def fallback_deep_output(
             "overall_status": "needs_review" if findings else "looks_good",
             "safe_to_publish": True,
             "findings": findings,
-            "model_notes": f"Synthesis failed: {model_notes}",
+            "model_notes": f"Synthesis failed: {redact_text(model_notes)}",
         },
         deterministic_findings=deterministic_findings,
     )

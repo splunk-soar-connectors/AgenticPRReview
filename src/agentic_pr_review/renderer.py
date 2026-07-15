@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .secret_redactor import redact_text
+
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -74,7 +76,7 @@ def render_comment(review_output: dict[str, Any], review_input: dict[str, Any], 
         lines.append("_Local review summary. GitHub comment publishing was requested; see publish_result.json._")
     else:
         lines.append("_Dry-run prototype comment. No GitHub comment was posted._")
-    return "\n".join(lines).rstrip() + "\n"
+    return redact_text("\n".join(lines).rstrip() + "\n")
 
 
 def format_location(finding: dict[str, Any]) -> str:

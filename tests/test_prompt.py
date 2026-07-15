@@ -1,7 +1,10 @@
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from agentic_pr_review.prompt import SYSTEM_PROMPT, build_collection_diagnostics, build_user_prompt
+from agentic_pr_review.secret_redactor import REDACTED_SECRET, REDACTED_TOKEN
 
 
 class PromptPackingTest(unittest.TestCase):
@@ -123,6 +126,49 @@ class PromptPackingTest(unittest.TestCase):
         self.assertEqual(inventory["legacy_config_fields"], ["api_key"])
         self.assertEqual(inventory["legacy_custom_view_actions"], ["lookup"])
         self.assertEqual(inventory["test_connectivity_count"], 1)
+
+    def test_model_prompt_redacts_runtime_and_literal_secrets(self):
+        env = {
+            "CIRCUIT_CLIENT_SECRET": "canary-model-client-secret",
+            "AI_REVIEW_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\\ncanary-model-private\\n-----END PRIVATE KEY-----",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "leak check", "body": "canary-model-client-secret", "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "patch": "+token = 'github_pat_1234567890abcdef1234567890abcdef1234567890abcdef'\n",
+                    "status": "modified",
+                }
+            ],
+            "full_files": {
+                "connector.py": "password='canary-model-client-secret'\n",
+            },
+            "base_files": {},
+            "comments": {"issue_comments": [{"body": "canary-model-client-secret"}]},
+            "ci": {"errors": ["Authorization: Bearer ci-secret-token-1234567890"]},
+        }
+        deterministic_findings = [
+            {
+                "title": "Secret canary",
+                "category": "unsafe_logging",
+                "confidence": "high",
+                "evidence": "canary-model-client-secret",
+                "why_it_matters": "Leak",
+                "suggested_fix": "Remove github_pat_1234567890abcdef1234567890abcdef1234567890abcdef",
+            }
+        ]
+
+        with patch.dict(os.environ, env, clear=True):
+            prompt = build_user_prompt(review_input, deterministic_findings, max_chars=40_000)
+
+        self.assertIn(REDACTED_SECRET, prompt)
+        self.assertIn(REDACTED_TOKEN, prompt)
+        self.assertNotIn("canary-model-client-secret", prompt)
+        self.assertNotIn("canary-model-private", prompt)
+        self.assertNotIn("github_pat_", prompt)
+        self.assertNotIn("ci-secret-token-1234567890", prompt)
 
 
 if __name__ == "__main__":

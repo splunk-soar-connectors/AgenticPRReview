@@ -8,6 +8,7 @@ from typing import Any
 
 from .github_client import GitHubClient, GitHubError
 from .models import is_actionable_review_finding, should_promote_deterministic_finding
+from .secret_redactor import redact_text
 
 
 CODE_SUFFIXES = {".py", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".txt"}
@@ -661,6 +662,7 @@ def build_comment_for_finding(
     marker = f"{MARKER_PREFIX}{finding_id} -->"
     body = render_short_comment(finding, finding_type, target)
     body = append_code_suggestion_block(body, finding, finding_type, target)
+    body = redact_text(body)
 
     return {
         "id": finding_id,
@@ -1132,7 +1134,7 @@ def render_comment_plan(plan: dict[str, Any]) -> str:
                 "",
             ]
         )
-    return "\n".join(lines).rstrip() + "\n"
+    return redact_text("\n".join(lines).rstrip() + "\n")
 
 
 def publish_comment_plan(
@@ -1157,7 +1159,7 @@ def publish_comment_plan(
         if marker and marker in existing_markers and not allow_duplicates:
             results.append({"id": comment.get("id"), "status": "skipped_duplicate"})
             continue
-        body = body_with_marker(comment)
+        body = redact_text(body_with_marker(comment))
         try:
             if comment.get("github_comment_type") == "line":
                 response = client.create_pull_request_line_comment(
@@ -1188,8 +1190,9 @@ def publish_comment_plan(
                     }
                 )
         except GitHubError as exc:
+            safe_error = redact_text(str(exc))
             if comment.get("github_comment_type") != "line":
-                results.append({"id": comment.get("id"), "status": "error", "error": str(exc)})
+                results.append({"id": comment.get("id"), "status": "error", "error": safe_error})
                 continue
             try:
                 response = client.create_issue_comment(repo, pr_number, body=body)
@@ -1198,17 +1201,18 @@ def publish_comment_plan(
                         "id": comment.get("id"),
                         "status": "posted_fallback",
                         "github_comment_type": "conversation",
-                        "line_error": str(exc),
+                        "line_error": safe_error,
                         "url": response.get("html_url") if isinstance(response, dict) else None,
                     }
                 )
             except GitHubError as fallback_exc:
+                safe_fallback_error = redact_text(str(fallback_exc))
                 results.append(
                     {
                         "id": comment.get("id"),
                         "status": "error",
-                        "error": str(exc),
-                        "fallback_error": str(fallback_exc),
+                        "error": safe_error,
+                        "fallback_error": safe_fallback_error,
                     }
                 )
 
@@ -1240,7 +1244,7 @@ def apply_reviewed_label(
     try:
         response = client.add_issue_labels(repo, pr_number, [label])
     except GitHubError as exc:
-        return {"name": label, "status": "error", "error": str(exc)}
+        return {"name": label, "status": "error", "error": redact_text(str(exc))}
     return {
         "name": label,
         "status": "applied",
@@ -1261,4 +1265,4 @@ def collect_existing_markers(review_input: dict[str, Any]) -> set[str]:
 def body_with_marker(comment: dict[str, Any]) -> str:
     marker = str(comment.get("marker") or "")
     body = str(comment.get("body") or "").rstrip()
-    return f"{body}\n\n{marker}".rstrip() + "\n"
+    return redact_text(f"{body}\n\n{marker}".rstrip() + "\n")

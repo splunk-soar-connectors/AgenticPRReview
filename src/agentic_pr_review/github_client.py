@@ -10,6 +10,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from .github_auth import TokenProvider
+from .secret_redactor import redact_text
 
 
 class GitHubError(RuntimeError):
@@ -45,8 +46,8 @@ class GitHubClient:
                     return None
                 return json.loads(raw.decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubError(f"GitHub API error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubError(f"GitHub API error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
 
     def get_raw(self, path: str, *, params: dict[str, Any] | None = None, accept: str | None = None) -> bytes:
         if params:
@@ -58,8 +59,8 @@ class GitHubClient:
             with urlopen(request, timeout=60) as response:
                 return response.read()
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubError(f"GitHub API error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubError(f"GitHub API error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
 
     def post(self, path: str, payload: dict[str, Any], *, accept: str | None = None) -> Any:
         if not self._auth_token():
@@ -76,8 +77,8 @@ class GitHubClient:
                     return None
                 return json.loads(raw.decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubError(f"GitHub API error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubError(f"GitHub API error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
 
     def _headers(self, *, accept: str | None = None) -> dict[str, str]:
         headers = {
@@ -108,8 +109,8 @@ class GitHubClient:
             with urlopen(request, timeout=45) as response:
                 raw = response.read()
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubError(f"GitHub raw file error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubError(f"GitHub raw file error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -264,11 +265,11 @@ class GitHubClient:
                 return response.read()
         except HTTPError as exc:
             if exc.code not in {301, 302, 303, 307, 308}:
-                body = exc.read().decode("utf-8", errors="replace")
-                raise GitHubError(f"GitHub API error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+                body = redact_text(exc.read().decode("utf-8", errors="replace"))
+                raise GitHubError(f"GitHub API error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
             location = exc.headers.get("Location")
             if not location:
-                raise GitHubError(f"GitHub API redirect for {url} did not include a Location header") from exc
+                raise GitHubError(f"GitHub API redirect for {redact_text(url)} did not include a Location header") from exc
 
         redirected = Request(
             location,
@@ -281,8 +282,8 @@ class GitHubClient:
             with urlopen(redirected, timeout=60) as response:
                 return response.read()
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise GitHubError(f"GitHub redirected asset error {exc.code} for {url}: {body}", status_code=exc.code) from exc
+            body = redact_text(exc.read().decode("utf-8", errors="replace"))
+            raise GitHubError(f"GitHub redirected asset error {exc.code} for {redact_text(url)}: {body}", status_code=exc.code) from exc
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
