@@ -8,6 +8,7 @@ from copy import deepcopy
 from io import BytesIO
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -148,8 +149,7 @@ class GatewayClaudeReviewer:
         self._run_chat_prefix = f"agentic-pr-review-{uuid.uuid4().hex}"
         self._chat_lock = threading.Lock()
         self._chat_session_index = 0
-        self._chat_transaction_count = 0
-        self._current_chat_id: str | None = None
+        self._chat_lanes: dict[str, dict[str, Any]] = {}
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -472,8 +472,7 @@ class GatewayClaudeReviewer:
         chat_id = self._next_chat_id()
         body = {
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": safe_user_prompt},
+                {"role": "user", "content": build_gateway_user_message(safe_user_prompt)},
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
@@ -497,13 +496,18 @@ class GatewayClaudeReviewer:
         return body
 
     def _next_chat_id(self) -> str:
+        lane = current_chat_lane()
         with self._chat_lock:
-            if self._current_chat_id is None or self._chat_transaction_count >= CIRCUIT_CHAT_TRANSACTION_LIMIT:
+            state = self._chat_lanes.get(lane)
+            if state is None or int(state.get("transaction_count") or 0) >= CIRCUIT_CHAT_TRANSACTION_LIMIT:
                 self._chat_session_index += 1
-                self._current_chat_id = f"{self._run_chat_prefix}-chat-{self._chat_session_index}"
-                self._chat_transaction_count = 0
-            self._chat_transaction_count += 1
-            return self._current_chat_id
+                state = {
+                    "chat_id": f"{self._run_chat_prefix}-{lane}-chat-{self._chat_session_index}",
+                    "transaction_count": 0,
+                }
+                self._chat_lanes[lane] = state
+            state["transaction_count"] = int(state.get("transaction_count") or 0) + 1
+            return str(state["chat_id"])
 
     def _response_format(self) -> dict[str, Any] | None:
         with self._response_format_lock:
@@ -690,6 +694,23 @@ class GatewayClaudeReviewer:
 
 def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
+
+
+def build_gateway_user_message(user_prompt: str) -> str:
+    return (
+        "System review instructions:\n"
+        f"{SYSTEM_PROMPT}\n\n"
+        "PR review request:\n"
+        f"{user_prompt}"
+    )
+
+
+def current_chat_lane() -> str:
+    name = threading.current_thread().name or "main"
+    if name == "MainThread":
+        name = "main"
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-")
+    return sanitized or "main"
 
 
 def normalize_deep_concurrency(value: int, total_chunks: int) -> int:
