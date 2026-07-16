@@ -54,14 +54,25 @@ export CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS="5"
 The provider exchanges `CIRCUIT_CLIENT_ID` and
 `CIRCUIT_CLIENT_SECRET` at `CIRCUIT_TOKEN_URL`, caches the returned token in
 memory, refreshes it before expiry, and retries once after a 401 or 403 model
-response. Model requests use a 300-second read timeout by default and retry
-transient timeout/network failures up to three total attempts without shrinking
-the prompt or chunks. The generic `GATEWAY_*` names are also supported for
+response. Model requests use a 180-second read timeout by default and retry
+transient timeout/network failures with smaller chunk prompts and adaptive
+subchunks when needed. The generic `GATEWAY_*` names are also supported for
 local testing, but the reusable workflow keeps the existing `CIRCUIT_*`
 interface.
 Runtime credential values are redacted from model prompts, errors, saved
 artifacts, and published comments. The CIRCUIT app key is sent only as required
 gateway request metadata in the `user` JSON string, not inside the chat prompt.
+Model transactions are grouped into bounded chat/session/conversation ids and
+rotate before CIRCUIT's approximate 10-transaction chat guidance. Prior chunk
+information is carried forward explicitly through structured chunk outputs and
+the final synthesis prompt, so review quality does not depend on long-lived chat
+memory.
+Deep reviews also use a Circuit-aware packet planner: deterministic/local
+checks still inspect the broad PR context, while model calls skip low-signal
+generated chunks such as `README.md`, `LICENSE`, `NOTICE`, and metadata-only
+`__init__.py` changes. Reviewed chunks are sent as focused packets containing
+the changed hunks, removed-code focus, relevant comments/CI snippets, and
+targeted line-window context instead of broad full-file dumps.
 
 The CLI does not auto-load credential files. For local development only, you
 can point `AGENTIC_PR_REVIEW_ENV_FILE` at an ignored env file.

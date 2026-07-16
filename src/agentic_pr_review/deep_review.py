@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 from pathlib import PurePosixPath
+import re
 from typing import Any
 
 from .collector import PRCollector, is_probably_text, is_relevant_full_file
@@ -18,6 +19,60 @@ DEEP_CONTEXT_FILES = {
     "release_notes/unreleased.md",
     "pyproject.toml",
     "uv.lock",
+}
+
+CIRCUIT_PACKET_DIFF_CHARS = 30_000
+CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS = 10_000
+CIRCUIT_PACKET_RELATED_CONTEXT_CHARS = 5_000
+
+LOW_SIGNAL_MODEL_FILENAMES = {
+    "license",
+    "notice",
+    "readme.md",
+}
+
+RISKY_MODEL_TERMS = {
+    "action_result",
+    "add_data",
+    "summary",
+    "save_artifact",
+    "save_container",
+    "source_data_identifier",
+    "on_poll",
+    "is_poll_now",
+    "checkpoint",
+    "save_state",
+    "load_state",
+    "requests.",
+    "httpx.",
+    "timeout",
+    "verify",
+    "verify_server_cert",
+    "token",
+    "oauth",
+    "authorization",
+    "client_secret",
+    "debug_print",
+    "logger.",
+    "read_only",
+    "param(",
+    "assetfield",
+    "actionoutput",
+    "model_validate",
+    "base64",
+    "b64decode",
+    "json.loads",
+    "pagination",
+    "nextlink",
+    "next_page",
+    "rate limit",
+    "429",
+    "pull_request_target",
+    "secrets.",
+    "self-hosted",
+    "<<<<<<<",
+    "=======",
+    ">>>>>>>",
 }
 
 
@@ -282,22 +337,30 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
     previous_path = str(chunk.get("previous_path") or path)
     full_files = review_input.get("full_files") or {}
     base_files = review_input.get("base_files") or {}
-    context_char_limit = int(chunk.get("context_char_limit") or 35_000)
+    context_char_limit = int(chunk.get("context_char_limit") or 14_000)
     if path.endswith(".py") and not chunk.get("adaptive_retry"):
-        context_char_limit = min(context_char_limit, 24_000)
+        context_char_limit = min(context_char_limit, 8_000)
     context_files = select_context_files(full_files, path, max_chars=context_char_limit)
     base_context_files = select_context_files(base_files, previous_path, max_chars=context_char_limit)
+    review_packet = build_circuit_review_packet(
+        review_input,
+        chunk,
+        context_files,
+        base_context_files,
+    )
     instruction = "Only report concrete issues proven by this chunk plus supplied PR context."
     if chunk.get("adaptive_retry"):
         instruction += (
             " This is a smaller retry slice of a larger file chunk after a transient model gateway failure; "
             "review this slice fully and do not assume sibling slices are already represented here."
         )
+    if chunk.get("model_review_reason"):
+        instruction += f" Circuit packet planner reason: {chunk.get('model_review_reason')}."
 
     return {
         "schema_version": "0.1",
         "review_scope": {
-            "type": "deep_file_chunk",
+            "type": "circuit_review_packet",
             "chunk_id": chunk.get("id"),
             "parent_chunk_id": chunk.get("parent_chunk_id"),
             "adaptive_retry": bool(chunk.get("adaptive_retry")),
@@ -305,8 +368,11 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             "previous_path": chunk.get("previous_path"),
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
+            "model_review_priority": chunk.get("model_review_priority"),
+            "model_review_reason": chunk.get("model_review_reason"),
             "instruction": instruction,
         },
+        "review_packet": review_packet,
         "repo": review_input.get("repo"),
         "pr": review_input.get("pr"),
         "changed_files": [
@@ -317,14 +383,14 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
                 "additions": chunk.get("additions"),
                 "deletions": chunk.get("deletions"),
                 "changes": chunk.get("changes"),
-                "patch": chunk.get("diff"),
+                "patch": review_packet.get("diff"),
                 "deep_chunk": True,
                 "chunk_index": chunk.get("chunk_index"),
                 "chunk_total": chunk.get("chunk_total"),
             }
         ],
-        "full_files": context_files,
-        "base_files": base_context_files,
+        "full_files": review_packet.get("head_context_files") or context_files,
+        "base_files": review_packet.get("base_context_files") or base_context_files,
         "comments": select_chunk_comments(review_input.get("comments") or {}, path),
         "ci": select_chunk_ci(review_input.get("ci") or {}, path),
         "historical_context": filter_historical_context_for_path(
@@ -340,6 +406,345 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             "deep_adaptive_retry": bool(chunk.get("adaptive_retry")),
         },
     }
+
+
+def plan_circuit_review_chunks(
+    chunks: list[dict[str, Any]],
+    deterministic_findings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    planned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for chunk in chunks:
+        decision = classify_chunk_for_circuit(chunk, deterministic_findings)
+        annotated = dict(chunk)
+        annotated["model_review_priority"] = decision["priority"]
+        annotated["model_review_reason"] = decision["reason"]
+        if decision["action"] == "skip":
+            skipped.append(
+                {
+                    "id": chunk.get("id"),
+                    "path": chunk.get("path"),
+                    "reason": decision["reason"],
+                    "priority": decision["priority"],
+                }
+            )
+            continue
+        planned.append(annotated)
+    return planned, skipped
+
+
+def classify_chunk_for_circuit(
+    chunk: dict[str, Any],
+    deterministic_findings: list[dict[str, Any]],
+) -> dict[str, str]:
+    path = str(chunk.get("path") or "")
+    name = PurePosixPath(path).name.lower()
+    suffix = PurePosixPath(path).suffix.lower()
+    diff = str(chunk.get("diff") or "")
+    diff_lower = diff.lower()
+
+    if name in LOW_SIGNAL_MODEL_FILENAMES:
+        return {"action": "skip", "priority": "low", "reason": f"{name} is low-signal for model review"}
+    if any(str(finding.get("file") or "") == path for finding in deterministic_findings if isinstance(finding, dict)):
+        return {"action": "review", "priority": "high", "reason": "deterministic finding targets this file"}
+    if name == "__init__.py" and is_metadata_only_diff(diff):
+        return {"action": "skip", "priority": "low", "reason": "__init__.py change is metadata-only"}
+    if any(term in diff_lower for term in RISKY_MODEL_TERMS):
+        return {"action": "review", "priority": "high", "reason": "diff contains connector-risk keywords"}
+    if chunk.get("status") == "removed" and suffix in {".py", ".json", ".toml", ".yml", ".yaml"}:
+        return {"action": "review", "priority": "high", "reason": "removed code/config can be a regression"}
+    if is_test_path(path):
+        return {"action": "review", "priority": "medium", "reason": "test change can affect review evidence"}
+    if path.startswith(".github/workflows/"):
+        return {"action": "review", "priority": "medium", "reason": "workflow changes can affect CI/secrets behavior"}
+    if suffix in {".py", ".json", ".toml", ".yml", ".yaml", ".xml", ".html", ".jinja", ".j2"}:
+        return {"action": "review", "priority": "medium", "reason": "connector source/config change"}
+    if path.startswith("release_notes/") or name == "manual_readme_content.md":
+        return {"action": "review", "priority": "medium", "reason": "user-visible docs/release-note source"}
+    return {"action": "skip", "priority": "low", "reason": "low-signal non-connector chunk"}
+
+
+def is_metadata_only_diff(diff: str) -> bool:
+    changed_lines: list[str] = []
+    for raw_line in diff.splitlines():
+        if raw_line.startswith(("+++", "---", "@@")):
+            continue
+        if raw_line.startswith(("+", "-")):
+            changed_lines.append(raw_line[1:].strip())
+    if not changed_lines:
+        return True
+    metadata_terms = ("copyright", "license", "generated", "__version__", "version", "year")
+    for line in changed_lines:
+        lowered = line.lower()
+        if not line or line in {'"""', "'''"}:
+            continue
+        if lowered.startswith(("#", "\"\"\"", "'''")) and any(term in lowered for term in metadata_terms):
+            continue
+        if re.fullmatch(r"[,\[\]\{\}\(\)]*", line):
+            continue
+        if re.fullmatch(r"\d{4}(?:-\d{4})?", line):
+            continue
+        return False
+    return True
+
+
+def is_test_path(path: str) -> bool:
+    lowered = path.lower()
+    name = PurePosixPath(path).name.lower()
+    return lowered.startswith("tests/") or "/tests/" in lowered or name.startswith("test_") or name.endswith("_test.py")
+
+
+def build_circuit_review_packet(
+    review_input: dict[str, Any],
+    chunk: dict[str, Any],
+    context_files: dict[str, str],
+    base_context_files: dict[str, str],
+) -> dict[str, Any]:
+    path = str(chunk.get("path") or "")
+    previous_path = str(chunk.get("previous_path") or path)
+    diff = str(chunk.get("diff") or "")
+    hunk_summaries = summarize_diff_hunks(diff)
+    head_ranges = [
+        (int(item["new_start"]), int(item["new_count"]))
+        for item in hunk_summaries
+        if int(item.get("new_count") or 0) > 0
+    ]
+    base_ranges = [
+        (int(item["old_start"]), int(item["old_count"]))
+        for item in hunk_summaries
+        if int(item.get("old_count") or 0) > 0
+    ]
+    terms = interesting_terms_from_diff(diff, path)
+    head_context = focused_context_for_packet(
+        context_files,
+        primary_path=path,
+        primary_ranges=head_ranges,
+        terms=terms,
+        primary_max_chars=CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS,
+        related_max_chars=CIRCUIT_PACKET_RELATED_CONTEXT_CHARS,
+    )
+    base_context = focused_context_for_packet(
+        base_context_files,
+        primary_path=previous_path,
+        primary_ranges=base_ranges,
+        terms=terms,
+        primary_max_chars=max(4_000, CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS // 2),
+        related_max_chars=max(2_500, CIRCUIT_PACKET_RELATED_CONTEXT_CHARS // 2),
+    )
+    return {
+        "packet_type": "focused_circuit_pr_review_packet",
+        "packet_goal": (
+            "Judge this focused changed-file packet for concrete SOAR connector issues. "
+            "Use local deterministic findings as candidate evidence, and do not report speculative issues."
+        ),
+        "path": path,
+        "previous_path": previous_path if previous_path != path else None,
+        "status": chunk.get("status"),
+        "change_stats": {
+            "additions": chunk.get("additions"),
+            "deletions": chunk.get("deletions"),
+            "changes": chunk.get("changes"),
+            "chunk_index": chunk.get("chunk_index"),
+            "chunk_total": chunk.get("chunk_total"),
+        },
+        "planner": {
+            "priority": chunk.get("model_review_priority"),
+            "reason": chunk.get("model_review_reason"),
+            "diff_chars_before_packet": len(diff),
+            "diff_truncated_for_packet": len(diff) > CIRCUIT_PACKET_DIFF_CHARS,
+        },
+        "diff": truncate_text(diff, CIRCUIT_PACKET_DIFF_CHARS),
+        "changed_hunks": hunk_summaries[:24],
+        "removed_code_focus": removed_line_excerpts(diff),
+        "head_context_files": head_context,
+        "base_context_files": base_context,
+        "terms_used_for_context": terms[:25],
+        "collection_diagnostics": {
+            "repo": review_input.get("repo"),
+            "pr_number": (review_input.get("pr") or {}).get("number"),
+            "collector_notes": review_input.get("collector_notes") or {},
+        },
+    }
+
+
+def summarize_diff_hunks(diff: str) -> list[dict[str, Any]]:
+    _, hunks = split_unified_diff(diff)
+    output: list[dict[str, Any]] = []
+    for hunk in hunks:
+        lines = hunk.splitlines()
+        if not lines:
+            continue
+        parsed = parse_hunk_header(lines[0])
+        if parsed is None:
+            continue
+        added = []
+        removed = []
+        for line in lines[1:]:
+            if line.startswith("+") and not line.startswith("+++"):
+                added.append(line)
+            elif line.startswith("-") and not line.startswith("---"):
+                removed.append(line)
+        output.append(
+            {
+                **parsed,
+                "added_excerpt": truncate_text("\n".join(added), 2_000),
+                "removed_excerpt": truncate_text("\n".join(removed), 2_000),
+            }
+        )
+    return output
+
+
+def parse_hunk_header(header: str) -> dict[str, Any] | None:
+    match = re.match(
+        r"@@\s+-(?P<old_start>\d+)(?:,(?P<old_count>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))?",
+        header,
+    )
+    if not match:
+        return None
+    old_count = int(match.group("old_count") or "1")
+    new_count = int(match.group("new_count") or "1")
+    return {
+        "header": header,
+        "old_start": int(match.group("old_start")),
+        "old_count": old_count,
+        "new_start": int(match.group("new_start")),
+        "new_count": new_count,
+    }
+
+
+def focused_context_for_packet(
+    files: dict[str, str],
+    *,
+    primary_path: str,
+    primary_ranges: list[tuple[int, int]],
+    terms: list[str],
+    primary_max_chars: int,
+    related_max_chars: int,
+) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for path, text in files.items():
+        if path == primary_path:
+            output[path] = line_window_snippets(text, primary_ranges, radius=35, max_chars=primary_max_chars)
+            continue
+        snippet = keyword_snippets(text, terms, radius=8, max_snippets=5, max_chars=related_max_chars)
+        if snippet:
+            output[path] = snippet
+        elif should_keep_context_file_without_term(path) or is_related_view_context_file(path, primary_path):
+            output[path] = truncate_text(text, min(related_max_chars, 3_000))
+    return output
+
+
+def line_window_snippets(
+    text: str,
+    ranges: list[tuple[int, int]],
+    *,
+    radius: int,
+    max_chars: int,
+) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if not ranges:
+        return truncate_text(text, max_chars)
+    windows: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for start, count in ranges[:10]:
+        if start <= 0:
+            start = 1
+        end_line = start + max(count, 1) - 1
+        window_start = max(1, start - radius)
+        window_end = min(len(lines), end_line + radius)
+        key = (window_start, window_end)
+        if key in seen:
+            continue
+        seen.add(key)
+        numbered = [
+            f"{line_no}: {lines[line_no - 1]}"
+            for line_no in range(window_start, window_end + 1)
+        ]
+        windows.append(f"lines {window_start}-{window_end}\n" + "\n".join(numbered))
+    return truncate_text("\n\n---\n\n".join(windows), max_chars)
+
+
+def keyword_snippets(
+    text: str,
+    terms: list[str],
+    *,
+    radius: int,
+    max_snippets: int,
+    max_chars: int,
+) -> str:
+    if not text or not terms:
+        return ""
+    lines = text.splitlines()
+    lowered_terms = [term.lower() for term in terms if len(term) >= 4]
+    snippets: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for index, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if not any(term in lowered for term in lowered_terms):
+            continue
+        start = max(1, index - radius)
+        end = min(len(lines), index + radius)
+        key = (start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        snippets.append(
+            f"lines {start}-{end}\n"
+            + "\n".join(f"{line_no}: {lines[line_no - 1]}" for line_no in range(start, end + 1))
+        )
+        if len(snippets) >= max_snippets:
+            break
+    return truncate_text("\n\n---\n\n".join(snippets), max_chars)
+
+
+def should_keep_context_file_without_term(path: str) -> bool:
+    name = PurePosixPath(path).name
+    return name in DEEP_CONTEXT_FILES or ("/" not in path and path.endswith(".json"))
+
+
+def interesting_terms_from_diff(diff: str, path: str) -> list[str]:
+    ignored = {
+        "self",
+        "none",
+        "true",
+        "false",
+        "return",
+        "import",
+        "from",
+        "class",
+        "def",
+        "with",
+        "data",
+        "result",
+        "response",
+        "action",
+    }
+    raw_terms = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{3,}\b", diff)
+    raw_terms.extend(re.findall(r"`([^`]{4,80})`", diff))
+    raw_terms.extend(PurePosixPath(path).stem.split("_"))
+    output: list[str] = []
+    seen: set[str] = set()
+    for term in raw_terms:
+        normalized = str(term).strip().lower()
+        if len(normalized) < 4 or normalized in ignored or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+        if len(output) >= 40:
+            break
+    return output
+
+
+def removed_line_excerpts(diff: str, *, max_chars: int = 4_000) -> str:
+    removed = []
+    for raw_line in diff.splitlines():
+        if raw_line.startswith("---") or raw_line.startswith("@@"):
+            continue
+        if raw_line.startswith("-"):
+            removed.append(raw_line)
+    return truncate_text("\n".join(removed), max_chars)
 
 
 def select_context_files(files: dict[str, str], primary_path: str, *, max_chars: int = 80_000) -> dict[str, str]:

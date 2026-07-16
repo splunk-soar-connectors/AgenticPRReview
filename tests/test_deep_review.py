@@ -5,6 +5,7 @@ from agentic_pr_review.deep_review import (
     build_chunk_review_input,
     chunk_unified_diff,
     generate_unified_diff,
+    plan_circuit_review_chunks,
     split_chunk_for_adaptive_retry,
 )
 
@@ -82,7 +83,8 @@ class DeepReviewHelpersTest(unittest.TestCase):
 
         chunk_input = build_chunk_review_input(review_input, chunk)
 
-        self.assertEqual(chunk_input["review_scope"]["type"], "deep_file_chunk")
+        self.assertEqual(chunk_input["review_scope"]["type"], "circuit_review_packet")
+        self.assertEqual(chunk_input["review_packet"]["packet_type"], "focused_circuit_pr_review_packet")
         self.assertIn("connector.py", chunk_input["full_files"])
         self.assertIn("sample.json", chunk_input["full_files"])
         self.assertNotIn("templates/ioc_view.html", chunk_input["full_files"])
@@ -119,7 +121,7 @@ class DeepReviewHelpersTest(unittest.TestCase):
 
         self.assertTrue(chunk_input["review_scope"]["adaptive_retry"])
         self.assertEqual(chunk_input["review_scope"]["parent_chunk_id"], "connector.py:1")
-        self.assertLess(len(chunk_input["full_files"]["connector.py"]), 150)
+        self.assertLess(len(chunk_input["full_files"]["connector.py"]), 220)
         self.assertIn("smaller retry slice", chunk_input["review_scope"]["instruction"])
 
     def test_chunk_review_input_keeps_only_path_relevant_comments_and_ci_logs(self):
@@ -233,6 +235,92 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertIn("templates/ioc_view.html", chunk_input["full_files"])
         self.assertIn("default/data/ui/dashboards/ioc_view.xml", chunk_input["full_files"])
         self.assertNotIn("connector.py", chunk_input["full_files"])
+
+    def test_circuit_planner_skips_generated_and_metadata_only_chunks(self):
+        chunks = [
+            {
+                "id": "README.md:1",
+                "path": "README.md",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            },
+            {
+                "id": "LICENSE:1",
+                "path": "LICENSE",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-2025\n+2025-2026",
+            },
+            {
+                "id": "__init__.py:1",
+                "path": "__init__.py",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-# Copyright 2025\n+# Copyright 2025-2026",
+            },
+            {
+                "id": "connector.py:1",
+                "path": "connector.py",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-response = requests.get(url, timeout=30)\n+response = requests.get(url)",
+            },
+        ]
+
+        planned, skipped = plan_circuit_review_chunks(chunks, [])
+
+        self.assertEqual([item["path"] for item in planned], ["connector.py"])
+        self.assertEqual({item["path"] for item in skipped}, {"README.md", "LICENSE", "__init__.py"})
+        self.assertEqual(planned[0]["model_review_priority"], "high")
+
+    def test_circuit_planner_keeps_manual_docs_with_deterministic_finding(self):
+        chunks = [
+            {
+                "id": "manual_readme_content.md:1",
+                "path": "manual_readme_content.md",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            }
+        ]
+
+        planned, skipped = plan_circuit_review_chunks(
+            chunks,
+            [{"file": "manual_readme_content.md", "title": "docs generator input mismatch"}],
+        )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(skipped, [])
+        self.assertEqual(planned[0]["model_review_reason"], "deterministic finding targets this file")
+
+    def test_chunk_review_input_builds_focused_packet_context(self):
+        big_file = "\n".join(f"line_{idx}" for idx in range(1, 1_200))
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {
+                "connector.py": big_file,
+                "sample.json": '{"actions": [{"identifier": "lookup_ioc"}]}',
+            },
+            "base_files": {
+                "connector.py": big_file.replace("line_100", "old_line_100"),
+            },
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+        }
+        chunk = {
+            "id": "connector.py:1",
+            "path": "connector.py",
+            "status": "modified",
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "diff": "@@ -100,3 +100,3 @@\n-line_100\n+lookup_ioc = line_100\n line_101\n line_102",
+        }
+
+        chunk_input = build_chunk_review_input(review_input, chunk)
+
+        packet = chunk_input["review_packet"]
+        self.assertIn("lines 65-", packet["head_context_files"]["connector.py"])
+        self.assertIn("100:", packet["head_context_files"]["connector.py"])
+        self.assertIn("lookup_ioc", packet["changed_hunks"][0]["added_excerpt"])
+        self.assertLess(len(chunk_input["full_files"]["connector.py"]), len(big_file))
 
     def test_deep_merge_replaces_truncated_github_patch_with_full_diff(self):
         collector = object.__new__(DeepPRCollector)

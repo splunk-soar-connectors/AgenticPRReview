@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from typing import Any, Callable
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -20,10 +21,11 @@ from .deep_review import (
     build_chunk_review_input,
     dedupe_findings,
     filter_findings_for_chunk,
+    plan_circuit_review_chunks,
     split_chunk_for_adaptive_retry,
 )
 from .json_utils import extract_json_object, truncate_text
-from .models import normalize_review_output
+from .models import deterministic_only_output, normalize_review_output
 from .progress import AdaptiveETA, format_duration
 from .prompt import SYSTEM_PROMPT, build_synthesis_prompt, build_user_prompt
 from .secret_redactor import redact_obj, redact_text
@@ -35,6 +37,7 @@ GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
 GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
 CHUNK_MODEL_INPUT_CHARS = 70_000
 ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS = 45_000
+CIRCUIT_CHAT_TRANSACTION_LIMIT = 8
 
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -142,6 +145,11 @@ class GatewayClaudeReviewer:
         self._token_lock = threading.Lock()
         self._response_format_lock = threading.Lock()
         self._eta_lock = threading.Lock()
+        self._run_chat_prefix = f"agentic-pr-review-{uuid.uuid4().hex}"
+        self._chat_lock = threading.Lock()
+        self._chat_session_index = 0
+        self._chat_transaction_count = 0
+        self._current_chat_id: str | None = None
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -168,6 +176,37 @@ class GatewayClaudeReviewer:
         if not chunks:
             self.progress("No deep-review chunks found; starting a single model review.")
             return self.review(review_input, deterministic_findings)
+
+        original_chunk_count = len(chunks)
+        chunks, skipped_model_chunks = plan_circuit_review_chunks(chunks, deterministic_findings)
+        deep_review_meta = review_input.setdefault("deep_review", {})
+        deep_review_meta["model_packet_strategy"] = "circuit_focused_packets_skip_low_signal"
+        deep_review_meta["model_skipped_chunk_count"] = len(skipped_model_chunks)
+        deep_review_meta["model_skipped_chunks"] = skipped_model_chunks[:100]
+        notes = review_input.setdefault("collector_notes", {})
+        notes["deep_model_original_chunk_count"] = original_chunk_count
+        notes["deep_model_review_chunk_count"] = len(chunks)
+        notes["deep_model_skipped_chunk_count"] = len(skipped_model_chunks)
+        if skipped_model_chunks:
+            self.progress(
+                f"Circuit packet planner skipped {len(skipped_model_chunks)} low-signal chunk(s); "
+                f"{len(chunks)} chunk(s) remain for model review."
+            )
+        if not chunks:
+            self.progress("No high-signal deep-review chunks remain; completing with deterministic checks only.")
+            output = deterministic_only_output(deterministic_findings)
+            output["summary"] = "No high-signal chunks required model review; deterministic checks completed."
+            output["model_notes"] = "Circuit model review skipped because every deep-review chunk was low-signal."
+            output["deep_review"] = {
+                "enabled": True,
+                "chunk_count": original_chunk_count,
+                "reviewed_chunk_count": 0,
+                "model_skipped_chunk_count": len(skipped_model_chunks),
+                "max_chunks": max_chunks,
+                "model_packet_strategy": "circuit_focused_packets_skip_low_signal",
+            }
+            output["chunk_review_outputs"] = []
+            return output
 
         chunk_outputs: list[dict[str, Any]] = []
         total_chunks = len(chunks)
@@ -205,9 +244,11 @@ class GatewayClaudeReviewer:
         self.progress(f"Synthesis completed in {synthesis_elapsed}.")
         final_output["deep_review"] = {
             "enabled": True,
-            "chunk_count": len(chunks),
+            "chunk_count": original_chunk_count,
             "reviewed_chunk_count": len(chunk_outputs),
+            "model_skipped_chunk_count": len(skipped_model_chunks),
             "max_chunks": max_chunks,
+            "model_packet_strategy": "circuit_focused_packets_skip_low_signal",
         }
         final_output["chunk_review_outputs"] = chunk_outputs
         return final_output
@@ -428,6 +469,7 @@ class GatewayClaudeReviewer:
 
     def _model_body(self, user_prompt: str) -> dict[str, Any]:
         safe_user_prompt = redact_text(user_prompt)
+        chat_id = self._next_chat_id()
         body = {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -437,7 +479,15 @@ class GatewayClaudeReviewer:
             "temperature": self.temperature,
             # CIRCUIT validates this exact JSON string metadata field.
             # It is auth metadata, not part of the chat prompt.
-            "user": json.dumps({"appkey": self.config.gateway_app_key}),
+            "user": json.dumps(
+                {
+                    "appkey": self.config.gateway_app_key,
+                    "chat_id": chat_id,
+                    "session_id": chat_id,
+                    "conversation_id": chat_id,
+                },
+                separators=(",", ":"),
+            ),
         }
         if should_include_model_in_body(str(self.config.gateway_base_url or "")):
             body["model"] = self.config.gateway_model
@@ -445,6 +495,15 @@ class GatewayClaudeReviewer:
         if response_format is not None:
             body["response_format"] = response_format
         return body
+
+    def _next_chat_id(self) -> str:
+        with self._chat_lock:
+            if self._current_chat_id is None or self._chat_transaction_count >= CIRCUIT_CHAT_TRANSACTION_LIMIT:
+                self._chat_session_index += 1
+                self._current_chat_id = f"{self._run_chat_prefix}-chat-{self._chat_session_index}"
+                self._chat_transaction_count = 0
+            self._chat_transaction_count += 1
+            return self._current_chat_id
 
     def _response_format(self) -> dict[str, Any] | None:
         with self._response_format_lock:

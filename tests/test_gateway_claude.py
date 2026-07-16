@@ -10,6 +10,7 @@ import unittest
 
 from agentic_pr_review.gateway_claude import (
     CHUNK_MODEL_INPUT_CHARS,
+    CIRCUIT_CHAT_TRANSACTION_LIMIT,
     GatewayClaudeReviewer,
     GatewayModelFormatError,
     GatewayTransientModelError,
@@ -166,7 +167,11 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
-        self.assertEqual(json.loads(model_payload["user"]), {"appkey": "app-key-test"})
+        user_metadata = json.loads(model_payload["user"])
+        self.assertEqual(user_metadata["appkey"], "app-key-test")
+        self.assertTrue(user_metadata["chat_id"].startswith("agentic-pr-review-"))
+        self.assertEqual(user_metadata["session_id"], user_metadata["chat_id"])
+        self.assertEqual(user_metadata["conversation_id"], user_metadata["chat_id"])
         self.assertNotIn("model", model_payload)
         self.assertEqual(model_payload["response_format"]["type"], "json_schema")
         self.assertEqual(model_payload["response_format"]["json_schema"]["name"], "agentic_pr_review_output")
@@ -174,6 +179,78 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(model_payload["max_tokens"], 123)
         self.assertEqual(model_payload["messages"][0]["role"], "system")
         self.assertEqual(model_payload["messages"][1]["content"], "review this")
+
+    def test_gateway_reuses_chat_metadata_until_circuit_transaction_limit(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        model_user_metadata = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/token"):
+                return Response({"access_token": "access-token-test", "token_type": "Bearer", "expires_in": 3600})
+            payload = json.loads(request.data.decode("utf-8"))
+            model_user_metadata.append(json.loads(payload["user"]))
+            return Response(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "ok",
+                                        "overall_status": "looks_good",
+                                        "safe_to_publish": True,
+                                        "findings": [],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch("agentic_pr_review.gateway_claude.urlopen", fake_urlopen):
+            for index in range(CIRCUIT_CHAT_TRANSACTION_LIMIT + 1):
+                reviewer._invoke_review(f"review {index}", [])
+
+        self.assertEqual(len(model_user_metadata), CIRCUIT_CHAT_TRANSACTION_LIMIT + 1)
+        self.assertEqual({item["appkey"] for item in model_user_metadata}, {"app-key-test"})
+        first_chat_id = model_user_metadata[0]["chat_id"]
+        self.assertTrue(first_chat_id.startswith("agentic-pr-review-"))
+        self.assertEqual(
+            {item["chat_id"] for item in model_user_metadata[:CIRCUIT_CHAT_TRANSACTION_LIMIT]},
+            {first_chat_id},
+        )
+        self.assertNotEqual(model_user_metadata[CIRCUIT_CHAT_TRANSACTION_LIMIT]["chat_id"], first_chat_id)
+        for metadata in model_user_metadata:
+            self.assertEqual(metadata["session_id"], metadata["chat_id"])
+            self.assertEqual(metadata["conversation_id"], metadata["chat_id"])
 
     def test_gateway_review_refreshes_token_after_model_auth_failure(self):
         env = {
@@ -519,7 +596,9 @@ class GatewayClaudeTest(unittest.TestCase):
         model_body = bodies[1]
         self.assertIn(REDACTED_SECRET, model_body)
         self.assertNotIn("canary-direct-secret", model_body)
-        self.assertEqual(json.loads(json.loads(model_body)["user"]), {"appkey": "canary-app-key-direct"})
+        user_metadata = json.loads(json.loads(model_body)["user"])
+        self.assertEqual(user_metadata["appkey"], "canary-app-key-direct")
+        self.assertTrue(user_metadata["chat_id"].startswith("agentic-pr-review-"))
 
     def test_gateway_repairs_non_json_model_response(self):
         env = {

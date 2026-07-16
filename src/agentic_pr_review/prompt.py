@@ -429,6 +429,8 @@ def compact_review_input_for_model(review_input: dict, *, limits: dict[str, int]
         review_input.get("historical_context") or {},
         limits=limits,
     )
+    if isinstance(review_input.get("review_packet"), dict):
+        compacted["review_packet"] = compact_review_packet(review_input["review_packet"], limits=limits)
     compacted["sdk_manifest"] = compact_sdk_manifest_context(review_input.get("sdk_manifest") or {})
     if isinstance(review_input.get("sdk_review_inventory"), dict):
         compacted["sdk_review_inventory"] = compact_sdk_review_inventory(review_input["sdk_review_inventory"])
@@ -440,6 +442,33 @@ def compact_changed_file(item: dict, *, patch_limit: int) -> dict:
     patch = str(item.get("patch") or "")
     output["patch"] = truncate_text(patch, patch_limit)
     output["model_patch_truncated"] = len(patch) > patch_limit
+    return output
+
+
+def compact_review_packet(packet: dict, *, limits: dict[str, int]) -> dict:
+    output = dict(packet)
+    output["diff"] = truncate_text(str(packet.get("diff") or ""), min(limits["patch"] * 3, 20_000))
+    output["removed_code_focus"] = truncate_text(
+        str(packet.get("removed_code_focus") or ""),
+        min(limits["patch"], 4_000),
+    )
+    output["head_context_files"] = {
+        path: truncate_text(str(text), min(limits["file"] * 2, 10_000))
+        for path, text in (packet.get("head_context_files") or {}).items()
+    }
+    output["base_context_files"] = {
+        path: truncate_text(str(text), min(limits["file"] * 2, 8_000))
+        for path, text in (packet.get("base_context_files") or {}).items()
+    }
+    compact_hunks = []
+    for hunk in (packet.get("changed_hunks") or [])[:20]:
+        if not isinstance(hunk, dict):
+            continue
+        item = dict(hunk)
+        item["added_excerpt"] = truncate_text(str(item.get("added_excerpt") or ""), min(limits["patch"], 2_000))
+        item["removed_excerpt"] = truncate_text(str(item.get("removed_excerpt") or ""), min(limits["patch"], 2_000))
+        compact_hunks.append(item)
+    output["changed_hunks"] = compact_hunks
     return output
 
 
