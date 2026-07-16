@@ -9,6 +9,7 @@ from unittest.mock import patch
 import unittest
 
 from agentic_pr_review.gateway_claude import (
+    CHUNK_MODEL_INPUT_CHARS,
     GatewayClaudeReviewer,
     GatewayModelFormatError,
     GatewayTransientModelError,
@@ -891,6 +892,78 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(output["deep_review"]["reviewed_chunk_count"], 2)
         self.assertEqual([item["chunk_path"] for item in output["chunk_review_outputs"]], ["one.py", "two.py"])
         self.assertEqual(invoke_count, 3)
+
+    def test_deep_review_chunk_uses_smaller_prompt_budget_than_global_limit(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {
+                "connector.py": "def one():\n    return 1\n" + ("x" * 200_000),
+                "sample.json": "y" * 80_000,
+            },
+            "base_files": {"connector.py": "z" * 120_000},
+            "comments": {
+                "review_comments": [{"path": "connector.py", "body": "comment " * 20_000}],
+                "issue_comments": [{"body": "connector.py " + ("issue " * 20_000)}],
+                "reviews": [{"body": "review " * 20_000}],
+            },
+            "ci": {
+                "check_runs": [
+                    {
+                        "name": "pre-commit",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "output": {"summary": "s" * 100_000, "text": "t" * 100_000},
+                    }
+                ],
+                "failed_check_logs": [{"body": "connector.py " + ("log " * 50_000)}],
+            },
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -1 +1 @@\n-return 0\n+return 1",
+                    }
+                ]
+            },
+        }
+        output_template = {
+            "summary": "ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        prompt_lengths = []
+
+        def fake_invoke(user_prompt, *args, **kwargs):
+            prompt_lengths.append(len(user_prompt))
+            return dict(output_template)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env(max_model_input_chars=145_000)
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+            reviewer.review_deep(review_input, [], deep_concurrency=1)
+
+        self.assertGreater(config.max_model_input_chars, CHUNK_MODEL_INPUT_CHARS)
+        self.assertLessEqual(prompt_lengths[0], CHUNK_MODEL_INPUT_CHARS + 500)
 
     def test_extract_chat_completion_text(self):
         payload = {"choices": [{"message": {"content": "{\"summary\":\"ok\"}"}}]}

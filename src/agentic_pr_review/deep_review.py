@@ -282,7 +282,9 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
     previous_path = str(chunk.get("previous_path") or path)
     full_files = review_input.get("full_files") or {}
     base_files = review_input.get("base_files") or {}
-    context_char_limit = int(chunk.get("context_char_limit") or 80_000)
+    context_char_limit = int(chunk.get("context_char_limit") or 35_000)
+    if path.endswith(".py") and not chunk.get("adaptive_retry"):
+        context_char_limit = min(context_char_limit, 24_000)
     context_files = select_context_files(full_files, path, max_chars=context_char_limit)
     base_context_files = select_context_files(base_files, previous_path, max_chars=context_char_limit)
     instruction = "Only report concrete issues proven by this chunk plus supplied PR context."
@@ -323,8 +325,8 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
         ],
         "full_files": context_files,
         "base_files": base_context_files,
-        "comments": review_input.get("comments") or {},
-        "ci": review_input.get("ci") or {},
+        "comments": select_chunk_comments(review_input.get("comments") or {}, path),
+        "ci": select_chunk_ci(review_input.get("ci") or {}, path),
         "historical_context": filter_historical_context_for_path(
             review_input.get("historical_context"),
             path,
@@ -352,6 +354,93 @@ def select_context_files(files: dict[str, str], primary_path: str, *, max_chars:
         ):
             output[path] = truncate_text(text, max_chars)
     return output
+
+
+def select_chunk_comments(comments: dict[str, Any], path: str) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(comments, dict):
+        return {"issue_comments": [], "review_comments": [], "reviews": []}
+    basename = PurePosixPath(path).name
+    output: dict[str, list[dict[str, Any]]] = {}
+    for key, limit in (("review_comments", 40), ("issue_comments", 12), ("reviews", 12)):
+        items = comments.get(key) or []
+        if not isinstance(items, list):
+            output[key] = []
+            continue
+        selected = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if comment_matches_path(item, path, basename) or key == "reviews":
+                compact = dict(item)
+                if "body" in compact:
+                    compact["body"] = truncate_text(str(compact.get("body") or ""), 1_200)
+                selected.append(compact)
+            if len(selected) >= limit:
+                break
+        output[key] = selected
+    return output
+
+
+def comment_matches_path(item: dict[str, Any], path: str, basename: str) -> bool:
+    candidate_paths = [
+        str(item.get(key) or "")
+        for key in ("path", "file", "filename", "original_path")
+    ]
+    if any(candidate == path for candidate in candidate_paths):
+        return True
+    body = str(item.get("body") or "")
+    return path in body or (basename and basename in body)
+
+
+def select_chunk_ci(ci: dict[str, Any], path: str) -> dict[str, Any]:
+    if not isinstance(ci, dict):
+        return {}
+    basename = PurePosixPath(path).name
+    output: dict[str, Any] = {}
+    for key in ("errors", "statuses"):
+        value = ci.get(key)
+        if isinstance(value, list):
+            output[key] = value[:20]
+    check_runs = ci.get("check_runs") or []
+    if isinstance(check_runs, list):
+        output["check_runs"] = [
+            compact_check_run(item)
+            for item in check_runs[:80]
+            if isinstance(item, dict)
+        ]
+    failed_logs = ci.get("failed_check_logs") or []
+    if isinstance(failed_logs, list):
+        selected_logs = []
+        for item in failed_logs:
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(str(item.get(key) or "") for key in ("name", "path", "body", "log", "text", "summary"))
+            if path in text or (basename and basename in text):
+                compact = dict(item)
+                for body_key in ("body", "log", "text", "summary"):
+                    if body_key in compact:
+                        compact[body_key] = truncate_text(str(compact.get(body_key) or ""), 1_500)
+                selected_logs.append(compact)
+            if len(selected_logs) >= 8:
+                break
+        output["failed_check_logs"] = selected_logs
+    return output
+
+
+def compact_check_run(item: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: item.get(key)
+        for key in ("name", "status", "conclusion", "html_url", "details_url", "started_at", "completed_at")
+        if key in item
+    }
+    output = item.get("output")
+    if isinstance(output, dict):
+        compact["output"] = {
+            "title": output.get("title"),
+            "summary": truncate_text(str(output.get("summary") or ""), 800),
+            "text": truncate_text(str(output.get("text") or ""), 1_200),
+        }
+    return compact
 
 
 def split_chunk_for_adaptive_retry(

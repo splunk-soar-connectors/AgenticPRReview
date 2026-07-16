@@ -122,6 +122,60 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertLess(len(chunk_input["full_files"]["connector.py"]), 150)
         self.assertIn("smaller retry slice", chunk_input["review_scope"]["instruction"])
 
+    def test_chunk_review_input_keeps_only_path_relevant_comments_and_ci_logs(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def f():\n    return 1\n"},
+            "base_files": {},
+            "comments": {
+                "review_comments": [
+                    {"path": "connector.py", "body": "Fix connector.py timeout."},
+                    {"path": "other.py", "body": "Unrelated comment."},
+                ],
+                "issue_comments": [
+                    {"body": "connector.py still has a failure path."},
+                    {"body": "General unrelated discussion."},
+                ],
+                "reviews": [{"body": "overall review body"}],
+            },
+            "ci": {
+                "check_runs": [
+                    {
+                        "name": "pre-commit",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "output": {"summary": "s" * 2000, "text": "t" * 3000},
+                    }
+                ],
+                "failed_check_logs": [
+                    {"name": "ruff", "body": "connector.py:10: error"},
+                    {"name": "ruff", "body": "other.py:10: error"},
+                ],
+            },
+            "collector_notes": {},
+        }
+        chunk = {
+            "id": "connector.py:1",
+            "path": "connector.py",
+            "status": "modified",
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "diff": "@@ -1 +1 @@\n-return 0\n+return 1",
+        }
+
+        chunk_input = build_chunk_review_input(review_input, chunk)
+
+        self.assertEqual(len(chunk_input["comments"]["review_comments"]), 1)
+        self.assertEqual(chunk_input["comments"]["review_comments"][0]["path"], "connector.py")
+        self.assertEqual(len(chunk_input["comments"]["issue_comments"]), 1)
+        self.assertIn("connector.py", chunk_input["comments"]["issue_comments"][0]["body"])
+        self.assertEqual(len(chunk_input["comments"]["reviews"]), 1)
+        self.assertEqual(len(chunk_input["ci"]["failed_check_logs"]), 1)
+        self.assertIn("connector.py", chunk_input["ci"]["failed_check_logs"][0]["body"])
+        self.assertLess(len(chunk_input["ci"]["check_runs"][0]["output"]["summary"]), 900)
+        self.assertLess(len(chunk_input["ci"]["check_runs"][0]["output"]["text"]), 1300)
+
     def test_split_chunk_for_adaptive_retry_preserves_all_diff_lines(self):
         diff = generate_unified_diff(
             "\n".join(f"old_{idx}" for idx in range(40)),

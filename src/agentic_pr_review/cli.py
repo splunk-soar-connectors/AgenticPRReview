@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--deep-max-file-bytes", type=int, default=5_000_000)
     review.add_argument("--deep-max-file-chars", type=int, default=DEFAULT_MAX_FILE_CHARS)
     review.add_argument("--deep-chunk-chars", type=int, default=35_000)
-    review.add_argument("--deep-concurrency", type=int, default=3, help="Concurrent deep model chunk reviews.")
+    review.add_argument("--deep-concurrency", type=int, default=2, help="Concurrent deep model chunk reviews.")
     review.add_argument("--deep-max-chunks", type=int, default=0, help="Limit deep model chunk reviews. 0 means all chunks.")
     review.add_argument(
         "--enable-sdk-manifest",

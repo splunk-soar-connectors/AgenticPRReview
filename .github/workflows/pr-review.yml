@@ -42,7 +42,7 @@ on:
         description: Concurrent deep model chunk reviews.
         required: false
         type: string
-        default: "3"
+        default: "2"
       publish_comments:
         description: Publish GitHub comments and apply the ai-reviewed label.
         required: false

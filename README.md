@@ -113,7 +113,7 @@ Useful controls:
 ```bash
 PYTHONPATH=src .venv/bin/python -m agentic_pr_review.cli review example-org/example-connector 1 \
   --deep-chunk-chars 35000 \
-  --deep-concurrency 3 \
+  --deep-concurrency 2 \
   --deep-max-file-bytes 5000000 \
   --deep-max-file-chars 250000
 ```
@@ -201,7 +201,7 @@ jobs:
       circuit_request_timeout_seconds: "180"
       circuit_request_max_attempts: "2"
       circuit_request_retry_backoff_seconds: "5"
-      deep_concurrency: "3"
+      deep_concurrency: "2"
     secrets:
       AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
       AI_REVIEW_INSTALLATION_ID: ${{ secrets.AI_REVIEW_INSTALLATION_ID }}

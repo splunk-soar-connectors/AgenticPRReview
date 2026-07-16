@@ -33,6 +33,8 @@ GATEWAY_HEARTBEAT_SECONDS = 60
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
 GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
+CHUNK_MODEL_INPUT_CHARS = 70_000
+ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS = 45_000
 
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -275,7 +277,7 @@ class GatewayClaudeReviewer:
         chunk_prompt = build_user_prompt(
             chunk_input,
             chunk_deterministic,
-            max_chars=self.config.max_model_input_chars,
+            max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS if chunk.get("adaptive_retry") else CHUNK_MODEL_INPUT_CHARS,
         )
         try:
             output = self._invoke_review(chunk_prompt, chunk_deterministic, request_max_attempts=1)
@@ -329,7 +331,7 @@ class GatewayClaudeReviewer:
             sub_prompt = build_user_prompt(
                 sub_input,
                 sub_deterministic,
-                max_chars=self.config.max_model_input_chars,
+                max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS,
             )
             sub_output = self._invoke_review(sub_prompt, sub_deterministic, request_max_attempts=1)
             sub_output["chunk_id"] = subchunk.get("id")
