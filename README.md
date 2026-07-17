@@ -62,14 +62,16 @@ interface.
 Runtime credential values are redacted from model prompts, errors, saved
 artifacts, and published comments. The CIRCUIT app key is sent only as required
 gateway request metadata in the `user` JSON string, not inside the chat prompt.
-Model transactions are grouped into bounded chat/session/conversation ids and
-rotate before CIRCUIT's approximate 10-transaction chat guidance. Concurrent
-deep-review workers use separate bounded chat lanes so two workers do not race
-to initialize the same CIRCUIT conversation. Requests keep CIRCUIT's documented
-chat-completions shape with one system message followed by one user message.
-Prior chunk information is carried forward explicitly through structured chunk
-outputs and the final synthesis prompt, so review quality does not depend on
-long-lived chat memory.
+The gateway `user` metadata matches CIRCUIT's documented Postman shape and
+contains only `{"appkey": "..."}`. The bot does not send undocumented
+`chat_id`/`session_id`/`conversation_id` metadata because those fields can route
+requests into stateful gateway paths that reject normal chat-completions
+payloads. Model requests include CIRCUIT's documented `<|im_end|>` stop
+sequence. If CIRCUIT returns a "start a new chat" style response, the bot
+retries the original review once as a fresh two-message chat-completions
+request. Prior chunk information is carried forward explicitly through
+structured chunk outputs and the final synthesis prompt, so review quality does
+not depend on long-lived chat memory.
 Deep reviews also use a Circuit-aware packet planner: deterministic/local
 checks still inspect the broad PR context, while model calls skip low-signal
 generated chunks such as `README.md`, `LICENSE`, `NOTICE`, and metadata-only

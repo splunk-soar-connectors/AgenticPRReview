@@ -8,11 +8,9 @@ from copy import deepcopy
 from io import BytesIO
 import json
 import os
-import re
 import threading
 import time
 from typing import Any, Callable
-import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -38,7 +36,6 @@ GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
 GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
 CHUNK_MODEL_INPUT_CHARS = 70_000
 ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS = 45_000
-CIRCUIT_CHAT_TRANSACTION_LIMIT = 8
 
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -146,10 +143,6 @@ class GatewayClaudeReviewer:
         self._token_lock = threading.Lock()
         self._response_format_lock = threading.Lock()
         self._eta_lock = threading.Lock()
-        self._run_chat_prefix = f"agentic-pr-review-{uuid.uuid4().hex}"
-        self._chat_lock = threading.Lock()
-        self._chat_session_index = 0
-        self._chat_lanes: dict[str, dict[str, Any]] = {}
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -447,6 +440,18 @@ class GatewayClaudeReviewer:
         previous_text: str,
         original_user_prompt: str,
     ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        if circuit_requests_new_chat(previous_text):
+            self.progress("Gateway requested a new chat; retrying the original review as a fresh request.")
+            try:
+                fresh_payload = self._post_model_json(
+                    self._model_body(build_fresh_chat_retry_prompt(original_user_prompt))
+                )
+                fresh_text = extract_chat_completion_text(fresh_payload)
+                raw_output = extract_json_object(fresh_text)
+                return raw_output, fresh_payload, "Recovered from a CIRCUIT new-chat prompt with a fresh retry."
+            except Exception:
+                self.progress("Gateway new-chat retry failed; attempting normal JSON recovery.")
+
         self.progress("Gateway model returned non-JSON; attempting one JSON repair request.")
         try:
             repair_payload = self._post_model_json(self._model_body(build_json_repair_prompt(previous_text)))
@@ -469,7 +474,6 @@ class GatewayClaudeReviewer:
 
     def _model_body(self, user_prompt: str) -> dict[str, Any]:
         safe_user_prompt = redact_text(user_prompt)
-        chat_id = self._next_chat_id()
         body = {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -477,17 +481,10 @@ class GatewayClaudeReviewer:
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "stop": ["<|im_end|>"],
             # CIRCUIT validates this exact JSON string metadata field.
             # It is auth metadata, not part of the chat prompt.
-            "user": json.dumps(
-                {
-                    "appkey": self.config.gateway_app_key,
-                    "chat_id": chat_id,
-                    "session_id": chat_id,
-                    "conversation_id": chat_id,
-                },
-                separators=(",", ":"),
-            ),
+            "user": json.dumps({"appkey": self.config.gateway_app_key}, separators=(",", ":")),
         }
         if should_include_model_in_body(str(self.config.gateway_base_url or "")):
             body["model"] = self.config.gateway_model
@@ -495,20 +492,6 @@ class GatewayClaudeReviewer:
         if response_format is not None:
             body["response_format"] = response_format
         return body
-
-    def _next_chat_id(self) -> str:
-        lane = current_chat_lane()
-        with self._chat_lock:
-            state = self._chat_lanes.get(lane)
-            if state is None or int(state.get("transaction_count") or 0) >= CIRCUIT_CHAT_TRANSACTION_LIMIT:
-                self._chat_session_index += 1
-                state = {
-                    "chat_id": f"{self._run_chat_prefix}-{lane}-chat-{self._chat_session_index}",
-                    "transaction_count": 0,
-                }
-                self._chat_lanes[lane] = state
-            state["transaction_count"] = int(state.get("transaction_count") or 0) + 1
-            return str(state["chat_id"])
 
     def _response_format(self) -> dict[str, Any] | None:
         with self._response_format_lock:
@@ -697,12 +680,20 @@ def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
 
 
-def current_chat_lane() -> str:
-    name = threading.current_thread().name or "main"
-    if name == "MainThread":
-        name = "main"
-    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-")
-    return sanitized or "main"
+def circuit_requests_new_chat(text: str) -> bool:
+    lowered = text.lower()
+    if "chat" not in lowered:
+        return False
+    new_chat_phrases = (
+        "begin a new chat",
+        "begin new chat",
+        "start a new chat",
+        "start new chat",
+        "new conversation",
+        "start a fresh chat",
+        "fresh chat",
+    )
+    return any(phrase in lowered for phrase in new_chat_phrases)
 
 
 def normalize_deep_concurrency(value: int, total_chunks: int) -> int:
@@ -763,8 +754,25 @@ def build_strict_json_retry_prompt(original_user_prompt: str) -> str:
     )
 
 
+def build_fresh_chat_retry_prompt(original_user_prompt: str) -> str:
+    return (
+        "This is a fresh CIRCUIT chat-completions request with no prior conversation history. "
+        "Review the original request below and return exactly one valid JSON object using the required schema. "
+        "Do not include Markdown, prose outside JSON, headings, or code fences. Preserve review quality and include "
+        "only concrete, high-confidence actionable findings.\n\n"
+        "Original review request:\n"
+        f"{original_user_prompt}"
+    )
+
+
 def extract_chat_completion_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
+    if isinstance(choices, dict):
+        message = choices.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
+        if isinstance(choices.get("text"), str):
+            return choices["text"]
     if isinstance(choices, list) and choices:
         first = choices[0]
         if isinstance(first, dict):
