@@ -177,11 +177,11 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(model_payload["response_format"]["json_schema"]["name"], "agentic_pr_review_output")
         self.assertTrue(model_payload["response_format"]["json_schema"]["strict"])
         self.assertEqual(model_payload["max_tokens"], 123)
-        self.assertEqual(len(model_payload["messages"]), 1)
-        self.assertEqual(model_payload["messages"][0]["role"], "user")
-        self.assertIn("System review instructions:", model_payload["messages"][0]["content"])
-        self.assertIn("PR review request:", model_payload["messages"][0]["content"])
-        self.assertIn("review this", model_payload["messages"][0]["content"])
+        self.assertEqual(len(model_payload["messages"]), 2)
+        self.assertEqual(model_payload["messages"][0]["role"], "system")
+        self.assertEqual(model_payload["messages"][1]["role"], "user")
+        self.assertIn("strict SOAR connectors", model_payload["messages"][0]["content"])
+        self.assertEqual(model_payload["messages"][1]["content"], "review this")
 
     def test_gateway_reuses_chat_metadata_until_circuit_transaction_limit(self):
         env = {
@@ -710,9 +710,10 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertIn("Recovered from a non-JSON model response", output["model_notes"])
         self.assertEqual(len(bodies), 3)
         repair_body = json.loads(bodies[2])
-        self.assertEqual(repair_body["messages"][0]["role"], "user")
-        self.assertIn("Your previous response was not valid JSON", repair_body["messages"][0]["content"])
-        self.assertIn("I found no concrete issue here.", repair_body["messages"][0]["content"])
+        self.assertEqual(repair_body["messages"][0]["role"], "system")
+        self.assertEqual(repair_body["messages"][1]["role"], "user")
+        self.assertIn("Your previous response was not valid JSON", repair_body["messages"][1]["content"])
+        self.assertIn("I found no concrete issue here.", repair_body["messages"][1]["content"])
 
     def test_gateway_retries_original_review_when_json_repair_fails(self):
         env = {
@@ -781,9 +782,10 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertIn("strict JSON retry", output["model_notes"])
         self.assertEqual(len(bodies), 4)
         retry_body = json.loads(bodies[3])
-        self.assertEqual(retry_body["messages"][0]["role"], "user")
-        self.assertIn("Retry the original review request", retry_body["messages"][0]["content"])
-        self.assertIn("review this exact chunk", retry_body["messages"][0]["content"])
+        self.assertEqual(retry_body["messages"][0]["role"], "system")
+        self.assertEqual(retry_body["messages"][1]["role"], "user")
+        self.assertIn("Retry the original review request", retry_body["messages"][1]["content"])
+        self.assertIn("review this exact chunk", retry_body["messages"][1]["content"])
 
     def test_gateway_invalid_json_after_repair_raises_format_error(self):
         env = {

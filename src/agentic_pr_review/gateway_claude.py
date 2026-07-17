@@ -472,7 +472,8 @@ class GatewayClaudeReviewer:
         chat_id = self._next_chat_id()
         body = {
             "messages": [
-                {"role": "user", "content": build_gateway_user_message(safe_user_prompt)},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": safe_user_prompt},
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
@@ -694,15 +695,6 @@ class GatewayClaudeReviewer:
 
 def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
-
-
-def build_gateway_user_message(user_prompt: str) -> str:
-    return (
-        "System review instructions:\n"
-        f"{SYSTEM_PROMPT}\n\n"
-        "PR review request:\n"
-        f"{user_prompt}"
-    )
 
 
 def current_chat_lane() -> str:
