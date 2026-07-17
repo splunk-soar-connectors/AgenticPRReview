@@ -929,6 +929,131 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
         self.assertGreaterEqual(invoke_count, 4)
 
+    def test_deep_review_retries_small_diff_as_focused_packet_after_transient_failure(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def helper():\n    return 1\n" + ("x" * 80_000)},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -10,2 +10,2 @@\n-response = requests.get(url, timeout=30)\n+response = requests.get(url)",
+                    }
+                ]
+            },
+        }
+        output_template = {
+            "summary": "focused retry ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        prompts = []
+
+        def fake_invoke(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                raise GatewayTransientModelError("Gateway model invocation failed: timed out")
+            return dict(output_template)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+            output = reviewer.review_deep(review_input, [], deep_concurrency=1)
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("smaller retry slice", prompts[1])
+        self.assertIn("focused retry after transient gateway failure", prompts[1])
+        self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+
+    def test_deep_review_keeps_deterministic_findings_when_focused_retry_times_out(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def helper():\n    return 1\n" + ("x" * 80_000)},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -10,2 +10,2 @@\n-response = requests.get(url, timeout=30)\n+response = requests.get(url)",
+                    }
+                ]
+            },
+        }
+        deterministic = [
+            {
+                "id": "det-timeout",
+                "title": "Diff removes request timeout handling without visible replacement",
+                "category": "validation",
+                "severity": "high",
+                "confidence": "high",
+                "file": "connector.py",
+                "line": 10,
+                "code_reference": "requests.get",
+                "evidence": "A removed line included timeout=, but no added line restores it.",
+                "why_it_matters": "Connector API calls can hang indefinitely without timeouts.",
+                "suggested_fix": "Restore an explicit timeout on the request.",
+                "suggested_code": None,
+                "source": "deterministic",
+            }
+        ]
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(
+            reviewer,
+            "_invoke_review",
+            side_effect=GatewayTransientModelError("Gateway model invocation failed: timed out"),
+        ):
+            output = reviewer.review_deep(review_input, deterministic, deep_concurrency=1)
+
+        titles = {finding["title"] for finding in output["findings"]}
+        self.assertIn("Diff removes request timeout handling without visible replacement", titles)
+        self.assertIn("repeated transient gateway failure", output["model_notes"])
+
     def test_deep_review_runs_independent_chunks_concurrently(self):
         env = {
             "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",

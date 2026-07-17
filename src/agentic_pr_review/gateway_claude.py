@@ -348,7 +348,7 @@ class GatewayClaudeReviewer:
     ) -> dict[str, Any]:
         subchunks = split_chunk_for_adaptive_retry(chunk)
         if not subchunks:
-            raise original_error
+            subchunks = [build_single_focused_retry_chunk(chunk)]
         path = str(chunk.get("path") or "unknown file")
         self.progress(
             f"Deep-review chunk {parent_position}/{parent_total} hit a transient gateway failure; "
@@ -367,7 +367,14 @@ class GatewayClaudeReviewer:
                 sub_deterministic,
                 max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS,
             )
-            sub_output = self._invoke_review(sub_prompt, sub_deterministic, request_max_attempts=1)
+            try:
+                sub_output = self._invoke_review(sub_prompt, sub_deterministic, request_max_attempts=1)
+            except GatewayTransientModelError as exc:
+                self.progress(
+                    f"Adaptive subchunk {sub_position}/{len(subchunks)} for {path} still hit a transient "
+                    "gateway failure; retaining deterministic findings for this slice."
+                )
+                sub_output = fallback_chunk_transient_output(subchunk, sub_deterministic, exc)
             sub_output["chunk_id"] = subchunk.get("id")
             sub_output["parent_chunk_id"] = subchunk.get("parent_chunk_id")
             sub_output["chunk_path"] = subchunk.get("path")
@@ -680,6 +687,26 @@ def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
 
 
+def build_single_focused_retry_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    parent_id = str(chunk.get("id") or chunk.get("path") or "chunk")
+    retry = dict(chunk)
+    retry.update(
+        {
+            "id": f"{parent_id}:focused-retry",
+            "parent_chunk_id": parent_id,
+            "adaptive_retry": True,
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "context_char_limit": 4_000,
+            "model_review_reason": (
+                f"{chunk.get('model_review_reason') or 'connector source/config change'}; "
+                "focused retry after transient gateway failure"
+            ),
+        }
+    )
+    return retry
+
+
 def circuit_requests_new_chat(text: str) -> bool:
     lowered = text.lower()
     if "chat" not in lowered:
@@ -840,16 +867,43 @@ def fallback_deep_output(
     model_notes: str,
 ) -> dict[str, Any]:
     findings = []
+    chunk_notes = []
     for output in chunk_outputs:
         findings.extend(output.get("findings") or [])
+        note = str(output.get("model_notes") or "").strip()
+        if note:
+            chunk_notes.append(note)
     findings = dedupe_findings(findings)
+    notes = [f"Synthesis failed: {redact_text(model_notes)}"]
+    notes.extend(chunk_notes[:10])
     return normalize_review_output(
         {
             "summary": "Deep chunk review completed, but synthesis failed; using deduplicated chunk findings.",
             "overall_status": "needs_review" if findings else "looks_good",
             "safe_to_publish": True,
             "findings": findings,
-            "model_notes": f"Synthesis failed: {redact_text(model_notes)}",
+            "model_notes": "\n".join(notes),
+        },
+        deterministic_findings=deterministic_findings,
+    )
+
+
+def fallback_chunk_transient_output(
+    chunk: dict[str, Any],
+    deterministic_findings: list[dict[str, Any]],
+    error: GatewayTransientModelError,
+) -> dict[str, Any]:
+    path = str(chunk.get("path") or "chunk")
+    return normalize_review_output(
+        {
+            "summary": f"Model review for {path} hit repeated transient gateway failures.",
+            "overall_status": "needs_review" if deterministic_findings else "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": (
+                f"Model review for `{path}` fell back to deterministic findings after a repeated transient "
+                f"gateway failure: {redact_text(str(error))}"
+            ),
         },
         deterministic_findings=deterministic_findings,
     )
