@@ -25,9 +25,55 @@ DEEP_CONTEXT_FILES = {
 CIRCUIT_PACKET_DIFF_CHARS = 30_000
 CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS = 10_000
 CIRCUIT_PACKET_RELATED_CONTEXT_CHARS = 5_000
-PYTHON_FUNCTION_CHUNK_MIN_FILE_CHARS = 18_000
-PYTHON_FUNCTION_CHUNK_MIN_CHANGES = 140
+CIRCUIT_PACKET_RELATED_FILE_LIMIT = 8
+CONTEXT_SOURCE_FILE_CHARS = 250_000
+CONTEXT_AWARE_HUNK_RADIUS = 45
+PYTHON_SEMANTIC_CONTEXT_CHARS = 12_000
+PYTHON_SEMANTIC_MAX_SYMBOLS = 16
+PYTHON_SEMANTIC_MAX_SNIPPETS = 12
 PYTHON_FUNCTION_CHUNK_TARGET_CHARS = 12_000
+STRUCTURED_UNIT_CHUNK_TARGET_CHARS = 12_000
+PYTHON_RELATED_CONTEXT_FILE_LIMIT = 20
+CONTEXT_AWARE_REVIEW_STRATEGY = "changed_hunks_enclosing_scope_semantic_context"
+
+IGNORED_EXTERNAL_PYTHON_MODULES = {
+    "abc",
+    "argparse",
+    "ast",
+    "base64",
+    "collections",
+    "contextlib",
+    "copy",
+    "csv",
+    "datetime",
+    "decimal",
+    "functools",
+    "hashlib",
+    "hmac",
+    "http",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "os",
+    "pathlib",
+    "phantom",
+    "pydantic",
+    "random",
+    "re",
+    "requests",
+    "shutil",
+    "ssl",
+    "sys",
+    "tempfile",
+    "time",
+    "typing",
+    "urllib",
+    "uuid",
+    "zipfile",
+}
 
 LOW_SIGNAL_MODEL_FILENAMES = {
     "license",
@@ -163,10 +209,19 @@ class DeepPRCollector(PRCollector):
                 )
             )
 
+        related_paths = sorted(collect_related_python_context_paths(head_files) - set(head_files))
+        related_fetched: list[str] = []
+        for related_path in related_paths[:PYTHON_RELATED_CONTEXT_FILE_LIMIT]:
+            related_text = self._fetch_deep_file(repo, related_path, head_sha, errors)
+            if related_text is None or not is_relevant_full_file(related_path):
+                continue
+            head_files[related_path] = truncate_text(related_text, self.deep_max_file_chars)
+            related_fetched.append(related_path)
+
         self._merge_deep_files(review_input, head_files, base_files, chunks, full_diffs)
         review_input["deep_review"] = {
             "enabled": True,
-            "strategy": "github_app_api_base_head_contents_local_diff_chunked",
+            "strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
             "chunk_chars": self.deep_chunk_chars,
             "changed_file_count": len(files),
             "chunk_count": len(chunks),
@@ -174,6 +229,7 @@ class DeepPRCollector(PRCollector):
             "skipped_binary_paths": skipped_binary[:100],
             "skipped_large_or_unavailable_paths": skipped_large_or_unavailable[:100],
             "errors": errors[:100],
+            "related_context_paths": related_fetched[:100],
         }
         notes.update(
             {
@@ -186,6 +242,8 @@ class DeepPRCollector(PRCollector):
                 "deep_skipped_large_or_unavailable_count": len(skipped_large_or_unavailable),
                 "deep_error_count": len(errors),
                 "deep_errors": errors[:20],
+                "deep_related_context_file_count": len(related_fetched),
+                "deep_related_context_paths": related_fetched[:20],
             }
         )
         return review_input
@@ -278,6 +336,16 @@ def chunk_unified_diff(
     if function_chunks:
         return function_chunks
 
+    structured_chunks = chunk_structured_diff_by_unit(
+        file_info,
+        diff,
+        max_chars=max_chars,
+        head_text=head_text,
+        base_text=base_text,
+    )
+    if structured_chunks:
+        return structured_chunks
+
     headers, hunks = split_unified_diff(diff)
     if not hunks:
         hunks = [diff]
@@ -315,8 +383,95 @@ def chunk_unified_diff(
                 "chunk_total": total,
                 "diff_chars": len(chunk),
                 "diff": chunk,
+                "chunk_strategy": "changed_hunks",
+                "context_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
             }
         )
+    return output
+
+
+def chunk_structured_diff_by_unit(
+    file_info: dict[str, Any],
+    diff: str,
+    *,
+    max_chars: int,
+    head_text: str,
+    base_text: str,
+) -> list[dict[str, Any]]:
+    path = str(file_info.get("filename") or "")
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix not in {".json", ".yml", ".yaml", ".toml", ".xml"}:
+        return []
+    if not (head_text.strip() or base_text.strip()):
+        return []
+
+    head_scopes = structured_scopes_from_source(head_text, suffix)
+    base_scopes = structured_scopes_from_source(base_text, suffix)
+    if not head_scopes and not base_scopes:
+        return []
+
+    headers, hunks = split_unified_diff(diff)
+    if not hunks:
+        return []
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for hunk in hunks:
+        for scope, scoped_hunk in split_hunk_by_structured_scope(hunk, head_scopes, base_scopes):
+            key = structured_scope_key(scope)
+            item = grouped.setdefault(key, {"scope": scope, "hunks": [], "hunk_count": 0})
+            item["hunks"].append(scoped_hunk)
+            item["hunk_count"] = int(item.get("hunk_count") or 0) + 1
+
+    if not grouped:
+        return []
+
+    target_chars = min(max_chars, STRUCTURED_UNIT_CHUNK_TARGET_CHARS)
+    path_suffix = suffix.lstrip(".") or "unknown"
+    previous_path = str(file_info.get("previous_filename") or path)
+    output: list[dict[str, Any]] = []
+    for item in grouped.values():
+        scope = item.get("scope") or {}
+        chunk_diff = f"{headers}\n" + "\n".join(str(hunk) for hunk in item.get("hunks") or [])
+        chunk_diff = chunk_diff.strip()
+        if not chunk_diff or chunk_diff == headers.strip():
+            continue
+        parts: list[str]
+        if len(chunk_diff) <= target_chars:
+            parts = [chunk_diff]
+        else:
+            parts = []
+            for hunk in item.get("hunks") or []:
+                parts.extend(split_large_hunk(headers, str(hunk), max_chars=target_chars))
+        for part in parts:
+            output.append(
+                {
+                    "id": "",
+                    "path": path,
+                    "previous_path": previous_path if previous_path != path else None,
+                    "status": file_info.get("status"),
+                    "additions": file_info.get("additions"),
+                    "deletions": file_info.get("deletions"),
+                    "changes": file_info.get("changes"),
+                    "file_type": path_suffix,
+                    "chunk_index": 0,
+                    "chunk_total": 0,
+                    "diff_chars": len(part),
+                    "diff": part,
+                    "chunk_strategy": str(scope.get("chunk_strategy") or "structured_unit"),
+                    "context_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
+                    "changed_hunk_count": item.get("hunk_count"),
+                    "logical_unit": scope.get("name") or "document",
+                    "logical_unit_kind": scope.get("kind") or "document",
+                    "logical_unit_start_line": scope.get("start_line"),
+                    "logical_unit_end_line": scope.get("end_line"),
+                }
+            )
+
+    total = len(output)
+    for index, chunk in enumerate(output, start=1):
+        chunk["id"] = f"{path}:{index}"
+        chunk["chunk_index"] = index
+        chunk["chunk_total"] = total
     return output
 
 
@@ -332,12 +487,8 @@ def chunk_python_diff_by_function(
     if not path.endswith(".py"):
         return []
 
-    change_count = int(file_info.get("changes") or 0)
-    if (
-        len(head_text or base_text) < PYTHON_FUNCTION_CHUNK_MIN_FILE_CHARS
-        and len(diff) < PYTHON_FUNCTION_CHUNK_TARGET_CHARS
-        and change_count < PYTHON_FUNCTION_CHUNK_MIN_CHANGES
-    ):
+    has_meaningful_context = bool(head_text.strip() or base_text.strip())
+    if not has_meaningful_context:
         return []
 
     head_scopes = python_scopes_from_source(head_text)
@@ -353,8 +504,9 @@ def chunk_python_diff_by_function(
     for hunk in hunks:
         for scope, scoped_hunk in split_python_hunk_by_scope(hunk, head_scopes, base_scopes):
             key = python_scope_key(scope)
-            item = grouped.setdefault(key, {"scope": scope, "hunks": []})
+            item = grouped.setdefault(key, {"scope": scope, "hunks": [], "hunk_count": 0})
             item["hunks"].append(scoped_hunk)
+            item["hunk_count"] = int(item.get("hunk_count") or 0) + 1
 
     if not grouped:
         return []
@@ -393,15 +545,14 @@ def chunk_python_diff_by_function(
                     "diff_chars": len(part),
                     "diff": part,
                     "chunk_strategy": "python_function",
+                    "context_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
+                    "changed_hunk_count": item.get("hunk_count"),
                     "python_scope": scope.get("name") if scope else "module",
                     "python_scope_kind": scope.get("kind") if scope else "module",
                     "python_scope_start_line": scope.get("start_line") if scope else None,
                     "python_scope_end_line": scope.get("end_line") if scope else None,
                 }
             )
-
-    if len(output) <= 1:
-        return []
 
     total = len(output)
     for index, chunk in enumerate(output, start=1):
@@ -473,7 +624,7 @@ def split_python_hunk_by_scope(
         key = python_scope_key(scope)
         item = grouped.setdefault(key, {"scope": scope, "lines": [lines[0]], "changed": False})
         item["lines"].append(line)
-        if is_added or is_removed:
+        if (is_added or is_removed) and line[1:].strip():
             item["changed"] = True
 
         if not is_added:
@@ -508,11 +659,402 @@ def find_python_scope_for_line(scopes: list[dict[str, Any]], line_no: int) -> di
 def python_scope_key(scope: dict[str, Any] | None) -> str:
     if not scope:
         return "module"
-    return (
-        f"{scope.get('kind') or 'scope'}:"
-        f"{scope.get('name') or 'unknown'}:"
-        f"{scope.get('start_line') or 0}-{scope.get('end_line') or 0}"
+    return f"{scope.get('kind') or 'scope'}:{scope.get('name') or 'unknown'}"
+
+
+def collect_related_python_context_paths(files: dict[str, str]) -> set[str]:
+    """Infer small, local Python modules worth fetching for semantic context."""
+
+    output: set[str] = set()
+    known_roots = project_roots_from_python_paths(files)
+    for path, text in files.items():
+        if not path.endswith(".py") or not text:
+            continue
+        output.update(infer_local_python_import_paths(path, text, known_roots=known_roots))
+    return output
+
+
+def project_roots_from_python_paths(files: dict[str, str]) -> set[str]:
+    roots: set[str] = {""}
+    for path in files:
+        parts = PurePosixPath(path).parts
+        if len(parts) >= 2 and parts[-1].endswith(".py"):
+            roots.add(parts[0])
+    return roots
+
+
+def infer_local_python_import_paths(path: str, text: str, *, known_roots: set[str] | None = None) -> set[str]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+
+    current_parts = list(PurePosixPath(path).parts[:-1])
+    roots = known_roots or {""}
+    output: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            output.update(resolve_import_from_paths(node, current_parts=current_parts, known_roots=roots))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                output.update(resolve_absolute_module_paths(alias.name, known_roots=roots))
+
+    return {
+        candidate
+        for candidate in output
+        if candidate
+        and candidate != path
+        and candidate.endswith(".py")
+        and not candidate.endswith("/__init__.py")
+        and is_probably_text(candidate)
+    }
+
+
+def resolve_import_from_paths(
+    node: ast.ImportFrom,
+    *,
+    current_parts: list[str],
+    known_roots: set[str],
+) -> set[str]:
+    module_parts = [part for part in (node.module or "").split(".") if part]
+    output: set[str] = set()
+    if node.level:
+        package_len = max(0, len(current_parts) - node.level + 1)
+        base_parts = current_parts[:package_len] + module_parts
+        output.update(module_path_candidates(base_parts))
+        if not module_parts:
+            for alias in node.names:
+                output.update(module_path_candidates(base_parts + [alias.name]))
+        return output
+
+    if not module_parts:
+        return output
+    output.update(resolve_absolute_module_paths(".".join(module_parts), known_roots=known_roots))
+    return output
+
+
+def resolve_absolute_module_paths(module_name: str, *, known_roots: set[str]) -> set[str]:
+    parts = [part for part in module_name.split(".") if part]
+    if not parts:
+        return set()
+    if parts[0] in IGNORED_EXTERNAL_PYTHON_MODULES:
+        return set()
+
+    output = set(module_path_candidates(parts))
+    for root in known_roots:
+        if not root or parts[0] == root:
+            continue
+        output.update(module_path_candidates([root, *parts]))
+    return output
+
+
+def module_path_candidates(parts: list[str]) -> set[str]:
+    if not parts:
+        return set()
+    path = "/".join(parts)
+    return {f"{path}.py", f"{path}/__init__.py"}
+
+
+def structured_scopes_from_source(source: str, suffix: str) -> list[dict[str, Any]]:
+    if not source.strip():
+        return []
+    if suffix == ".json":
+        return json_scopes_from_source(source)
+    if suffix in {".yml", ".yaml"}:
+        return yaml_scopes_from_source(source)
+    if suffix == ".toml":
+        return toml_scopes_from_source(source)
+    if suffix == ".xml":
+        return xml_scopes_from_source(source)
+    return []
+
+
+def json_scopes_from_source(source: str) -> list[dict[str, Any]]:
+    scopes: list[dict[str, Any]] = []
+    stack: list[dict[str, Any]] = []
+    in_string = False
+    escaped = False
+    lines = source.splitlines()
+    for line_no, line in enumerate(lines, start=1):
+        for index, char in enumerate(line):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == "\"":
+                    in_string = False
+                continue
+            if char == "\"":
+                in_string = True
+                continue
+            if char not in "{}[]":
+                continue
+            if char in "{[":
+                name = json_key_before_position(line, index)
+                if not name:
+                    name = "$root" if not stack else f"{stack[-1]['name']}[]"
+                stack.append(
+                    {
+                        "kind": "json_object" if char == "{" else "json_array",
+                        "chunk_strategy": "json_object" if char == "{" else "json_array",
+                        "name": name,
+                        "start_line": line_no,
+                        "open": char,
+                    }
+                )
+                continue
+            expected_open = "{" if char == "}" else "["
+            while stack:
+                scope = stack.pop()
+                if scope.get("open") != expected_open:
+                    continue
+                scope = {
+                    key: value
+                    for key, value in scope.items()
+                    if key != "open"
+                }
+                scope["end_line"] = line_no
+                scope["name"] = json_scope_name(source, scope)
+                scopes.append(scope)
+                break
+
+    last_line = max(1, len(lines))
+    for scope in stack:
+        scope = {key: value for key, value in scope.items() if key != "open"}
+        scope["end_line"] = last_line
+        scope["name"] = json_scope_name(source, scope)
+        scopes.append(scope)
+
+    if not scopes:
+        scopes.append(document_scope("json_document", "json_document", len(lines)))
+    return sorted(scopes, key=lambda item: (int(item.get("start_line") or 0), int(item.get("end_line") or 0)))
+
+
+def json_key_before_position(line: str, index: int) -> str | None:
+    prefix = line[:index]
+    matches = list(re.finditer(r'"((?:\\.|[^"\\])*)"\s*:\s*$', prefix))
+    if not matches:
+        return None
+    return matches[-1].group(1)
+
+
+def json_scope_name(source: str, scope: dict[str, Any]) -> str:
+    name = str(scope.get("name") or "")
+    if name and name != "$root" and not name.endswith("[]"):
+        return name
+    start = max(1, int(scope.get("start_line") or 1))
+    end = max(start, int(scope.get("end_line") or start))
+    snippet = "\n".join(source.splitlines()[start - 1:end])
+    for key in ("identifier", "action", "name", "contains", "data_path", "parameter", "type"):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', snippet)
+        if match:
+            return f"{key}:{match.group(1)}"
+    return name or "$root"
+
+
+def yaml_scopes_from_source(source: str) -> list[dict[str, Any]]:
+    lines = source.splitlines()
+    candidates: list[dict[str, Any]] = []
+    stack: list[dict[str, Any]] = []
+    key_pattern = re.compile(r"^(?P<indent>\s*)(?:-\s*)?(?P<key>[A-Za-z0-9_.-][^:#{}\[\]]{0,80}?):(?:\s|$)")
+    for line_no, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = key_pattern.match(line)
+        if not match:
+            continue
+        key = match.group("key").strip().strip("'\"")
+        if not key:
+            continue
+        indent = len(match.group("indent").replace("\t", "    "))
+        while stack and int(stack[-1]["indent"]) >= indent:
+            stack.pop()
+        name = ".".join([str(item["key"]) for item in stack] + [key])
+        item = {
+            "kind": "yaml_section",
+            "chunk_strategy": "yaml_section",
+            "name": name,
+            "key": key,
+            "indent": indent,
+            "start_line": line_no,
+            "end_line": len(lines),
+        }
+        candidates.append(item)
+        value_after_colon = line[match.end():].strip()
+        is_container = not value_after_colon or value_after_colon.startswith(("#", "|", ">"))
+        if is_container:
+            stack.append(item)
+
+    for index, item in enumerate(candidates):
+        indent = int(item["indent"])
+        for later in candidates[index + 1:]:
+            if int(later["indent"]) <= indent:
+                item["end_line"] = int(later["start_line"]) - 1
+                break
+
+    return [
+        {key: value for key, value in item.items() if key not in {"indent", "key"}}
+        for item in candidates
+    ] or [document_scope("yaml_document", "yaml_section", len(lines))]
+
+
+def toml_scopes_from_source(source: str) -> list[dict[str, Any]]:
+    lines = source.splitlines()
+    scopes: list[dict[str, Any]] = []
+    section_pattern = re.compile(r"^\s*(?P<header>\[\[?[^\]]+\]?\])")
+    matches: list[tuple[int, str]] = []
+    for line_no, line in enumerate(lines, start=1):
+        match = section_pattern.match(line)
+        if match:
+            matches.append((line_no, match.group("header").strip()))
+    for index, (start_line, header) in enumerate(matches):
+        end_line = (matches[index + 1][0] - 1) if index + 1 < len(matches) else len(lines)
+        scopes.append(
+            {
+                "kind": "toml_section",
+                "chunk_strategy": "toml_section",
+                "name": header.strip("[]"),
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
+    return scopes or [document_scope("toml_document", "toml_section", len(lines))]
+
+
+def xml_scopes_from_source(source: str) -> list[dict[str, Any]]:
+    lines = source.splitlines()
+    scopes: list[dict[str, Any]] = []
+    stack: list[dict[str, Any]] = []
+    tag_pattern = re.compile(r"<(?P<closing>/)?(?P<tag>[A-Za-z_][\w:.-]*)(?P<attrs>[^>]*)>")
+    for line_no, line in enumerate(lines, start=1):
+        for match in tag_pattern.finditer(line):
+            token = match.group(0)
+            if token.startswith(("<?", "<!")):
+                continue
+            tag = match.group("tag")
+            if match.group("closing"):
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index]["tag"] != tag:
+                        continue
+                    scope = stack.pop(index)
+                    scope["end_line"] = line_no
+                    scopes.append({key: value for key, value in scope.items() if key != "tag"})
+                    break
+                continue
+            if token.endswith("/>"):
+                scopes.append(
+                    {
+                        "kind": "xml_element",
+                        "chunk_strategy": "xml_element",
+                        "name": xml_scope_name(tag, match.group("attrs") or ""),
+                        "start_line": line_no,
+                        "end_line": line_no,
+                    }
+                )
+                continue
+            stack.append(
+                {
+                    "kind": "xml_element",
+                    "chunk_strategy": "xml_element",
+                    "name": xml_scope_name(tag, match.group("attrs") or ""),
+                    "tag": tag,
+                    "start_line": line_no,
+                }
+            )
+
+    last_line = max(1, len(lines))
+    for scope in stack:
+        scope["end_line"] = last_line
+        scopes.append({key: value for key, value in scope.items() if key != "tag"})
+    return scopes or [document_scope("xml_document", "xml_element", len(lines))]
+
+
+def xml_scope_name(tag: str, attrs: str) -> str:
+    for attr in ("id", "name", "label"):
+        match = re.search(rf"\b{attr}\s*=\s*['\"]([^'\"]+)['\"]", attrs)
+        if match:
+            return f"{tag}#{match.group(1)}"
+    return tag
+
+
+def document_scope(name: str, strategy: str, line_count: int) -> dict[str, Any]:
+    return {
+        "kind": "document",
+        "chunk_strategy": strategy,
+        "name": name,
+        "start_line": 1,
+        "end_line": max(1, line_count),
+    }
+
+
+def split_hunk_by_structured_scope(
+    hunk: str,
+    head_scopes: list[dict[str, Any]],
+    base_scopes: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any] | None, str]]:
+    lines = hunk.splitlines()
+    if not lines:
+        return []
+    parsed = parse_hunk_header(lines[0])
+    if parsed is None:
+        return [(None, hunk)]
+
+    old_line = int(parsed["old_start"])
+    new_line = int(parsed["new_start"])
+    grouped: dict[str, dict[str, Any]] = {}
+    for line in lines[1:]:
+        is_added = line.startswith("+") and not line.startswith("+++")
+        is_removed = line.startswith("-") and not line.startswith("---")
+        old_for_line = None if is_added else old_line
+        new_for_line = None if is_removed else new_line
+        scope = None
+        if new_for_line is not None:
+            scope = find_structured_scope_for_line(head_scopes, new_for_line)
+        if scope is None and old_for_line is not None:
+            scope = find_structured_scope_for_line(base_scopes, old_for_line)
+
+        key = structured_scope_key(scope)
+        item = grouped.setdefault(key, {"scope": scope, "lines": [lines[0]], "changed": False})
+        item["lines"].append(line)
+        if (is_added or is_removed) and line[1:].strip():
+            item["changed"] = True
+
+        if not is_added:
+            old_line += 1
+        if not is_removed:
+            new_line += 1
+
+    return [
+        (item.get("scope"), "\n".join(item.get("lines") or []))
+        for item in grouped.values()
+        if item.get("changed") and len(item.get("lines") or []) > 1
+    ]
+
+
+def find_structured_scope_for_line(scopes: list[dict[str, Any]], line_no: int) -> dict[str, Any] | None:
+    candidates = [
+        scope
+        for scope in scopes
+        if int(scope.get("start_line") or 0) <= line_no <= int(scope.get("end_line") or 0)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda scope: (
+            int(scope.get("end_line") or 0) - int(scope.get("start_line") or 0),
+            -int(scope.get("start_line") or 0),
+        ),
     )
+
+
+def structured_scope_key(scope: dict[str, Any] | None) -> str:
+    if not scope:
+        return "document"
+    return f"{scope.get('kind') or 'unit'}:{scope.get('name') or 'document'}"
 
 
 def split_unified_diff(diff: str) -> tuple[str, list[str]]:
@@ -558,8 +1100,19 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
     context_char_limit = int(chunk.get("context_char_limit") or 14_000)
     if path.endswith(".py") and not chunk.get("adaptive_retry"):
         context_char_limit = min(context_char_limit, 8_000)
-    context_files = select_context_files(full_files, path, max_chars=context_char_limit)
-    base_context_files = select_context_files(base_files, previous_path, max_chars=context_char_limit)
+    source_char_limit = int(chunk.get("source_char_limit") or CONTEXT_SOURCE_FILE_CHARS)
+    context_files = select_context_files(
+        full_files,
+        path,
+        max_chars=source_char_limit,
+        include_all_source=True,
+    )
+    base_context_files = select_context_files(
+        base_files,
+        previous_path,
+        max_chars=source_char_limit,
+        include_all_source=True,
+    )
     review_packet = build_circuit_review_packet(
         review_input,
         chunk,
@@ -594,10 +1147,16 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
             "chunk_strategy": chunk.get("chunk_strategy"),
+            "context_strategy": chunk.get("context_strategy"),
+            "changed_hunk_count": chunk.get("changed_hunk_count"),
             "python_scope": chunk.get("python_scope"),
             "python_scope_kind": chunk.get("python_scope_kind"),
             "python_scope_start_line": chunk.get("python_scope_start_line"),
             "python_scope_end_line": chunk.get("python_scope_end_line"),
+            "logical_unit": chunk.get("logical_unit"),
+            "logical_unit_kind": chunk.get("logical_unit_kind"),
+            "logical_unit_start_line": chunk.get("logical_unit_start_line"),
+            "logical_unit_end_line": chunk.get("logical_unit_end_line"),
             "model_review_priority": chunk.get("model_review_priority"),
             "model_review_reason": chunk.get("model_review_reason"),
             "instruction": instruction,
@@ -754,27 +1313,51 @@ def build_circuit_review_packet(
                 base_ranges.insert(0, scope_range)
         elif scope_range not in head_ranges:
             head_ranges.insert(0, scope_range)
+    logical_start = int(chunk.get("logical_unit_start_line") or 0)
+    logical_end = int(chunk.get("logical_unit_end_line") or 0)
+    if logical_start > 0 and logical_end >= logical_start:
+        logical_range = (logical_start, logical_end - logical_start + 1)
+        if chunk.get("status") == "removed":
+            if logical_range not in base_ranges:
+                base_ranges.insert(0, logical_range)
+        elif logical_range not in head_ranges:
+            head_ranges.insert(0, logical_range)
     terms = interesting_terms_from_diff(diff, path)
+    primary_context_max_chars = min(
+        CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS,
+        max(80, int(chunk.get("context_char_limit") or CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS)),
+    )
+    related_context_max_chars = min(
+        CIRCUIT_PACKET_RELATED_CONTEXT_CHARS,
+        max(80, primary_context_max_chars // 2),
+    )
     head_context = focused_context_for_packet(
         context_files,
         primary_path=path,
         primary_ranges=head_ranges,
         terms=terms,
-        primary_max_chars=CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS,
-        related_max_chars=CIRCUIT_PACKET_RELATED_CONTEXT_CHARS,
+        primary_max_chars=primary_context_max_chars,
+        related_max_chars=related_context_max_chars,
     )
     base_context = focused_context_for_packet(
         base_context_files,
         primary_path=previous_path,
         primary_ranges=base_ranges,
         terms=terms,
-        primary_max_chars=max(4_000, CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS // 2),
-        related_max_chars=max(2_500, CIRCUIT_PACKET_RELATED_CONTEXT_CHARS // 2),
+        primary_max_chars=max(80, min(primary_context_max_chars, CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS // 2)),
+        related_max_chars=max(80, min(related_context_max_chars, CIRCUIT_PACKET_RELATED_CONTEXT_CHARS // 2)),
+    )
+    semantic_context = build_semantic_context_for_packet(
+        context_files,
+        primary_path=path,
+        chunk=chunk,
+        diff=diff,
     )
     return {
         "packet_type": "focused_circuit_pr_review_packet",
         "packet_goal": (
-            "Judge this focused changed-file packet for concrete SOAR connector issues. "
+            "Judge this context-aware changed-code packet for concrete SOAR connector issues. "
+            "The packet is centered on changed hunks, enclosing logical units, and selected semantic context. "
             "Use local deterministic findings as candidate evidence, and do not report speculative issues."
         ),
         "path": path,
@@ -787,10 +1370,16 @@ def build_circuit_review_packet(
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
             "chunk_strategy": chunk.get("chunk_strategy"),
+            "context_strategy": chunk.get("context_strategy"),
+            "changed_hunk_count": chunk.get("changed_hunk_count"),
             "python_scope": chunk.get("python_scope"),
             "python_scope_kind": chunk.get("python_scope_kind"),
             "python_scope_start_line": chunk.get("python_scope_start_line"),
             "python_scope_end_line": chunk.get("python_scope_end_line"),
+            "logical_unit": chunk.get("logical_unit"),
+            "logical_unit_kind": chunk.get("logical_unit_kind"),
+            "logical_unit_start_line": chunk.get("logical_unit_start_line"),
+            "logical_unit_end_line": chunk.get("logical_unit_end_line"),
         },
         "planner": {
             "priority": chunk.get("model_review_priority"),
@@ -803,6 +1392,7 @@ def build_circuit_review_packet(
         "removed_code_focus": removed_line_excerpts(diff),
         "head_context_files": head_context,
         "base_context_files": base_context,
+        "semantic_context": semantic_context,
         "terms_used_for_context": terms[:25],
         "collection_diagnostics": {
             "repo": review_input.get("repo"),
@@ -867,15 +1457,25 @@ def focused_context_for_packet(
     related_max_chars: int,
 ) -> dict[str, str]:
     output: dict[str, str] = {}
+    related_count = 0
     for path, text in files.items():
         if path == primary_path:
-            output[path] = line_window_snippets(text, primary_ranges, radius=35, max_chars=primary_max_chars)
+            output[path] = line_window_snippets(
+                text,
+                primary_ranges,
+                radius=CONTEXT_AWARE_HUNK_RADIUS,
+                max_chars=primary_max_chars,
+            )
+            continue
+        if related_count >= CIRCUIT_PACKET_RELATED_FILE_LIMIT:
             continue
         snippet = keyword_snippets(text, terms, radius=8, max_snippets=5, max_chars=related_max_chars)
         if snippet:
             output[path] = snippet
+            related_count += 1
         elif should_keep_context_file_without_term(path) or is_related_view_context_file(path, primary_path):
             output[path] = truncate_text(text, min(related_max_chars, 3_000))
+            related_count += 1
     return output
 
 
@@ -911,6 +1511,11 @@ def line_window_snippets(
     return truncate_text("\n\n---\n\n".join(windows), max_chars)
 
 
+def iter_lines(text: str):
+    for index, line in enumerate(text.splitlines(), start=1):
+        yield index, line
+
+
 def keyword_snippets(
     text: str,
     terms: list[str],
@@ -944,9 +1549,396 @@ def keyword_snippets(
     return truncate_text("\n\n---\n\n".join(snippets), max_chars)
 
 
+def build_semantic_context_for_packet(
+    files: dict[str, str],
+    *,
+    primary_path: str,
+    chunk: dict[str, Any],
+    diff: str,
+) -> dict[str, Any]:
+    if not primary_path.endswith(".py"):
+        return {}
+    primary_text = files.get(primary_path, "")
+    if not primary_text:
+        return {}
+
+    symbols = extract_python_referenced_symbols(diff)
+    scope_name = str(chunk.get("python_scope") or "")
+    if scope_name and scope_name != "module":
+        symbols = [symbol for symbol in symbols if symbol != scope_name.rsplit(".", 1)[-1]]
+    symbols = symbols[:PYTHON_SEMANTIC_MAX_SYMBOLS]
+
+    current_start = int(chunk.get("python_scope_start_line") or 0)
+    current_end = int(chunk.get("python_scope_end_line") or 0)
+    snippets: list[dict[str, Any]] = []
+    if symbols:
+        snippets.extend(
+            python_import_constant_snippets(
+                primary_text,
+                primary_path,
+                symbols,
+                max_snippets=4,
+            )
+        )
+        snippets.extend(
+            python_symbol_definition_snippets(
+                files,
+                symbols,
+                primary_path=primary_path,
+                current_start=current_start,
+                current_end=current_end,
+                max_snippets=PYTHON_SEMANTIC_MAX_SNIPPETS,
+            )
+        )
+
+    if scope_name and scope_name != "module":
+        snippets.extend(
+            python_enclosing_class_snippets(
+                primary_text,
+                primary_path,
+                scope_name,
+                max_snippets=max(1, PYTHON_SEMANTIC_MAX_SNIPPETS - len(snippets)),
+            )
+        )
+        function_name = scope_name.rsplit(".", 1)[-1]
+        snippets.extend(
+            python_caller_snippets_in_files(
+                files,
+                function_name,
+                primary_path=primary_path,
+                current_start=current_start,
+                current_end=current_end,
+                max_snippets=max(2, PYTHON_SEMANTIC_MAX_SNIPPETS - len(snippets)),
+            )
+        )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    total_chars = 0
+    for item in snippets:
+        key = (str(item.get("path") or ""), str(item.get("symbol") or item.get("kind") or ""), item.get("line"))
+        if key in seen:
+            continue
+        seen.add(key)
+        excerpt = truncate_text(str(item.get("excerpt") or ""), 2_000)
+        if not excerpt:
+            continue
+        total_chars += len(excerpt)
+        if total_chars > PYTHON_SEMANTIC_CONTEXT_CHARS:
+            break
+        copied = dict(item)
+        copied["excerpt"] = excerpt
+        deduped.append(copied)
+
+    if not symbols and not deduped:
+        return {}
+    return {
+        "strategy": "static_symbol_expansion_from_changed_code",
+        "referenced_symbols": symbols,
+        "snippet_count": len(deduped),
+        "snippets": deduped,
+    }
+
+
+def extract_python_referenced_symbols(diff: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in diff.splitlines():
+        if raw_line.startswith(("+++", "---", "@@")):
+            continue
+        if raw_line.startswith(("+", "-", " ")):
+            lines.append(raw_line[1:])
+        else:
+            lines.append(raw_line)
+    text = "\n".join(lines)
+    ignored = {
+        "and",
+        "assert",
+        "class",
+        "def",
+        "elif",
+        "else",
+        "except",
+        "false",
+        "finally",
+        "for",
+        "from",
+        "if",
+        "import",
+        "in",
+        "none",
+        "not",
+        "or",
+        "return",
+        "self",
+        "true",
+        "with",
+        "yield",
+        "dict",
+        "append",
+        "decode",
+        "encode",
+        "endswith",
+        "extend",
+        "format",
+        "get",
+        "items",
+        "join",
+        "keys",
+        "lower",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "open",
+        "range",
+        "read",
+        "replace",
+        "set",
+        "split",
+        "startswith",
+        "str",
+        "strip",
+        "sum",
+        "update",
+        "values",
+    }
+    candidates: list[str] = []
+    candidates.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
+    candidates.extend(re.findall(r"\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
+    candidates.extend(re.findall(r"\bself\.([A-Za-z_][A-Za-z0-9_]*)\b", text))
+    candidates.extend(re.findall(r"\b([A-Z][A-Z0-9_]{3,})\b", text))
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.strip()
+        lowered = normalized.lower()
+        if len(normalized) < 3 or lowered in ignored or normalized.startswith("__"):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+    return output
+
+
+def python_import_constant_snippets(
+    text: str,
+    path: str,
+    symbols: list[str],
+    *,
+    max_snippets: int,
+) -> list[dict[str, Any]]:
+    if not symbols:
+        return []
+    symbol_pattern = "|".join(re.escape(symbol) for symbol in symbols)
+    line_pattern = re.compile(
+        rf"^\s*(?:from\s+[\w.]+\s+import\s+.*\b(?:{symbol_pattern})\b|import\s+.*\b(?:{symbol_pattern})\b|(?:{symbol_pattern})\s*=)",
+        re.M,
+    )
+    output: list[dict[str, Any]] = []
+    for match in line_pattern.finditer(text):
+        line_no = text[: match.start()].count("\n") + 1
+        output.append(
+            {
+                "path": path,
+                "kind": "import_or_constant",
+                "symbol": matched_symbol(match.group(0), symbols),
+                "line": line_no,
+                "reason": "import or constant referenced by changed code",
+                "excerpt": line_window_snippets(text, [(line_no, 1)], radius=2, max_chars=800),
+            }
+        )
+        if len(output) >= max_snippets:
+            break
+    return output
+
+
+def matched_symbol(text: str, symbols: list[str]) -> str:
+    lowered = text.lower()
+    for symbol in symbols:
+        if symbol.lower() in lowered:
+            return symbol
+    return symbols[0] if symbols else ""
+
+
+def python_symbol_definition_snippets(
+    files: dict[str, str],
+    symbols: list[str],
+    *,
+    primary_path: str,
+    current_start: int,
+    current_end: int,
+    max_snippets: int,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    symbol_set = {symbol.lower() for symbol in symbols}
+    ordered_files = sorted(files.items(), key=lambda item: 0 if item[0] == primary_path else 1)
+    for path, text in ordered_files:
+        if not path.endswith(".py") or not text:
+            continue
+        for scope in python_scopes_from_source(text):
+            name = str(scope.get("name") or "")
+            short_name = name.rsplit(".", 1)[-1].lower()
+            if short_name not in symbol_set:
+                continue
+            start = int(scope.get("start_line") or 0)
+            end = int(scope.get("end_line") or start)
+            if path == primary_path and current_start and current_end and current_start <= start <= current_end:
+                continue
+            output.append(
+                {
+                    "path": path,
+                    "kind": str(scope.get("kind") or "function"),
+                    "symbol": name,
+                    "line": start,
+                    "reason": "definition referenced by changed code",
+                    "excerpt": line_window_snippets(text, [(start, end - start + 1)], radius=4, max_chars=2_000),
+                }
+            )
+            if len(output) >= max_snippets:
+                return output
+    return output
+
+
+def python_enclosing_class_snippets(
+    text: str,
+    path: str,
+    scope_name: str,
+    *,
+    max_snippets: int,
+) -> list[dict[str, Any]]:
+    if "." not in scope_name or max_snippets <= 0:
+        return []
+    class_name = scope_name.rsplit(".", 1)[0]
+    scopes = python_scopes_from_source(text)
+    class_scope = next(
+        (scope for scope in scopes if scope.get("kind") == "class" and scope.get("name") == class_name),
+        None,
+    )
+    if not class_scope:
+        return []
+
+    output: list[dict[str, Any]] = []
+    class_start = int(class_scope.get("start_line") or 1)
+    output.append(
+        {
+            "path": path,
+            "kind": "enclosing_class",
+            "symbol": class_name,
+            "line": class_start,
+            "reason": "enclosing class for changed method",
+            "excerpt": line_window_snippets(text, [(class_start, 1)], radius=8, max_chars=1_200),
+        }
+    )
+    if len(output) >= max_snippets:
+        return output
+
+    init_name = f"{class_name}.__init__"
+    init_scope = next(
+        (scope for scope in scopes if scope.get("kind") == "function" and scope.get("name") == init_name),
+        None,
+    )
+    if init_scope:
+        start = int(init_scope.get("start_line") or class_start)
+        end = int(init_scope.get("end_line") or start)
+        output.append(
+            {
+                "path": path,
+                "kind": "enclosing_class_initializer",
+                "symbol": init_name,
+                "line": start,
+                "reason": "initializer for changed method's class",
+                "excerpt": line_window_snippets(text, [(start, end - start + 1)], radius=3, max_chars=1_800),
+            }
+        )
+    return output[:max_snippets]
+
+
+def python_caller_snippets_in_files(
+    files: dict[str, str],
+    function_name: str,
+    *,
+    primary_path: str,
+    current_start: int,
+    current_end: int,
+    max_snippets: int,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    ordered_files = sorted(files.items(), key=lambda item: 0 if item[0] == primary_path else 1)
+    for path, text in ordered_files:
+        if not path.endswith(".py") or not text:
+            continue
+        remaining = max_snippets - len(output)
+        if remaining <= 0:
+            break
+        output.extend(
+            python_caller_snippets(
+                text,
+                path,
+                function_name,
+                current_start=current_start if path == primary_path else 0,
+                current_end=current_end if path == primary_path else 0,
+                max_snippets=remaining,
+            )
+        )
+    return output[:max_snippets]
+
+
+def python_caller_snippets(
+    text: str,
+    path: str,
+    function_name: str,
+    *,
+    current_start: int,
+    current_end: int,
+    max_snippets: int,
+) -> list[dict[str, Any]]:
+    if not function_name or not text or max_snippets <= 0:
+        return []
+    scopes = python_scopes_from_source(text)
+    call_pattern = re.compile(rf"\b(?:self\.)?{re.escape(function_name)}\s*\(")
+    output: list[dict[str, Any]] = []
+    seen_scope_names: set[str] = set()
+    for line_no, line in iter_lines(text):
+        if not call_pattern.search(line) or re.match(r"\s*def\s+", line):
+            continue
+        if current_start and current_end and current_start <= line_no <= current_end:
+            continue
+        scope = find_python_scope_for_line(scopes, line_no)
+        if not scope:
+            continue
+        scope_name = str(scope.get("name") or "")
+        if scope_name in seen_scope_names:
+            continue
+        seen_scope_names.add(scope_name)
+        start = int(scope.get("start_line") or line_no)
+        end = int(scope.get("end_line") or line_no)
+        output.append(
+            {
+                "path": path,
+                "kind": "caller",
+                "symbol": scope_name,
+                "line": start,
+                "reason": f"caller of changed function `{function_name}`",
+                "excerpt": line_window_snippets(text, [(start, end - start + 1)], radius=4, max_chars=2_000),
+            }
+        )
+        if len(output) >= max_snippets:
+            break
+    return output
+
+
 def should_keep_context_file_without_term(path: str) -> bool:
-    name = PurePosixPath(path).name
-    return name in DEEP_CONTEXT_FILES or ("/" not in path and path.endswith(".json"))
+    name = PurePosixPath(path).name.lower()
+    if name in {"readme.md", "uv.lock", "license", "notice"}:
+        return False
+    return (
+        name in {"manual_readme_content.md", "pyproject.toml"}
+        or path.startswith("release_notes/")
+        or ("/" not in path and path.endswith(".json"))
+    )
 
 
 def interesting_terms_from_diff(diff: str, path: str) -> list[str]:
@@ -992,7 +1984,13 @@ def removed_line_excerpts(diff: str, *, max_chars: int = 4_000) -> str:
     return truncate_text("\n".join(removed), max_chars)
 
 
-def select_context_files(files: dict[str, str], primary_path: str, *, max_chars: int = 80_000) -> dict[str, str]:
+def select_context_files(
+    files: dict[str, str],
+    primary_path: str,
+    *,
+    max_chars: int = 80_000,
+    include_all_source: bool = False,
+) -> dict[str, str]:
     output: dict[str, str] = {}
     for path, text in files.items():
         name = PurePosixPath(path).name
@@ -1001,9 +1999,18 @@ def select_context_files(files: dict[str, str], primary_path: str, *, max_chars:
             or name in DEEP_CONTEXT_FILES
             or ("/" not in path and path.endswith(".json"))
             or is_related_view_context_file(path, primary_path)
+            or (include_all_source and is_semantic_context_source_file(path))
         ):
             output[path] = truncate_text(text, max_chars)
     return output
+
+
+def is_semantic_context_source_file(path: str) -> bool:
+    suffix = PurePosixPath(path).suffix.lower()
+    name = PurePosixPath(path).name.lower()
+    if name in {"license", "notice", "readme.md", "uv.lock"}:
+        return False
+    return suffix in {".py", ".json", ".toml", ".yml", ".yaml", ".xml", ".html", ".jinja", ".j2"}
 
 
 def select_chunk_comments(comments: dict[str, Any], path: str) -> dict[str, list[dict[str, Any]]]:

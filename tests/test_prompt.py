@@ -3,7 +3,12 @@ import os
 import unittest
 from unittest.mock import patch
 
-from agentic_pr_review.prompt import SYSTEM_PROMPT, build_collection_diagnostics, build_user_prompt
+from agentic_pr_review.prompt import (
+    SYSTEM_PROMPT,
+    build_collection_diagnostics,
+    build_user_prompt,
+    compact_review_input_for_model,
+)
 from agentic_pr_review.secret_redactor import REDACTED_SECRET, REDACTED_TOKEN
 
 
@@ -79,6 +84,34 @@ class PromptPackingTest(unittest.TestCase):
         self.assertIn("oauth_basic_auth_contract", prompt)
         self.assertIn("Historical reviewer caught missing Basic auth", prompt)
         self.assertIn("compacted_for_model", prompt)
+
+    def test_context_aware_packet_prompt_does_not_duplicate_focused_files(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "changed_files": [{"filename": "connector.py", "patch": "+return 1"}],
+            "full_files": {"connector.py": "duplicated focused context"},
+            "base_files": {"connector.py": "duplicated base context"},
+            "review_packet": {
+                "diff": "@@ -1 +1 @@\n-return 0\n+return 1",
+                "head_context_files": {"connector.py": "single focused head context"},
+                "base_context_files": {"connector.py": "single focused base context"},
+                "semantic_context": {"snippets": []},
+            },
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+        }
+
+        compacted = compact_review_input_for_model(review_input, limits={"patch": 500, "file": 500, "comment": 200, "review": 200})
+
+        self.assertEqual(compacted["full_files"], {})
+        self.assertEqual(compacted["base_files"], {})
+        self.assertIn("single focused head context", compacted["review_packet"]["head_context_files"]["connector.py"])
+
+        prompt = build_user_prompt(review_input, [], max_chars=50_000)
+        self.assertIn("single focused head context", prompt)
+        self.assertNotIn("duplicated focused context", prompt)
+        self.assertNotIn("duplicated base context", prompt)
 
     def test_collection_diagnostics_include_sdk_review_inventory(self):
         review_input = {

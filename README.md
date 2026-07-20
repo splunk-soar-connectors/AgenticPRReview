@@ -119,17 +119,27 @@ excerpts, usernames, repository names, URLs, and other private context.
 ## Deep Review
 
 Deep collection is enabled by default. The bot fetches base and head contents
-for changed text files, generates local diffs, splits large diffs into chunks,
-reviews each chunk, and then runs a synthesis pass. Independent chunks can run
-concurrently to reduce wall-clock time; concurrency does not skip chunks or
-change the final synthesis step.
+for changed text files so deterministic analyzers can still reason over full
+current files, then builds context-aware model packets from changed hunks rather
+than blindly reviewing whole files. Python changes are grouped around enclosing
+functions/classes, nearby hunk context, referenced helpers/constants/imports,
+and callers where available. JSON, YAML, TOML, and XML changes are grouped
+around the changed object, section, or element when the structure can be
+inferred. Low-signal chunks such as license/notice/readme and metadata-only
+changes are skipped for model review after deterministic checks run.
+
+Independent chunks can run concurrently to reduce wall-clock time. The default
+concurrency is automatic: small reviews can use more parallelism, while large or
+high-risk packets are reviewed with less concurrency to reduce CIRCUIT gateway
+pressure. Passing `--deep-concurrency N` sets a maximum cap, not a guaranteed
+floor.
 
 Useful controls:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m agentic_pr_review.cli review example-org/example-connector 1 \
   --deep-chunk-chars 35000 \
-  --deep-concurrency 2 \
+  --deep-concurrency 0 \
   --deep-max-file-bytes 5000000 \
   --deep-max-file-chars 250000
 ```

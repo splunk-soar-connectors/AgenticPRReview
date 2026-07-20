@@ -148,6 +148,12 @@ High-value review pattern library:
 - Unused boilerplate handlers or methods should be removed or implemented.
 - Use PR comments or supplied docs links to check whether code follows vendor
   API contracts, especially auth, pagination, validation, and response shapes.
+- Deep review packets are context-aware: they are centered on changed hunks,
+  enclosing logical units, selected helper/caller snippets, and high-signal
+  related files. Python packets use changed functions/methods/classes; JSON,
+  YAML, TOML, and XML packets use changed objects, sections, or elements when
+  structure is available. Use `review_packet.semantic_context` to reason about
+  interactions with existing code without requiring the entire file.
 - New app mapping checks may be needed in the .github/ci-metadata support repos.
 - review_input.historical_context may include similar human-reviewed historical
   PR examples from mined comments. Use these examples as reviewer memory and
@@ -200,6 +206,10 @@ Strict output rules:
 
 Evidence rules:
 - Use the supplied PR context and deterministic findings as evidence.
+- In deep-review mode, treat `review_packet.diff`, `changed_hunks`,
+  `head_context_files`, `base_context_files`, and `semantic_context` together.
+  Report only issues proven by those snippets and current PR metadata; put
+  missing-context concerns in model_notes instead of findings.
 - Historical examples can help you decide what to inspect and how to phrase a
   concise human-style comment, but do not cite historical PRs as evidence in an
   active finding. Cite the current file, line, diff, docs, comments, or CI log.
@@ -406,7 +416,13 @@ def build_model_payload(review_input: dict, deterministic_findings: list[dict], 
 
 
 def compact_review_input_for_model(review_input: dict, *, limits: dict[str, int] | None) -> dict:
+    has_review_packet = isinstance(review_input.get("review_packet"), dict)
     if limits is None:
+        if has_review_packet:
+            compacted = dict(review_input)
+            compacted["full_files"] = {}
+            compacted["base_files"] = {}
+            return compacted
         return review_input
 
     compacted = dict(review_input)
@@ -415,14 +431,18 @@ def compact_review_input_for_model(review_input: dict, *, limits: dict[str, int]
         for item in review_input.get("changed_files", [])
         if isinstance(item, dict)
     ]
-    compacted["full_files"] = {
-        path: truncate_text(text, limits["file"])
-        for path, text in (review_input.get("full_files") or {}).items()
-    }
-    compacted["base_files"] = {
-        path: truncate_text(text, min(limits["file"], 3_000))
-        for path, text in (review_input.get("base_files") or {}).items()
-    }
+    if has_review_packet:
+        compacted["full_files"] = {}
+        compacted["base_files"] = {}
+    else:
+        compacted["full_files"] = {
+            path: truncate_text(text, limits["file"])
+            for path, text in (review_input.get("full_files") or {}).items()
+        }
+        compacted["base_files"] = {
+            path: truncate_text(text, min(limits["file"], 3_000))
+            for path, text in (review_input.get("base_files") or {}).items()
+        }
     compacted["comments"] = compact_comments_for_model(review_input.get("comments") or {}, limits=limits)
     compacted["doc_context"] = compact_doc_context(review_input.get("doc_context") or {}, limits=limits)
     compacted["historical_context"] = compact_historical_context(
@@ -460,6 +480,8 @@ def compact_review_packet(packet: dict, *, limits: dict[str, int]) -> dict:
         path: truncate_text(str(text), min(limits["file"] * 2, 8_000))
         for path, text in (packet.get("base_context_files") or {}).items()
     }
+    if isinstance(packet.get("semantic_context"), dict):
+        output["semantic_context"] = compact_semantic_context(packet["semantic_context"], limits=limits)
     compact_hunks = []
     for hunk in (packet.get("changed_hunks") or [])[:20]:
         if not isinstance(hunk, dict):
@@ -469,6 +491,23 @@ def compact_review_packet(packet: dict, *, limits: dict[str, int]) -> dict:
         item["removed_excerpt"] = truncate_text(str(item.get("removed_excerpt") or ""), min(limits["patch"], 2_000))
         compact_hunks.append(item)
     output["changed_hunks"] = compact_hunks
+    return output
+
+
+def compact_semantic_context(semantic_context: dict, *, limits: dict[str, int]) -> dict:
+    output = {
+        key: semantic_context.get(key)
+        for key in ("strategy", "referenced_symbols", "snippet_count")
+        if key in semantic_context
+    }
+    snippets = []
+    for item in (semantic_context.get("snippets") or [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        copied["excerpt"] = truncate_text(str(copied.get("excerpt") or ""), min(limits["file"], 2_000))
+        snippets.append(copied)
+    output["snippets"] = snippets
     return output
 
 

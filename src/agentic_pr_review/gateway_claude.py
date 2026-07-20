@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 from .config import RuntimeConfig
 from .deep_review import (
     build_chunk_review_input,
+    CONTEXT_AWARE_REVIEW_STRATEGY,
     dedupe_findings,
     filter_findings_for_chunk,
     plan_circuit_review_chunks,
@@ -179,7 +180,7 @@ class GatewayClaudeReviewer:
         original_chunk_count = len(chunks)
         chunks, skipped_model_chunks = plan_circuit_review_chunks(chunks, deterministic_findings)
         deep_review_meta = review_input.setdefault("deep_review", {})
-        deep_review_meta["model_packet_strategy"] = "circuit_focused_packets_skip_low_signal"
+        deep_review_meta["model_packet_strategy"] = CONTEXT_AWARE_REVIEW_STRATEGY
         deep_review_meta["model_skipped_chunk_count"] = len(skipped_model_chunks)
         deep_review_meta["model_skipped_chunks"] = skipped_model_chunks[:100]
         notes = review_input.setdefault("collector_notes", {})
@@ -202,7 +203,7 @@ class GatewayClaudeReviewer:
                 "reviewed_chunk_count": 0,
                 "model_skipped_chunk_count": len(skipped_model_chunks),
                 "max_chunks": max_chunks,
-                "model_packet_strategy": "circuit_focused_packets_skip_low_signal",
+                "model_packet_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
             }
             output["chunk_review_outputs"] = []
             return output
@@ -210,16 +211,17 @@ class GatewayClaudeReviewer:
         chunk_outputs: list[dict[str, Any]] = []
         total_chunks = len(chunks)
         self.eta = AdaptiveETA(total_requests=total_chunks + 1)
+        selected_concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
         self.progress(
             f"Deep model review started: {total_chunks} chunk(s) plus synthesis; "
-            f"concurrency {normalize_deep_concurrency(deep_concurrency, total_chunks)}; "
+            f"concurrency {selected_concurrency}; "
             f"estimated whole-review time remaining: {self._eta_text()}."
         )
         chunk_outputs = self._review_deep_chunks(
             review_input,
             deterministic_findings,
             chunks,
-            deep_concurrency=deep_concurrency,
+            deep_concurrency=selected_concurrency,
         )
 
         synthesis_started = time.monotonic()
@@ -247,7 +249,7 @@ class GatewayClaudeReviewer:
             "reviewed_chunk_count": len(chunk_outputs),
             "model_skipped_chunk_count": len(skipped_model_chunks),
             "max_chunks": max_chunks,
-            "model_packet_strategy": "circuit_focused_packets_skip_low_signal",
+            "model_packet_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
         }
         final_output["chunk_review_outputs"] = chunk_outputs
         return final_output
@@ -261,7 +263,7 @@ class GatewayClaudeReviewer:
         deep_concurrency: int,
     ) -> list[dict[str, Any]]:
         total_chunks = len(chunks)
-        concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks)
+        concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
         if concurrency <= 1:
             return [
                 self._review_single_deep_chunk(review_input, deterministic_findings, chunk, position, total_chunks)
@@ -832,10 +834,33 @@ def circuit_requests_new_chat(text: str) -> bool:
     return any(phrase in lowered for phrase in new_chat_phrases)
 
 
-def normalize_deep_concurrency(value: int, total_chunks: int) -> int:
+def normalize_deep_concurrency(
+    value: int,
+    total_chunks: int,
+    chunks: list[dict[str, Any]] | None = None,
+) -> int:
     if total_chunks <= 1:
         return 1
-    return min(max(1, int(value or 1)), total_chunks)
+    requested = int(value or 0)
+    explicit_cap = requested if requested > 0 else 3
+    recommended = recommended_deep_concurrency(total_chunks, chunks or [])
+    return min(max(1, explicit_cap), recommended, total_chunks)
+
+
+def recommended_deep_concurrency(total_chunks: int, chunks: list[dict[str, Any]]) -> int:
+    diff_chars = [int(chunk.get("diff_chars") or len(str(chunk.get("diff") or ""))) for chunk in chunks]
+    max_diff = max(diff_chars) if diff_chars else 0
+    avg_diff = (sum(diff_chars) / len(diff_chars)) if diff_chars else 0
+    high_priority_count = sum(1 for chunk in chunks if chunk.get("model_review_priority") == "high")
+    if max_diff >= 16_000 or avg_diff >= 9_000:
+        return 1
+    if total_chunks <= 3:
+        return 3
+    if total_chunks >= 18 or high_priority_count >= 10:
+        return 1
+    if total_chunks >= 7 or max_diff >= 8_000 or avg_diff >= 5_000 or high_priority_count >= 4:
+        return 2
+    return 3
 
 
 def mask_secret_for_github_actions(value: str) -> None:

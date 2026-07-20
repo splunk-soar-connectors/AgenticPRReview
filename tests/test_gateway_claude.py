@@ -16,12 +16,28 @@ from agentic_pr_review.gateway_claude import (
     circuit_requests_new_chat,
     extract_chat_completion_text,
     mask_secret_for_github_actions,
+    normalize_deep_concurrency,
 )
 from agentic_pr_review.config import RuntimeConfig
 from agentic_pr_review.secret_redactor import REDACTED_AUTH, REDACTED_SECRET
 
 
 class GatewayClaudeTest(unittest.TestCase):
+    def test_normalize_deep_concurrency_adapts_to_workload(self):
+        small_chunks = [{"diff_chars": 500}, {"diff_chars": 600}]
+        medium_chunks = [{"diff_chars": 700} for _ in range(8)]
+        large_chunks = [{"diff_chars": 17_000}, {"diff_chars": 500}]
+
+        self.assertEqual(normalize_deep_concurrency(0, len(small_chunks), small_chunks), 2)
+        self.assertEqual(normalize_deep_concurrency(0, len(medium_chunks), medium_chunks), 2)
+        self.assertEqual(normalize_deep_concurrency(0, len(large_chunks), large_chunks), 1)
+
+    def test_explicit_deep_concurrency_is_a_cap_not_a_floor(self):
+        chunks = [{"diff_chars": 17_000}, {"diff_chars": 500}, {"diff_chars": 500}]
+
+        self.assertEqual(normalize_deep_concurrency(3, len(chunks), chunks), 1)
+        self.assertEqual(normalize_deep_concurrency(1, len(chunks), chunks), 1)
+
     def test_runtime_config_selects_gateway_provider(self):
         env = {
             "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",

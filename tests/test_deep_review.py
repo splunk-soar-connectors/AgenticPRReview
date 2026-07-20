@@ -1,10 +1,13 @@
+import json
 import unittest
 
 from agentic_pr_review.deep_review import (
     DeepPRCollector,
     build_chunk_review_input,
     chunk_unified_diff,
+    collect_related_python_context_paths,
     generate_unified_diff,
+    infer_local_python_import_paths,
     plan_circuit_review_chunks,
     split_chunk_for_adaptive_retry,
 )
@@ -93,6 +96,242 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertEqual(scoped_input["review_scope"]["chunk_strategy"], "python_function")
         self.assertEqual(scoped_input["review_scope"]["python_scope"], "alpha")
         self.assertEqual(scoped_input["review_packet"]["change_stats"]["python_scope"], "alpha")
+
+    def test_small_python_diff_uses_scope_and_semantic_helper_context(self):
+        spacer = "\n".join("# spacer" for _ in range(80))
+        base = (
+            "def get_token(asset):\n"
+            "    return asset.token\n\n"
+            f"{spacer}\n\n"
+            "def authenticate(asset, client):\n"
+            "    return client.post('/token', timeout=30)\n\n"
+            f"{spacer}\n\n"
+            "def unrelated_massive_helper():\n"
+            "    return 'not relevant'\n"
+        )
+        head = base.replace(
+            "def authenticate(asset, client):\n"
+            "    return client.post('/token', timeout=30)",
+            "def authenticate(asset, client):\n"
+            "    token = get_token(asset)\n"
+            "    return client.post('/token', headers={'Authorization': token}, timeout=30)",
+        )
+        diff = generate_unified_diff(base, head, base_path="connector.py", head_path="connector.py")
+
+        chunks = chunk_unified_diff(
+            {"filename": "connector.py", "status": "modified", "additions": 2, "deletions": 1, "changes": 3},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["chunk_strategy"], "python_function")
+        self.assertEqual(chunks[0]["python_scope"], "authenticate")
+
+        chunk_input = build_chunk_review_input(
+            {
+                "repo": "owner/repo",
+                "pr": {"number": 1, "title": "test"},
+                "full_files": {"connector.py": head},
+                "base_files": {"connector.py": base},
+                "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+                "ci": {"check_runs": []},
+                "collector_notes": {},
+            },
+            chunks[0],
+        )
+        packet = chunk_input["review_packet"]
+        semantic_text = json.dumps(packet["semantic_context"])
+
+        self.assertIn("get_token", semantic_text)
+        self.assertIn("definition referenced by changed code", semantic_text)
+        self.assertIn("authenticate", packet["head_context_files"]["connector.py"])
+        self.assertNotIn("unrelated_massive_helper", packet["head_context_files"]["connector.py"])
+        self.assertNotIn("unrelated_massive_helper", semantic_text)
+
+    def test_added_python_file_splits_by_added_functions(self):
+        head = (
+            "def first_action():\n"
+            "    return 1\n\n"
+            "def second_action():\n"
+            "    return 2\n"
+        )
+        diff = generate_unified_diff("", head, base_path="connector.py", head_path="connector.py")
+
+        chunks = chunk_unified_diff(
+            {"filename": "connector.py", "status": "added", "additions": 5, "deletions": 0, "changes": 5},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text="",
+        )
+
+        self.assertEqual({chunk.get("python_scope") for chunk in chunks}, {"first_action", "second_action"})
+        self.assertTrue(all(chunk.get("context_strategy") == "changed_hunks_enclosing_scope_semantic_context" for chunk in chunks))
+
+    def test_local_python_imports_are_collected_for_semantic_context(self):
+        paths = infer_local_python_import_paths(
+            "src/actions/get_issue.py",
+            (
+                "from ..client import call_github\n"
+                "from . import helpers\n"
+                "from .validators import validate_issue\n"
+                "import json\n"
+                "import requests\n"
+                "import consts\n"
+            ),
+            known_roots={"src"},
+        )
+
+        self.assertIn("src/client.py", paths)
+        self.assertIn("src/actions/helpers.py", paths)
+        self.assertIn("src/actions/validators.py", paths)
+        self.assertIn("src/consts.py", paths)
+        self.assertNotIn("json.py", paths)
+        self.assertNotIn("requests.py", paths)
+
+    def test_related_python_context_paths_follow_changed_file_imports(self):
+        related = collect_related_python_context_paths(
+            {
+                "src/app.py": "from .client import call_api\nfrom .actions.lookup import lookup\n",
+                "README.md": "from .ignored import no\n",
+            }
+        )
+
+        self.assertIn("src/client.py", related)
+        self.assertIn("src/actions/lookup.py", related)
+        self.assertNotIn("README/ignored.py", related)
+
+    def test_changed_method_packet_includes_enclosing_class_context(self):
+        base = (
+            "class Connector:\n"
+            "    def __init__(self, session):\n"
+            "        self.session = session\n\n"
+            "    def _make_rest_call(self, url):\n"
+            "        return self.session.get(url, timeout=30)\n\n"
+            "    def handle_action(self, url):\n"
+            "        return self._make_rest_call(url)\n"
+        )
+        head = base.replace(
+            "    def handle_action(self, url):\n"
+            "        return self._make_rest_call(url)",
+            "    def handle_action(self, url):\n"
+            "        response = self._make_rest_call(url)\n"
+            "        return response",
+        )
+        diff = generate_unified_diff(base, head, base_path="connector.py", head_path="connector.py")
+        chunks = chunk_unified_diff(
+            {"filename": "connector.py", "status": "modified", "additions": 2, "deletions": 1, "changes": 3},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        chunk_input = build_chunk_review_input(
+            {
+                "repo": "owner/repo",
+                "pr": {"number": 1, "title": "test"},
+                "full_files": {"connector.py": head},
+                "base_files": {"connector.py": base},
+                "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+                "ci": {"check_runs": []},
+                "collector_notes": {},
+            },
+            chunks[0],
+        )
+        semantic_text = json.dumps(chunk_input["review_packet"]["semantic_context"])
+
+        self.assertEqual(chunks[0]["python_scope"], "Connector.handle_action")
+        self.assertIn("enclosing class for changed method", semantic_text)
+        self.assertIn("initializer for changed method's class", semantic_text)
+        self.assertIn("_make_rest_call", semantic_text)
+
+    def test_changed_function_packet_includes_cross_file_callers(self):
+        base = "def authenticate(asset):\n    return asset.token\n"
+        head = "def authenticate(asset):\n    return asset.token.strip()\n"
+        caller = "from .auth import authenticate\n\ndef test_connectivity(asset):\n    return authenticate(asset)\n"
+        diff = generate_unified_diff(base, head, base_path="src/auth.py", head_path="src/auth.py")
+        chunks = chunk_unified_diff(
+            {"filename": "src/auth.py", "status": "modified", "additions": 1, "deletions": 1, "changes": 2},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        chunk_input = build_chunk_review_input(
+            {
+                "repo": "owner/repo",
+                "pr": {"number": 1, "title": "test"},
+                "full_files": {"src/auth.py": head, "src/app.py": caller},
+                "base_files": {"src/auth.py": base},
+                "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+                "ci": {"check_runs": []},
+                "collector_notes": {},
+            },
+            chunks[0],
+        )
+        semantic_text = json.dumps(chunk_input["review_packet"]["semantic_context"])
+
+        self.assertIn("src/app.py", semantic_text)
+        self.assertIn("caller of changed function `authenticate`", semantic_text)
+        self.assertIn("test_connectivity", semantic_text)
+
+    def test_json_diff_groups_by_changed_object(self):
+        base = (
+            "{\n"
+            '  "actions": [\n'
+            "    {\n"
+            '      "identifier": "lookup",\n'
+            '      "read_only": true\n'
+            "    },\n"
+            "    {\n"
+            '      "identifier": "delete_item",\n'
+            '      "read_only": true\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        )
+        head = base.replace('"read_only": true\n    }\n  ]', '"read_only": false\n    }\n  ]')
+        diff = generate_unified_diff(base, head, base_path="app.json", head_path="app.json")
+
+        chunks = chunk_unified_diff(
+            {"filename": "app.json", "status": "modified", "additions": 1, "deletions": 1, "changes": 2},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["chunk_strategy"], "json_object")
+        self.assertEqual(chunks[0]["logical_unit"], "identifier:delete_item")
+
+    def test_yaml_diff_groups_by_changed_section(self):
+        base = (
+            "name: Review\n"
+            "jobs:\n"
+            "  test:\n"
+            "    steps:\n"
+            "      - name: Run tests\n"
+            "        run: pytest\n"
+        )
+        head = base.replace("        run: pytest\n", "        run: pytest -q\n")
+        diff = generate_unified_diff(base, head, base_path=".github/workflows/review.yml", head_path=".github/workflows/review.yml")
+
+        chunks = chunk_unified_diff(
+            {"filename": ".github/workflows/review.yml", "status": "modified", "additions": 1, "deletions": 1, "changes": 2},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["chunk_strategy"], "yaml_section")
+        self.assertIn("jobs.test.steps.run", chunks[0]["logical_unit"])
 
     def test_build_chunk_review_input_includes_primary_and_app_context(self):
         review_input = {
@@ -372,10 +611,37 @@ class DeepReviewHelpersTest(unittest.TestCase):
         chunk_input = build_chunk_review_input(review_input, chunk)
 
         packet = chunk_input["review_packet"]
-        self.assertIn("lines 65-", packet["head_context_files"]["connector.py"])
+        self.assertIn("lines 55-", packet["head_context_files"]["connector.py"])
         self.assertIn("100:", packet["head_context_files"]["connector.py"])
         self.assertIn("lookup_ioc", packet["changed_hunks"][0]["added_excerpt"])
         self.assertLess(len(chunk_input["full_files"]["connector.py"]), len(big_file))
+
+    def test_chunk_review_packet_caps_related_context_files(self):
+        full_files = {"connector.py": "def lookup_ioc():\n    return 1\n"}
+        for index in range(20):
+            full_files[f"helper_{index}.py"] = f"def helper_{index}():\n    return 'lookup_ioc'\n"
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": full_files,
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+        }
+        chunk = {
+            "id": "connector.py:1",
+            "path": "connector.py",
+            "status": "modified",
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "diff": "@@ -1 +1 @@\n-def lookup_ioc():\n+def lookup_ioc(value):",
+        }
+
+        packet = build_chunk_review_input(review_input, chunk)["review_packet"]
+
+        self.assertLessEqual(len(packet["head_context_files"]), 9)
+        self.assertIn("connector.py", packet["head_context_files"])
 
     def test_deep_merge_replaces_truncated_github_patch_with_full_diff(self):
         collector = object.__new__(DeepPRCollector)
