@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 from pathlib import PurePosixPath
 import re
@@ -24,6 +25,9 @@ DEEP_CONTEXT_FILES = {
 CIRCUIT_PACKET_DIFF_CHARS = 30_000
 CIRCUIT_PACKET_PRIMARY_CONTEXT_CHARS = 10_000
 CIRCUIT_PACKET_RELATED_CONTEXT_CHARS = 5_000
+PYTHON_FUNCTION_CHUNK_MIN_FILE_CHARS = 18_000
+PYTHON_FUNCTION_CHUNK_MIN_CHANGES = 140
+PYTHON_FUNCTION_CHUNK_TARGET_CHARS = 12_000
 
 LOW_SIGNAL_MODEL_FILENAMES = {
     "license",
@@ -154,6 +158,8 @@ class DeepPRCollector(PRCollector):
                     file_info,
                     diff,
                     max_chars=self.deep_chunk_chars,
+                    head_text=head_text or "",
+                    base_text=base_text or "",
                 )
             )
 
@@ -252,9 +258,26 @@ def generate_unified_diff(base_text: str, head_text: str, *, base_path: str, hea
     )
 
 
-def chunk_unified_diff(file_info: dict[str, Any], diff: str, *, max_chars: int) -> list[dict[str, Any]]:
+def chunk_unified_diff(
+    file_info: dict[str, Any],
+    diff: str,
+    *,
+    max_chars: int,
+    head_text: str = "",
+    base_text: str = "",
+) -> list[dict[str, Any]]:
     path = str(file_info.get("filename") or "")
     previous_path = str(file_info.get("previous_filename") or path)
+    function_chunks = chunk_python_diff_by_function(
+        file_info,
+        diff,
+        max_chars=max_chars,
+        head_text=head_text,
+        base_text=base_text,
+    )
+    if function_chunks:
+        return function_chunks
+
     headers, hunks = split_unified_diff(diff)
     if not hunks:
         hunks = [diff]
@@ -295,6 +318,201 @@ def chunk_unified_diff(file_info: dict[str, Any], diff: str, *, max_chars: int) 
             }
         )
     return output
+
+
+def chunk_python_diff_by_function(
+    file_info: dict[str, Any],
+    diff: str,
+    *,
+    max_chars: int,
+    head_text: str,
+    base_text: str,
+) -> list[dict[str, Any]]:
+    path = str(file_info.get("filename") or "")
+    if not path.endswith(".py"):
+        return []
+
+    change_count = int(file_info.get("changes") or 0)
+    if (
+        len(head_text or base_text) < PYTHON_FUNCTION_CHUNK_MIN_FILE_CHARS
+        and len(diff) < PYTHON_FUNCTION_CHUNK_TARGET_CHARS
+        and change_count < PYTHON_FUNCTION_CHUNK_MIN_CHANGES
+    ):
+        return []
+
+    head_scopes = python_scopes_from_source(head_text)
+    base_scopes = python_scopes_from_source(base_text)
+    if not head_scopes and not base_scopes:
+        return []
+
+    headers, hunks = split_unified_diff(diff)
+    if not hunks:
+        return []
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for hunk in hunks:
+        for scope, scoped_hunk in split_python_hunk_by_scope(hunk, head_scopes, base_scopes):
+            key = python_scope_key(scope)
+            item = grouped.setdefault(key, {"scope": scope, "hunks": []})
+            item["hunks"].append(scoped_hunk)
+
+    if not grouped:
+        return []
+
+    target_chars = min(max_chars, PYTHON_FUNCTION_CHUNK_TARGET_CHARS)
+    path_suffix = PurePosixPath(path).suffix.lower().lstrip(".") or "unknown"
+    previous_path = str(file_info.get("previous_filename") or path)
+    output: list[dict[str, Any]] = []
+
+    for item in grouped.values():
+        scope = item.get("scope")
+        chunk_diff = f"{headers}\n" + "\n".join(str(hunk) for hunk in item.get("hunks") or [])
+        chunk_diff = chunk_diff.strip()
+        if not chunk_diff or chunk_diff == headers.strip():
+            continue
+        parts: list[str]
+        if len(chunk_diff) <= target_chars:
+            parts = [chunk_diff]
+        else:
+            parts = []
+            for hunk in item.get("hunks") or []:
+                parts.extend(split_large_hunk(headers, str(hunk), max_chars=target_chars))
+        for part in parts:
+            output.append(
+                {
+                    "id": "",
+                    "path": path,
+                    "previous_path": previous_path if previous_path != path else None,
+                    "status": file_info.get("status"),
+                    "additions": file_info.get("additions"),
+                    "deletions": file_info.get("deletions"),
+                    "changes": file_info.get("changes"),
+                    "file_type": path_suffix,
+                    "chunk_index": 0,
+                    "chunk_total": 0,
+                    "diff_chars": len(part),
+                    "diff": part,
+                    "chunk_strategy": "python_function",
+                    "python_scope": scope.get("name") if scope else "module",
+                    "python_scope_kind": scope.get("kind") if scope else "module",
+                    "python_scope_start_line": scope.get("start_line") if scope else None,
+                    "python_scope_end_line": scope.get("end_line") if scope else None,
+                }
+            )
+
+    if len(output) <= 1:
+        return []
+
+    total = len(output)
+    for index, chunk in enumerate(output, start=1):
+        chunk["id"] = f"{path}:{index}"
+        chunk["chunk_index"] = index
+        chunk["chunk_total"] = total
+    return output
+
+
+def python_scopes_from_source(source: str) -> list[dict[str, Any]]:
+    if not source.strip():
+        return []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    scopes: list[dict[str, Any]] = []
+
+    def visit_body(body: list[ast.stmt], prefix: str = "") -> None:
+        for node in body:
+            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = f"{prefix}.{node.name}" if prefix else node.name
+            kind = "class" if isinstance(node, ast.ClassDef) else "function"
+            start_line = int(getattr(node, "lineno", 1) or 1)
+            end_line = int(getattr(node, "end_lineno", start_line) or start_line)
+            scopes.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }
+            )
+            visit_body(list(getattr(node, "body", []) or []), name)
+
+    visit_body(list(tree.body))
+    return scopes
+
+
+def split_python_hunk_by_scope(
+    hunk: str,
+    head_scopes: list[dict[str, Any]],
+    base_scopes: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any] | None, str]]:
+    lines = hunk.splitlines()
+    if not lines:
+        return []
+    parsed = parse_hunk_header(lines[0])
+    if parsed is None:
+        return [(None, hunk)]
+
+    old_line = int(parsed["old_start"])
+    new_line = int(parsed["new_start"])
+    grouped: dict[str, dict[str, Any]] = {}
+
+    for line in lines[1:]:
+        is_added = line.startswith("+") and not line.startswith("+++")
+        is_removed = line.startswith("-") and not line.startswith("---")
+        old_for_line = None if is_added else old_line
+        new_for_line = None if is_removed else new_line
+        scope = None
+        if new_for_line is not None:
+            scope = find_python_scope_for_line(head_scopes, new_for_line)
+        if scope is None and old_for_line is not None:
+            scope = find_python_scope_for_line(base_scopes, old_for_line)
+
+        key = python_scope_key(scope)
+        item = grouped.setdefault(key, {"scope": scope, "lines": [lines[0]], "changed": False})
+        item["lines"].append(line)
+        if is_added or is_removed:
+            item["changed"] = True
+
+        if not is_added:
+            old_line += 1
+        if not is_removed:
+            new_line += 1
+
+    return [
+        (item.get("scope"), "\n".join(item.get("lines") or []))
+        for item in grouped.values()
+        if item.get("changed") and len(item.get("lines") or []) > 1
+    ]
+
+
+def find_python_scope_for_line(scopes: list[dict[str, Any]], line_no: int) -> dict[str, Any] | None:
+    candidates = [
+        scope
+        for scope in scopes
+        if int(scope.get("start_line") or 0) <= line_no <= int(scope.get("end_line") or 0)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda scope: (
+            int(scope.get("end_line") or 0) - int(scope.get("start_line") or 0),
+            -int(scope.get("start_line") or 0),
+        ),
+    )
+
+
+def python_scope_key(scope: dict[str, Any] | None) -> str:
+    if not scope:
+        return "module"
+    return (
+        f"{scope.get('kind') or 'scope'}:"
+        f"{scope.get('name') or 'unknown'}:"
+        f"{scope.get('start_line') or 0}-{scope.get('end_line') or 0}"
+    )
 
 
 def split_unified_diff(diff: str) -> tuple[str, list[str]]:
@@ -350,10 +568,16 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
     )
     instruction = "Only report concrete issues proven by this chunk plus supplied PR context."
     if chunk.get("adaptive_retry"):
-        instruction += (
-            " This is a smaller retry slice of a larger file chunk after a transient model gateway failure; "
-            "review this slice fully and do not assume sibling slices are already represented here."
-        )
+        if chunk.get("proactive_review"):
+            instruction += (
+                " This is a proactive smaller slice of a timeout-risk file chunk; review this slice fully "
+                "and do not assume sibling slices are already represented here."
+            )
+        else:
+            instruction += (
+                " This is a smaller retry slice of a larger file chunk after a transient model gateway failure; "
+                "review this slice fully and do not assume sibling slices are already represented here."
+            )
     if chunk.get("model_review_reason"):
         instruction += f" Circuit packet planner reason: {chunk.get('model_review_reason')}."
 
@@ -364,10 +588,16 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             "chunk_id": chunk.get("id"),
             "parent_chunk_id": chunk.get("parent_chunk_id"),
             "adaptive_retry": bool(chunk.get("adaptive_retry")),
+            "proactive_review": bool(chunk.get("proactive_review")),
             "path": path,
             "previous_path": chunk.get("previous_path"),
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
+            "chunk_strategy": chunk.get("chunk_strategy"),
+            "python_scope": chunk.get("python_scope"),
+            "python_scope_kind": chunk.get("python_scope_kind"),
+            "python_scope_start_line": chunk.get("python_scope_start_line"),
+            "python_scope_end_line": chunk.get("python_scope_end_line"),
             "model_review_priority": chunk.get("model_review_priority"),
             "model_review_reason": chunk.get("model_review_reason"),
             "instruction": instruction,
@@ -404,6 +634,7 @@ def build_chunk_review_input(review_input: dict[str, Any], chunk: dict[str, Any]
             "deep_chunk_id": chunk.get("id"),
             "deep_parent_chunk_id": chunk.get("parent_chunk_id"),
             "deep_adaptive_retry": bool(chunk.get("adaptive_retry")),
+            "deep_proactive_review": bool(chunk.get("proactive_review")),
         },
     }
 
@@ -514,6 +745,15 @@ def build_circuit_review_packet(
         for item in hunk_summaries
         if int(item.get("old_count") or 0) > 0
     ]
+    scope_start = int(chunk.get("python_scope_start_line") or 0)
+    scope_end = int(chunk.get("python_scope_end_line") or 0)
+    if path.endswith(".py") and scope_start > 0 and scope_end >= scope_start:
+        scope_range = (scope_start, scope_end - scope_start + 1)
+        if chunk.get("status") == "removed":
+            if scope_range not in base_ranges:
+                base_ranges.insert(0, scope_range)
+        elif scope_range not in head_ranges:
+            head_ranges.insert(0, scope_range)
     terms = interesting_terms_from_diff(diff, path)
     head_context = focused_context_for_packet(
         context_files,
@@ -546,6 +786,11 @@ def build_circuit_review_packet(
             "changes": chunk.get("changes"),
             "chunk_index": chunk.get("chunk_index"),
             "chunk_total": chunk.get("chunk_total"),
+            "chunk_strategy": chunk.get("chunk_strategy"),
+            "python_scope": chunk.get("python_scope"),
+            "python_scope_kind": chunk.get("python_scope_kind"),
+            "python_scope_start_line": chunk.get("python_scope_start_line"),
+            "python_scope_end_line": chunk.get("python_scope_end_line"),
         },
         "planner": {
             "priority": chunk.get("model_review_priority"),

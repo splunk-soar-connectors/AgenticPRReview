@@ -107,6 +107,7 @@ def run_deterministic_checks(review_input: dict[str, Any]) -> list[dict[str, Any
     findings.extend(check_oauth_v1_v2_endpoint_mismatch(review_input, full_files))
     findings.extend(check_tls_verification_defaults(review_input, full_files, app_jsons))
     findings.extend(check_missing_verify_config_field(full_files, app_jsons))
+    findings.extend(check_python_config_reads_missing_json_fields(full_files, app_jsons))
     findings.extend(check_unsafe_logging(full_files))
     findings.extend(check_sensitive_debug_data(full_files))
     findings.extend(check_read_only_metadata(app_jsons))
@@ -685,6 +686,77 @@ def check_missing_verify_config_field(
             "evidence": f"{py_path}:{py_line} reads `verify_server_cert` (`{py_evidence}`), but no matching asset configuration field exists in the app JSON.",
             "why_it_matters": "Users cannot enable or control TLS certificate verification from the asset UI if the runtime option is absent from configuration metadata.",
             "suggested_fix": "Add a boolean `verify_server_cert` asset parameter with a secure default, and have all external API calls use that value consistently.",
+        }
+    ]
+
+
+def check_python_config_reads_missing_json_fields(
+    full_files: dict[str, str],
+    app_jsons: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not app_jsons:
+        return []
+
+    configured_names: set[str] = set()
+    for app_json in app_jsons.values():
+        for item in app_configuration(app_json):
+            name = str(item.get("name") or item.get("key") or item.get("identifier") or "").strip().lower()
+            if name:
+                configured_names.add(name)
+
+    ignored = {
+        "asset_id",
+        "app_version",
+        "directory",
+        "ingest",
+        "main_module",
+        "verify_server_cert",
+    }
+    config_read_pattern = re.compile(
+        r"(?:self\.)?get_config\(\)\s*(?:\.get\(\s*['\"](?P<direct_get>[^'\"]+)['\"]|\[\s*['\"](?P<direct_index>[^'\"]+)['\"]\s*\])"
+        r"|\bconfig\s*(?:\.get\(\s*['\"](?P<var_get>[^'\"]+)['\"]|\[\s*['\"](?P<var_index>[^'\"]+)['\"]\s*\])"
+    )
+
+    missing_refs: dict[str, tuple[str, int, str]] = {}
+    for path, text in full_files.items():
+        if not path.endswith(".py") or ("get_config" not in text and "config" not in text):
+            continue
+        for line_no, line in iter_lines(text):
+            for match in config_read_pattern.finditer(line):
+                raw_key = next((match.group(name) for name in ("direct_get", "direct_index", "var_get", "var_index") if match.group(name)), "")
+                key = raw_key.strip().lower()
+                if not key or key in configured_names or key in ignored or key.startswith("_"):
+                    continue
+                missing_refs.setdefault(key, (path, line_no, line.strip()))
+
+    if not missing_refs:
+        return []
+
+    json_path = next(iter(app_jsons))
+    json_text = full_files.get(json_path, "")
+    evidence_parts = [
+        f"`{key}` at {path}:{line_no} (`{line}`)"
+        for key, (path, line_no, line) in sorted(missing_refs.items())[:6]
+    ]
+    more_count = max(0, len(missing_refs) - len(evidence_parts))
+    more_text = f" plus {more_count} more" if more_count else ""
+    return [
+        {
+            "title": "Python reads asset configuration fields missing from app JSON",
+            "category": "soar_metadata",
+            "severity": "high",
+            "confidence": "high",
+            "file": json_path,
+            "line": json_key_line(json_text, "configuration"),
+            "code_reference": "configuration",
+            "evidence": (
+                "Python reads asset config keys that are not exposed in the manifest configuration: "
+                + "; ".join(evidence_parts)
+                + more_text
+                + "."
+            ),
+            "why_it_matters": "Runtime options that are absent from app JSON cannot be set from the SOAR asset UI, so the connector can silently use hardcoded or insecure fallback behavior.",
+            "suggested_fix": "Add matching configuration entries with correct data types/defaults, or remove the Python reads and document the intentionally unsupported behavior.",
         }
     ]
 
@@ -3316,10 +3388,11 @@ def check_custom_view_action_result_misuse(full_files: dict[str, str]) -> list[d
                 }
             )
 
-        if "request.get.get" in lowered and "httpresponse" in lowered:
+        api_recall_terms = ("_handle_", "_make_rest_call", "requests.", "session.", "connector.")
+        if "request.get.get" in lowered and any(term in lowered for term in api_recall_terms):
             for function_name, start_line, body in extract_functions_matching(text, r"view"):
                 body_lower = body.lower()
-                if "request.get.get" not in body_lower or "httpresponse" not in body_lower:
+                if "request.get.get" not in body_lower or not any(term in body_lower for term in api_recall_terms):
                     continue
                 if re.search(r"if\s+not\s+[^:\n]+:", body) or "missing required" in body_lower:
                     continue

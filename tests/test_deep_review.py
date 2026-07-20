@@ -39,6 +39,61 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertEqual(chunks[0]["path"], "connector.py")
         self.assertIn("@@", chunks[0]["diff"])
 
+    def test_large_python_diff_is_chunked_by_function_scope(self):
+        def function_source(name: str, value: int) -> str:
+            body = [f"def {name}():"]
+            body.extend(f"    item_{idx} = {value + idx}" for idx in range(90))
+            body.append("    return item_0")
+            return "\n".join(body)
+
+        base = "\n\n".join(
+            [
+                function_source("alpha", 1),
+                function_source("beta", 1000),
+                function_source("gamma", 2000),
+            ]
+        )
+        head = base.replace("    item_7 = 8", "    item_7 = 9008").replace(
+            "    item_12 = 2012",
+            "    item_12 = 9912",
+        )
+        diff = generate_unified_diff(base, head, base_path="connector.py", head_path="connector.py")
+
+        chunks = chunk_unified_diff(
+            {
+                "filename": "connector.py",
+                "status": "modified",
+                "additions": 2,
+                "deletions": 2,
+                "changes": 200,
+            },
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        scopes = {chunk.get("python_scope") for chunk in chunks}
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertIn("alpha", scopes)
+        self.assertIn("gamma", scopes)
+        self.assertTrue(all(chunk.get("chunk_strategy") == "python_function" for chunk in chunks))
+
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": head},
+            "base_files": {"connector.py": base},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+        }
+        scoped_input = build_chunk_review_input(review_input, next(chunk for chunk in chunks if chunk.get("python_scope") == "alpha"))
+
+        self.assertEqual(scoped_input["review_scope"]["chunk_strategy"], "python_function")
+        self.assertEqual(scoped_input["review_scope"]["python_scope"], "alpha")
+        self.assertEqual(scoped_input["review_packet"]["change_stats"]["python_scope"], "alpha")
+
     def test_build_chunk_review_input_includes_primary_and_app_context(self):
         review_input = {
             "repo": "owner/repo",

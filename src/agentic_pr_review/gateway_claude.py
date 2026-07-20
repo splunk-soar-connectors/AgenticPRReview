@@ -36,6 +36,11 @@ GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
 GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
 CHUNK_MODEL_INPUT_CHARS = 70_000
 ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS = 45_000
+PROACTIVE_SUBCHUNK_PROMPT_CHARS = 52_000
+PROACTIVE_SUBCHUNK_DIFF_CHARS = 6_000
+PROACTIVE_SUBCHUNK_CONTEXT_CHARS = 6_000
+PROACTIVE_SUBCHUNK_DETERMINISTIC_FINDINGS = 8
+PROACTIVE_SUBCHUNK_ESTIMATED_SECONDS = 90
 
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -143,6 +148,7 @@ class GatewayClaudeReviewer:
         self._token_lock = threading.Lock()
         self._response_format_lock = threading.Lock()
         self._eta_lock = threading.Lock()
+        self._completed_model_prompt_chars: list[int] = []
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -313,6 +319,35 @@ class GatewayClaudeReviewer:
             chunk_deterministic,
             max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS if chunk.get("adaptive_retry") else CHUNK_MODEL_INPUT_CHARS,
         )
+        estimated_request_seconds = self._estimated_request_seconds_for_prompt(len(chunk_prompt))
+        if should_proactively_subchunk(
+            chunk,
+            chunk_prompt,
+            chunk_deterministic,
+            estimated_request_seconds=estimated_request_seconds,
+        ):
+            output = self._review_chunk_as_adaptive_subchunks(
+                review_input,
+                deterministic_findings,
+                chunk,
+                parent_position=position,
+                parent_total=total_chunks,
+                original_error=GatewayTransientModelError(
+                    "Proactively split timeout-risk CIRCUIT packet before first model request."
+                ),
+                proactive=True,
+            )
+            output["chunk_id"] = chunk.get("id")
+            output["chunk_path"] = chunk.get("path")
+            output["chunk_index"] = chunk.get("chunk_index")
+            output["chunk_total"] = chunk.get("chunk_total")
+            chunk_elapsed = format_duration(time.monotonic() - chunk_started)
+            finding_count = len(output.get("findings") or [])
+            self.progress(
+                f"Deep-review chunk {position}/{total_chunks} completed in {chunk_elapsed} "
+                f"with {finding_count} finding(s); estimated whole-review time remaining: {self._eta_text()}."
+            )
+            return output
         try:
             output = self._invoke_review(chunk_prompt, chunk_deterministic, request_max_attempts=1)
         except GatewayTransientModelError as exc:
@@ -345,15 +380,36 @@ class GatewayClaudeReviewer:
         parent_position: int,
         parent_total: int,
         original_error: GatewayTransientModelError,
+        proactive: bool = False,
     ) -> dict[str, Any]:
-        subchunks = split_chunk_for_adaptive_retry(chunk)
-        if not subchunks:
-            subchunks = [build_single_focused_retry_chunk(chunk)]
-        path = str(chunk.get("path") or "unknown file")
-        self.progress(
-            f"Deep-review chunk {parent_position}/{parent_total} hit a transient gateway failure; "
-            f"retrying {path} as {len(subchunks)} smaller focused subchunk(s)."
+        subchunks = split_chunk_for_adaptive_retry(
+            chunk,
+            max_chars=PROACTIVE_SUBCHUNK_DIFF_CHARS if proactive else 18_000,
+            context_char_limit=PROACTIVE_SUBCHUNK_CONTEXT_CHARS if proactive else 30_000,
         )
+        if proactive:
+            for subchunk in subchunks:
+                subchunk["proactive_review"] = True
+                reason = str(subchunk.get("model_review_reason") or chunk.get("model_review_reason") or "")
+                if "proactive" not in reason.lower():
+                    subchunk["model_review_reason"] = (
+                        f"{reason}; proactive smaller packet for timeout-risk review"
+                        if reason
+                        else "proactive smaller packet for timeout-risk review"
+                    )
+        if not subchunks:
+            subchunks = [build_single_focused_retry_chunk(chunk, proactive=proactive)]
+        path = str(chunk.get("path") or "unknown file")
+        if proactive:
+            self.progress(
+                f"Deep-review chunk {parent_position}/{parent_total} is timeout-risk; proactively reviewing "
+                f"{path} as {len(subchunks)} smaller focused subchunk(s)."
+            )
+        else:
+            self.progress(
+                f"Deep-review chunk {parent_position}/{parent_total} hit a transient gateway failure; "
+                f"retrying {path} as {len(subchunks)} smaller focused subchunk(s)."
+            )
         sub_outputs: list[dict[str, Any]] = []
         for sub_position, subchunk in enumerate(subchunks, start=1):
             self.progress(
@@ -425,7 +481,7 @@ class GatewayClaudeReviewer:
             if heartbeat_thread is not None:
                 heartbeat_thread.join(timeout=1)
             if request_succeeded:
-                self._complete_eta_request(time.monotonic() - request_started)
+                self._complete_eta_request(time.monotonic() - request_started, prompt_chars=len(user_prompt))
 
         text = extract_chat_completion_text(response_payload)
         recovery_note = ""
@@ -672,35 +728,88 @@ class GatewayClaudeReviewer:
             remaining = self.eta.remaining_seconds(current_request_elapsed=current_request_elapsed)
         return f"~{format_duration(remaining)}"
 
-    def _complete_eta_request(self, duration_seconds: float) -> None:
+    def _complete_eta_request(self, duration_seconds: float, *, prompt_chars: int | None = None) -> None:
         eta_lock = getattr(self, "_eta_lock", None)
         if eta_lock is None:
             if self.eta is not None:
                 self.eta.complete_request(duration_seconds)
+            if prompt_chars is not None:
+                self._completed_model_prompt_chars.append(max(1, int(prompt_chars)))
             return
         with eta_lock:
             if self.eta is not None:
                 self.eta.complete_request(duration_seconds)
+            if prompt_chars is not None:
+                self._completed_model_prompt_chars.append(max(1, int(prompt_chars)))
+
+    def _estimated_request_seconds_for_prompt(self, prompt_chars: int) -> float | None:
+        eta_lock = getattr(self, "_eta_lock", None)
+        if eta_lock is None:
+            if self.eta is None or not self.eta.completed_request_seconds or not self._completed_model_prompt_chars:
+                return None
+            avg_seconds = self.eta.estimated_request_seconds
+            avg_chars = sum(self._completed_model_prompt_chars) / len(self._completed_model_prompt_chars)
+        else:
+            with eta_lock:
+                if self.eta is None or not self.eta.completed_request_seconds or not self._completed_model_prompt_chars:
+                    return None
+                avg_seconds = self.eta.estimated_request_seconds
+                avg_chars = sum(self._completed_model_prompt_chars) / len(self._completed_model_prompt_chars)
+        if avg_chars <= 0:
+            return None
+        scale = max(0.5, min(4.0, max(1, int(prompt_chars)) / avg_chars))
+        return avg_seconds * scale
 
 
 def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
 
 
-def build_single_focused_retry_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+def should_proactively_subchunk(
+    chunk: dict[str, Any],
+    chunk_prompt: str,
+    chunk_deterministic: list[dict[str, Any]],
+    *,
+    estimated_request_seconds: float | None = None,
+) -> bool:
+    if chunk.get("adaptive_retry"):
+        return False
+    path = str(chunk.get("path") or "")
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if suffix not in {"py", "json", "toml", "yaml", "yml", "xml", "html", "jinja", "j2"}:
+        return False
+    if estimated_request_seconds is not None and estimated_request_seconds >= PROACTIVE_SUBCHUNK_ESTIMATED_SECONDS:
+        return True
+    if len(chunk_prompt) >= PROACTIVE_SUBCHUNK_PROMPT_CHARS:
+        return True
+    if int(chunk.get("diff_chars") or 0) >= PROACTIVE_SUBCHUNK_DIFF_CHARS * 2:
+        return True
+    if suffix == "py" and len(chunk_deterministic) >= PROACTIVE_SUBCHUNK_DETERMINISTIC_FINDINGS:
+        return True
+    changes = int(chunk.get("changes") or 0)
+    return suffix == "py" and changes >= 250
+
+
+def build_single_focused_retry_chunk(chunk: dict[str, Any], *, proactive: bool = False) -> dict[str, Any]:
     parent_id = str(chunk.get("id") or chunk.get("path") or "chunk")
     retry = dict(chunk)
+    reason_suffix = (
+        "proactive focused packet for timeout-risk review"
+        if proactive
+        else "focused retry after transient gateway failure"
+    )
     retry.update(
         {
             "id": f"{parent_id}:focused-retry",
             "parent_chunk_id": parent_id,
             "adaptive_retry": True,
+            "proactive_review": proactive,
             "chunk_index": 1,
             "chunk_total": 1,
             "context_char_limit": 4_000,
             "model_review_reason": (
                 f"{chunk.get('model_review_reason') or 'connector source/config change'}; "
-                "focused retry after transient gateway failure"
+                f"{reason_suffix}"
             ),
         }
     )

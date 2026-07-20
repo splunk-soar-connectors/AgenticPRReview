@@ -7,6 +7,23 @@ from scripts.evaluate_gold_reviews import evaluate_gold_file
 
 
 class GoldReviewEvalTest(unittest.TestCase):
+    def test_packaged_gold_file_has_unique_ids(self):
+        gold_path = Path(__file__).parents[1] / "examples" / "gold_reviews.connector_sdk.json"
+        gold = json.loads(gold_path.read_text(encoding="utf-8"))
+
+        pattern_ids = [item["id"] for item in gold["pattern_catalog"]]
+        case_ids = [item["id"] for item in gold["cases"]]
+        expected_ids = [
+            expected["id"]
+            for case in gold["cases"]
+            for expected in case.get("expected", [])
+        ]
+
+        self.assertEqual(len(pattern_ids), len(set(pattern_ids)))
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+        self.assertEqual(len(expected_ids), len(set(expected_ids)))
+        self.assertGreaterEqual(len(case_ids), 10)
+
     def test_matches_expected_and_forbidden_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

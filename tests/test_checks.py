@@ -1889,6 +1889,32 @@ class DeterministicChecksTest(unittest.TestCase):
             self.titles(review_input),
         )
 
+    def test_python_config_reads_missing_json_fields_are_flagged(self):
+        review_input = {
+            "pr": {"title": "legacy connector", "body": ""},
+            "changed_files": [{"filename": "connector.py"}, {"filename": "sample.json"}],
+            "full_files": {
+                "connector.py": (
+                    "def initialize(self):\n"
+                    "    config = self.get_config()\n"
+                    "    self._api_key = config.get('api_key')\n"
+                    "    self._container_label = config.get('container_label', 'events')\n"
+                    "    self._feed_limit = config['feed_limit']\n"
+                ),
+                "sample.json": (
+                    '{"configuration": {"api_key": {"data_type": "password"}}, "actions": []}'
+                ),
+            },
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        findings = run_deterministic_checks(review_input)
+
+        self.assertIn("Python reads asset configuration fields missing from app JSON", {item["title"] for item in findings})
+        evidence = " ".join(item["evidence"] for item in findings)
+        self.assertIn("container_label", evidence)
+        self.assertIn("feed_limit", evidence)
+
     def test_connector_helper_calls_without_timeouts_are_flagged(self):
         review_input = {
             "pr": {"title": "timeouts", "body": ""},
@@ -1961,6 +1987,25 @@ class DeterministicChecksTest(unittest.TestCase):
 
         self.assertIn("Custom view references phantom.action_result without importing it", titles)
         self.assertIn("Custom view renders a different ActionResult than the handler populates", titles)
+
+    def test_custom_view_recalls_api_from_get_parameters_is_flagged(self):
+        review_input = {
+            "pr": {"title": "views", "body": ""},
+            "changed_files": [{"filename": "sample_view.py"}],
+            "full_files": {
+                "sample_view.py": (
+                    "from django.http import HttpResponse\n"
+                    "def enrich_domain_view(request):\n"
+                    "    domain = request.GET.get('domain')\n"
+                    "    connector = CyberintConnector()\n"
+                    "    connector._handle_enrich_domain({'domain': domain})\n"
+                    "    return HttpResponse('ok')\n"
+                )
+            },
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        self.assertIn("Custom view re-calls API with unchecked GET parameters", self.titles(review_input))
 
     def test_polling_container_and_artifact_contract_issues_are_flagged(self):
         review_input = {

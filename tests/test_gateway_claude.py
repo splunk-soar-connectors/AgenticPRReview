@@ -39,7 +39,7 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(config.model_provider, "gateway")
         self.assertEqual(config.gateway_model, "claude-sonnet-4-6")
-        self.assertEqual(config.gateway_request_timeout_seconds, 180)
+        self.assertEqual(config.gateway_request_timeout_seconds, 600)
         self.assertEqual(config.gateway_request_max_attempts, 2)
         config.require_model()
 
@@ -163,7 +163,7 @@ class GatewayClaudeTest(unittest.TestCase):
         model_request, model_timeout, model_body = calls[1]
         model_headers = {key.lower(): value for key, value in model_request.header_items()}
         model_payload = json.loads(model_body)
-        self.assertEqual(model_timeout, 180)
+        self.assertEqual(model_timeout, 600)
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
@@ -988,6 +988,125 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertIn("smaller retry slice", prompts[1])
         self.assertIn("focused retry after transient gateway failure", prompts[1])
         self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+
+    def test_deep_review_proactively_subchunks_timeout_risk_python_chunk(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def helper():\n    return 1\n"},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "changes": 300,
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -10,2 +10,2 @@\n-response = requests.get(url, timeout=30)\n+response = requests.get(url)",
+                    }
+                ]
+            },
+        }
+        output_template = {
+            "summary": "proactive ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        prompts = []
+
+        def fake_invoke(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return dict(output_template)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+            output = reviewer.review_deep(review_input, [], deep_concurrency=1)
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
+        self.assertIn("proactive focused packet for timeout-risk review", prompts[0])
+        self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+
+    def test_deep_review_uses_eta_prediction_to_proactively_subchunk(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "full_files": {"connector.py": "def helper():\n    return 1\n"},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+            "collector_notes": {},
+            "deep_review": {
+                "chunks": [
+                    {
+                        "id": "connector.py:1",
+                        "path": "connector.py",
+                        "status": "modified",
+                        "changes": 1,
+                        "chunk_index": 1,
+                        "chunk_total": 1,
+                        "diff": "@@ -10,1 +10,1 @@\n-return 1\n+return 2",
+                    }
+                ]
+            },
+        }
+        output_template = {
+            "summary": "eta proactive ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+        prompts = []
+
+        def fake_invoke(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return dict(output_template)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with (
+            patch.object(reviewer, "_estimated_request_seconds_for_prompt", return_value=120.0),
+            patch.object(reviewer, "_invoke_review", side_effect=fake_invoke),
+        ):
+            output = reviewer.review_deep(review_input, [], deep_concurrency=1)
+
+        self.assertEqual(output["overall_status"], "looks_good")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
 
     def test_deep_review_keeps_deterministic_findings_when_focused_retry_times_out(self):
         env = {

@@ -1,77 +1,531 @@
 {
-  "schema_version": "0.1",
-  "description": "Synthetic regression expectations for connector review behavior.",
+  "schema_version": "0.2",
+  "description": "Human-review-derived golden expectations for Splunk SOAR connector PR review behavior. Expected patterns are based on historical AI/human review feedback and the detailed human reviews supplied for Microsoft OneDrive, Tanium REST, GitHub, urlscan, and Cyberint Premium IOC.",
+  "notes": [
+    "The evaluator skips cases whose artifacts_dir does not contain review_input.json. Keep the case here anyway so a saved run becomes active automatically once copied under runs/.",
+    "Historical human reviews are reference material, not authority. A current PR must still prove the issue from its own code, docs, CI, or metadata.",
+    "Terms should stay behavior-focused so the bot learns reusable review patterns instead of overfitting to one exact PR comment."
+  ],
   "pattern_catalog": [
     {
-      "id": "oauth_doc_drift",
-      "source_reviews": ["sample-sdk-migration"],
+      "id": "oauth_basic_auth_client_credentials",
+      "source_reviews": ["beyondtrust-1"],
       "category": "api_auth_correctness",
-      "summary": "Auth fields, README, and release notes must not claim OAuth support when executable code is token-only.",
+      "summary": "OAuth client-credentials token exchanges must match vendor docs, including HTTP Basic auth when required instead of sending client_id/client_secret only in the body.",
       "bot_coverage": ["deterministic", "prompt"]
     },
     {
-      "id": "sparse_output_models",
-      "source_reviews": ["sample-sdk-migration"],
-      "category": "output_schema_mismatch",
-      "summary": "SDK output models built from raw API dictionaries must tolerate optional and sparse fields.",
-      "bot_coverage": ["deterministic", "prompt"]
-    },
-    {
-      "id": "live_only_tests",
-      "source_reviews": ["sample-sdk-migration"],
-      "category": "missing_tests",
-      "summary": "SDK migration tests that require live tenant credentials do not replace offline tests for model construction, endpoint building, and error payloads.",
-      "bot_coverage": ["deterministic", "prompt"]
-    },
-    {
-      "id": "request_timeouts",
-      "source_reviews": ["sample-legacy-connector"],
+      "id": "auth_path_doc_drift",
+      "source_reviews": ["googlethreatintelligence-7", "github-39"],
       "category": "api_auth_correctness",
-      "summary": "Direct request/helper/session calls need explicit timeouts so API failures do not hang workers.",
+      "summary": "Auth docs, asset fields, and executable auth paths must agree; stale OAuth/client-credential fields should not remain when runtime code only supports another path.",
       "bot_coverage": ["deterministic", "prompt"]
     },
     {
-      "id": "unsafe_debug_data",
-      "source_reviews": ["sample-legacy-connector"],
+      "id": "token_request_timeout",
+      "source_reviews": ["googlethreatintelligence-7", "cyberintpremiumioc-2"],
+      "category": "api_auth_correctness",
+      "summary": "Token and API requests need explicit timeouts so worker execution cannot hang on network failures.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "tls_verify_default_and_config",
+      "source_reviews": ["beyondtrust-1", "cyberintpremiumioc-2"],
+      "category": "api_auth_correctness",
+      "summary": "External API TLS verification should not default to false, and any runtime verify option must be exposed in app JSON asset configuration.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "unsafe_logging_sensitive_payloads",
+      "source_reviews": ["commvaultcloud-15", "beyondtrust-1", "cyberintpremiumioc-2"],
       "category": "unsafe_logging",
-      "summary": "Debug data should not include full response text, response headers, tokens, tenant data, or full payloads.",
+      "summary": "Do not log full params, API responses, headers, tokens, tenant data, PII, or full debug response text.",
       "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "add_data_manifest_output_mismatch",
+      "source_reviews": ["msadgraph-47", "cyberintpremiumioc-2"],
+      "category": "output_schema_mismatch",
+      "summary": "When code calls add_data() with raw API responses, app JSON must declare the returned action_result.data.* paths users need.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "summary_manifest_output_mismatch",
+      "source_reviews": ["beyondtrust-1", "cyberintpremiumioc-2", "taniumrest-37"],
+      "category": "output_schema_mismatch",
+      "summary": "Summary keys emitted by code or preserved from legacy apps must be declared in app JSON or SDK summary metadata.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "sdk_sparse_api_output_models",
+      "source_reviews": ["microsoftonedrive-36", "urlscan-52"],
+      "category": "output_schema_mismatch",
+      "summary": "SDK output models built around raw vendor API responses should tolerate optional/sparse fields and preserve high-value legacy output discovery paths.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "sdk_nested_output_path_regression",
+      "source_reviews": ["taniumrest-37"],
+      "category": "output_schema_mismatch",
+      "summary": "SDK migrations must preserve legacy nested output datapaths unless the compatibility break is explicit and justified.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "sdk_dynamic_model_attributes_not_serialized",
+      "source_reviews": ["github-39"],
+      "category": "output_schema_mismatch",
+      "summary": "Adding dynamic attributes to SDK/Pydantic output models after construction does not necessarily serialize those fields into action_result.data.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "poll_now_scheduled_state_contamination",
+      "source_reviews": ["msgraphforoffice365-78"],
+      "category": "polling_checkpoint",
+      "summary": "Poll Now and scheduled polling state must remain separate so manual testing cannot advance or corrupt scheduled checkpoints.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "checkpoint_advance_after_partial_failure",
+      "source_reviews": ["googlethreatintelligence-7"],
+      "category": "polling_checkpoint",
+      "summary": "Do not advance checkpoints after partial container/artifact ingestion failure because that silently drops future events.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "timestamp_or_single_id_dedup",
+      "source_reviews": ["msgraphforoffice365-78", "googlesecops-1", "cyberintpremiumioc-2"],
+      "category": "polling_checkpoint",
+      "summary": "Timestamp-only SDIs, single-ID boundary cursors, and daily-feed-only checkpoints can replay or drop same-timestamp events.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "on_poll_controls_ignored",
+      "source_reviews": ["cyberintpremiumioc-2", "connector-history"],
+      "category": "polling_checkpoint",
+      "summary": "on_poll implementations should use Poll Now, start_time, end_time, container_count, and artifact_count or clearly document a safe bounded alternative.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "container_artifact_contract",
+      "source_reviews": ["cyberintpremiumioc-2"],
+      "category": "soar_metadata",
+      "summary": "Poll-created containers and artifacts need labels, stable CEF fields/contains mappings, checked save results, and a defensible source_data_identifier strategy.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "unbounded_pagination",
+      "source_reviews": ["ciscosecureaccess-1", "cyberintpremiumioc-2"],
+      "category": "pagination",
+      "summary": "List/feed/dashboard pagination should have a maximum page/result guard and should not silently return only the first page.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "raw_search_query_interpolation",
+      "source_reviews": ["urlscan-52"],
+      "category": "validation",
+      "summary": "Search actions must not interpolate raw user input into vendor search syntax without strict validation or escaping.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "numeric_validation_regression",
+      "source_reviews": ["taniumrest-37", "github-39"],
+      "category": "validation",
+      "summary": "SDK migrations should preserve legacy positive-integer and non-negative validation instead of silently coercing floats, zero, or negative values with int().",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "branch_local_exception_import",
+      "source_reviews": ["taniumrest-37"],
+      "category": "general",
+      "summary": "Imports placed inside one branch can make a later exception reference a local variable and raise UnboundLocalError.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "custom_view_action_result_misuse",
+      "source_reviews": ["cyberintpremiumioc-2"],
+      "category": "validation",
+      "summary": "Custom action views should render completed action-result data, not create fresh ActionResult objects or re-call APIs from unchecked GET parameters.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "unknown_action_success_dispatch",
+      "source_reviews": ["cyberintpremiumioc-2"],
+      "category": "general",
+      "summary": "Unknown action identifiers should fail explicitly instead of returning APP_SUCCESS by default.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "malformed_jsonl_swallowed",
+      "source_reviews": ["cyberintpremiumioc-2"],
+      "category": "general",
+      "summary": "Malformed JSONL/feed rows should be surfaced as errors or counted clearly instead of silently dropped while the action succeeds.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "test_connectivity_quota_endpoint",
+      "source_reviews": ["cyberintpremiumioc-2"],
+      "category": "api_auth_correctness",
+      "summary": "test_connectivity should validate low-cost connectivity/auth paths and avoid consuming production enrichment quota for a fixed indicator unless justified.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "sdk_tests_not_actionable",
+      "source_reviews": ["microsoftonedrive-36", "github-39", "urlscan-52", "taniumrest-37"],
+      "category": "missing_tests",
+      "summary": "Large migrations and new make request actions need actionable offline tests; live-only tests, no collected tests, or import-broken tests are not enough.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "docs_pr_accuracy",
+      "source_reviews": ["ip2locationioapi-11", "taniumrest-34", "github-39", "urlscan-52"],
+      "category": "docs_pr_accuracy",
+      "summary": "PR bodies, release notes, README output tables, defaults, dependencies, and migration notes must match the code and generated manifest behavior.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "good_pr_no_major_findings",
+      "source_reviews": ["msadgraph-48", "socradarincidents-4"],
+      "category": "review_quality",
+      "summary": "The bot should be able to approve or stay quiet on historically good PRs instead of forcing low-confidence comments.",
+      "bot_coverage": ["prompt", "filtering"]
     }
   ],
   "cases": [
     {
-      "id": "sample-sdk-migration",
-      "repo": "example-org/cloudstorage",
-      "pr_number": 36,
-      "artifacts_dir": "runs/example-org-cloudstorage-36",
+      "id": "beyondtrust-1",
+      "repo": "splunk-soar-connectors/beyondtrust",
+      "pr_number": 1,
+      "artifacts_dir": "runs/nonsdk-eval-full-splunk-soar-connectors-beyondtrust-1",
+      "human_review_summary": "Historical auth review caught missing HTTP Basic auth for client_credentials token exchange, plus TLS default, unsafe response logging, output summary mismatch, and failing CI/no tests.",
       "expected": [
         {
-          "id": "token-auth-doc-drift",
-          "terms": ["token-only", "OAuth"]
+          "id": "oauth-basic-auth-required",
+          "terms": ["OAuth client credentials", "Basic auth"]
         },
         {
-          "id": "sparse-output-fields",
-          "terms": ["output models", "omit"]
+          "id": "tls-default-disabled",
+          "terms": ["TLS verification", "default", "disabled"]
         },
         {
-          "id": "sdk-migration-tests-missing",
-          "terms": ["SDK migration", "tests"]
+          "id": "response-body-logged",
+          "terms": ["response body", "logged"]
+        },
+        {
+          "id": "summary-fields-missing-json",
+          "terms": ["summary", "missing", "app JSON"]
+        },
+        {
+          "id": "risky-change-without-tests",
+          "terms": ["risky", "tests"]
         }
       ]
     },
     {
-      "id": "sample-legacy-connector",
-      "repo": "example-org/threatintel",
-      "pr_number": 2,
-      "artifacts_dir": "runs/example-org-threatintel-2",
+      "id": "googlethreatintelligence-7",
+      "repo": "splunk-soar-connectors/googlethreatintelligence",
+      "pr_number": 7,
+      "artifacts_dir": "runs/splunk-soar-connectors-googlethreatintelligence-7",
+      "human_review_summary": "Historical review caught auth-path mistakes around test_connectivity, missing timeout on OAuth token request, and checkpoint advancement after artifact ingestion failure.",
       "expected": [
         {
-          "id": "request-timeouts",
-          "terms": ["Direct requests call", "timeout"]
+          "id": "auth-path-doc-code-mismatch",
+          "terms": ["test_connectivity", "OAuth", "legacy"]
         },
         {
-          "id": "unsafe-debug-data",
-          "terms": ["Debug data", "headers"]
+          "id": "oauth-token-timeout",
+          "terms": ["OAuth", "token", "timeout"]
+        },
+        {
+          "id": "checkpoint-after-ingestion-failure",
+          "terms": ["checkpoint", "ingestion", "failed"]
+        }
+      ]
+    },
+    {
+      "id": "msgraphforoffice365-78",
+      "repo": "splunk-soar-connectors/msgraphforoffice365",
+      "pr_number": 78,
+      "artifacts_dir": "runs/splunk-soar-connectors-msgraphforoffice365-78",
+      "human_review_summary": "Historical polling review caught same-timestamp replay because only one last_email_id was saved, and Poll Now contaminated scheduled state.",
+      "expected": [
+        {
+          "id": "same-timestamp-boundary-cursor",
+          "terms": ["same-timestamp", "last_email_id", "reprocessed"]
+        },
+        {
+          "id": "poll-now-scheduled-state",
+          "terms": ["Poll Now", "scheduled", "state"]
+        }
+      ]
+    },
+    {
+      "id": "msadgraph-47",
+      "repo": "splunk-soar-connectors/msadgraph",
+      "pr_number": 47,
+      "artifacts_dir": "runs/splunk-soar-connectors-msadgraph-47",
+      "human_review_summary": "Historical output review caught add_data(response) while app JSON declared no corresponding action_result.data.* paths.",
+      "expected": [
+        {
+          "id": "add-data-without-output-paths",
+          "terms": ["add_data", "action_result.data", "output"]
+        }
+      ]
+    },
+    {
+      "id": "ip2locationioapi-11",
+      "repo": "splunk-soar-connectors/ip2locationioapi",
+      "pr_number": 11,
+      "artifacts_dir": "runs/splunk-soar-connectors-ip2locationioapi-11",
+      "human_review_summary": "Historical docs/schema review caught README/manual claiming new JSON outputs while app JSON was untouched.",
+      "expected": [
+        {
+          "id": "readme-output-json-drift",
+          "terms": ["README", "output", "json"]
+        }
+      ]
+    },
+    {
+      "id": "commvaultcloud-15",
+      "repo": "splunk-soar-connectors/commvaultcloud",
+      "pr_number": 15,
+      "artifacts_dir": "runs/splunk-soar-connectors-commvaultcloud-15",
+      "human_review_summary": "Historical security review caught cleartext logging of auth headers, token payloads, rotated token bundles, and token-creation responses.",
+      "expected": [
+        {
+          "id": "auth-token-logging",
+          "terms": ["token", "headers", "logged"]
+        }
+      ]
+    },
+    {
+      "id": "taniumrest-34",
+      "repo": "splunk-soar-connectors/taniumrest",
+      "pr_number": 34,
+      "artifacts_dir": "runs/splunk-soar-connectors-taniumrest-34",
+      "human_review_summary": "Historical docs review caught PR body claiming a default x-tanium-integration header value that code did not implement.",
+      "expected": [
+        {
+          "id": "pr-body-default-not-implemented",
+          "terms": ["default", "x-tanium-integration", "not implemented"]
+        }
+      ]
+    },
+    {
+      "id": "microsoftonedrive-36",
+      "repo": "splunk-soar-connectors/microsoftonedrive",
+      "pr_number": 36,
+      "artifacts_dir": "runs/splunk-soar-connectors-microsoftonedrive-36",
+      "human_review_summary": "Human SDK migration review focused on Microsoft Graph optional/sparse response modeling, upload completion model strictness, file memory buffering, upload-session retry/nextExpectedRanges, target_user_id URL normalization, and test quality. The saved PR #36 artifact has offline tests, so the stale live-only-test expectation is intentionally not active here.",
+      "expected": [
+        {
+          "id": "graph-sparse-output-models",
+          "terms": ["Graph", "output models", "omit"]
+        },
+        {
+          "id": "upload-parentreference-required",
+          "terms": ["UploadFileOutput", "parentReference"]
+        },
+        {
+          "id": "file-transfer-buffering",
+          "terms": ["OneDrive download", "entire file", "vault"]
+        },
+        {
+          "id": "upload-session-ranges-retry",
+          "terms": ["nextExpectedRanges", "retry"]
+        },
+        {
+          "id": "target-user-id-normalization",
+          "terms": ["target_user_id", "Graph URL", "normalization"]
+        }
+      ]
+    },
+    {
+      "id": "taniumrest-37",
+      "repo": "splunk-soar-connectors/taniumrest",
+      "pr_number": 37,
+      "artifacts_dir": "runs/splunk-soar-connectors-taniumrest-37",
+      "human_review_summary": "Human SDK migration review caught ActionFailure UnboundLocalError, numeric validation regressions, get question results nested row-cell output breakage, dropped summary fields, and missing tests.",
+      "expected": [
+        {
+          "id": "actionfailure-unboundlocalerror",
+          "terms": ["ActionFailure", "UnboundLocalError"]
+        },
+        {
+          "id": "run-query-numeric-validation",
+          "terms": ["numeric", "parameters", "validation"]
+        },
+        {
+          "id": "get-question-results-nested-output",
+          "terms": ["get_question_results", "nested", "datapath"]
+        },
+        {
+          "id": "legacy-summary-fields-dropped",
+          "terms": ["legacy", "summary", "fields"]
+        },
+        {
+          "id": "large-sdk-migration-no-tests",
+          "terms": ["Large SDK migration", "tests"]
+        }
+      ]
+    },
+    {
+      "id": "github-39",
+      "repo": "splunk-soar-connectors/github",
+      "pr_number": 39,
+      "artifact_source_note": "User compared bot run PR #39 with human review text labeled Remote PR #38; keep this case active against the saved run used for that comparison.",
+      "artifacts_dir": "runs/splunk-soar-connectors-github-39",
+      "human_review_summary": "Human SDK migration review caught OAuth fields/docs while code was PAT-only, issue_number positive-integer validation regression, make request dynamic output serialization bug, import-broken tests, and missing make_request coverage.",
+      "expected": [
+        {
+          "id": "oauth-fields-pat-only-code",
+          "terms": ["OAuth", "PAT-only"]
+        },
+        {
+          "id": "issue-number-positive-validation",
+          "terms": ["issue_number", "positive", "validation"]
+        },
+        {
+          "id": "make-request-dynamic-output-not-serialized",
+          "terms": ["make request", "serialized", "output"]
+        },
+        {
+          "id": "tests-import-top-level-app",
+          "terms": ["tests", "top-level", "relative imports"]
+        },
+        {
+          "id": "make-request-no-tests",
+          "terms": ["make request", "test coverage"]
+        }
+      ]
+    },
+    {
+      "id": "urlscan-52",
+      "repo": "splunk-soar-connectors/urlscan",
+      "pr_number": 52,
+      "artifact_source_note": "User compared bot run PR #52 with human review text labeled Remote PR #49; keep this case active against the saved run used for that comparison.",
+      "artifacts_dir": "runs/splunk-soar-connectors-urlscan-52",
+      "human_review_summary": "Human SDK migration review caught raw domain interpolation into urlscan search syntax, get report output schema contraction, missing _id/sort lookup outputs, no tests collected, rate-limit/backoff weakness, and polling-timeout behavior change documentation risk.",
+      "expected": [
+        {
+          "id": "lookup-domain-search-escaping",
+          "terms": ["Search action", "raw user input", "query"]
+        },
+        {
+          "id": "get-report-output-schema-contraction",
+          "terms": ["get report", "output", "schema"]
+        },
+        {
+          "id": "lookup-output-id-sort",
+          "terms": ["_id", "sort", "pagination"]
+        },
+        {
+          "id": "no-tests-collected",
+          "terms": ["no tests", "collected"]
+        },
+        {
+          "id": "rate-limit-backoff",
+          "terms": ["429", "backoff"]
+        },
+        {
+          "id": "polling-timeout-migration-note",
+          "terms": ["polling-timeout", "success", "failure"]
+        }
+      ]
+    },
+    {
+      "id": "cyberintpremiumioc-2",
+      "repo": "splunk-soar-connectors/cyberintpremiumioc",
+      "pr_number": 2,
+      "artifacts_dir": "runs/splunk-soar-connectors-cyberintpremiumioc-2",
+      "human_review_summary": "Human external non-SDK review caught TLS verification disabled/missing config, missing timeouts, sensitive debug data, output/contains drift, broken custom views, unknown-action success, malformed JSONL swallowing, weak polling/container/artifact behavior, unbounded feed pagination, and quota-consuming test_connectivity.",
+      "expected": [
+        {
+          "id": "tls-verify-config-missing",
+          "terms": ["verify_server_cert", "configuration"]
+        },
+        {
+          "id": "request-timeouts-missing",
+          "terms": ["requests", "timeout"]
+        },
+        {
+          "id": "debug-response-text-headers",
+          "terms": ["Debug data", "response", "headers"]
+        },
+        {
+          "id": "indicator-contains-missing",
+          "terms": ["Indicator", "parameters", "contains"]
+        },
+        {
+          "id": "enrich-add-data-output-mismatch",
+          "terms": ["add_data", "action_result.data", "output"]
+        },
+        {
+          "id": "custom-view-get-params",
+          "terms": ["Custom view", "GET parameters"]
+        },
+        {
+          "id": "unknown-action-success",
+          "terms": ["Unknown action", "APP_SUCCESS"]
+        },
+        {
+          "id": "jsonl-malformed-lines",
+          "terms": ["JSONL", "malformed"]
+        },
+        {
+          "id": "polling-state-not-checkpointed",
+          "terms": ["state", "checkpoint"]
+        },
+        {
+          "id": "on-poll-controls-ignored",
+          "terms": ["on_poll", "standard SOAR poll controls"]
+        },
+        {
+          "id": "container-label-missing",
+          "terms": ["containers", "label"]
+        },
+        {
+          "id": "save-artifact-return-ignored",
+          "terms": ["save_artifact", "return values"]
+        },
+        {
+          "id": "dynamic-cef-keys",
+          "terms": ["dynamic CEF keys"]
+        },
+        {
+          "id": "unbounded-feed-pagination",
+          "terms": ["pagination", "maximum page guard"]
+        },
+        {
+          "id": "test-connectivity-quota",
+          "terms": ["Test connectivity", "enrichment", "quota"]
+        }
+      ]
+    },
+    {
+      "id": "msadgraph-48-good",
+      "repo": "splunk-soar-connectors/msadgraph",
+      "pr_number": 48,
+      "artifacts_dir": "runs/splunk-soar-connectors-msadgraph-48",
+      "human_review_summary": "Historical good PR approved with no major findings; use as a quiet-review regression case when artifacts are available.",
+      "expected": [],
+      "forbidden": [
+        {
+          "id": "msadgraph-48-should-not-force-blocker",
+          "terms": ["BLOCKER"]
+        }
+      ]
+    },
+    {
+      "id": "socradarincidents-4-good",
+      "repo": "splunk-soar-connectors/socradarincidents",
+      "pr_number": 4,
+      "artifacts_dir": "runs/splunk-soar-connectors-socradarincidents-4",
+      "human_review_summary": "Historical good PR approved with no major findings; use as a quiet-review regression case when artifacts are available.",
+      "expected": [],
+      "forbidden": [
+        {
+          "id": "socradarincidents-4-should-not-force-blocker",
+          "terms": ["BLOCKER"]
         }
       ]
     }

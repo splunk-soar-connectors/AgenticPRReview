@@ -46,7 +46,7 @@ export CIRCUIT_APP_KEY="<app key>"
 export CIRCUIT_CLIENT_ID="<oauth client id>"
 export CIRCUIT_CLIENT_SECRET="<oauth client secret>"
 export CIRCUIT_TOKEN_URL="<oauth token endpoint>"
-export CIRCUIT_REQUEST_TIMEOUT_SECONDS="180"
+export CIRCUIT_REQUEST_TIMEOUT_SECONDS="600"
 export CIRCUIT_REQUEST_MAX_ATTEMPTS="2"
 export CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS="5"
 ```
@@ -54,7 +54,7 @@ export CIRCUIT_REQUEST_RETRY_BACKOFF_SECONDS="5"
 The provider exchanges `CIRCUIT_CLIENT_ID` and
 `CIRCUIT_CLIENT_SECRET` at `CIRCUIT_TOKEN_URL`, caches the returned token in
 memory, refreshes it before expiry, and retries once after a 401 or 403 model
-response. Model requests use a 180-second read timeout by default and retry
+response. Model requests use a 600-second read timeout by default and retry
 transient timeout/network failures with smaller chunk prompts and adaptive
 subchunks when needed. The generic `GATEWAY_*` names are also supported for
 local testing, but the reusable workflow keeps the existing `CIRCUIT_*`
@@ -185,6 +185,25 @@ PYTHONPATH=src .venv/bin/python -m agentic_pr_review.cli review example-org/exam
   --disable-historical-context
 ```
 
+## Golden Evaluation Set
+
+Human-reviewed PR expectations live in:
+
+```text
+examples/gold_reviews.connector_sdk.json
+```
+
+Run the evaluator against saved review artifacts:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/evaluate_gold_reviews.py examples/gold_reviews.connector_sdk.json
+```
+
+The evaluator re-runs deterministic checks against each case's
+`review_input.json` and compares combined deterministic/model findings against
+the human-review-derived expected patterns. Cases without saved artifacts under
+`runs/` are skipped until a run is copied there.
+
 ## SDK Manifest Validation
 
 Generated SDK manifest validation is available as an explicit trusted-local
@@ -214,7 +233,7 @@ jobs:
       circuit_base_url: ${{ vars.CIRCUIT_BASE_URL }}
       circuit_model: ${{ vars.CIRCUIT_MODEL }}
       circuit_token_url: ${{ vars.CIRCUIT_TOKEN_URL }}
-      circuit_request_timeout_seconds: "180"
+      circuit_request_timeout_seconds: "600"
       circuit_request_max_attempts: "2"
       circuit_request_retry_backoff_seconds: "5"
       deep_concurrency: "2"

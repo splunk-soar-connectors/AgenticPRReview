@@ -27,7 +27,7 @@ on:
         description: Per-request CIRCUIT model timeout in seconds.
         required: false
         type: string
-        default: "180"
+        default: "600"
       circuit_request_max_attempts:
         description: Maximum CIRCUIT model attempts for transient timeout/network failures.
         required: false
@@ -68,7 +68,7 @@ jobs:
   review:
     name: Review pull request
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     permissions:
       contents: read
       pull-requests: read
