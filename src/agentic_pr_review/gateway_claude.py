@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+import hashlib
 from io import BytesIO
 import json
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable
@@ -169,6 +171,7 @@ class GatewayClaudeReviewer:
         *,
         max_chunks: int = 0,
         deep_concurrency: int = 1,
+        checkpoint_path: str | Path | None = None,
     ) -> dict[str, Any]:
         chunks = list(((review_input.get("deep_review") or {}).get("chunks")) or [])
         if max_chunks > 0:
@@ -187,6 +190,21 @@ class GatewayClaudeReviewer:
         notes["deep_model_original_chunk_count"] = original_chunk_count
         notes["deep_model_review_chunk_count"] = len(chunks)
         notes["deep_model_skipped_chunk_count"] = len(skipped_model_chunks)
+        planning = (review_input.get("deep_review") or {}).get("packet_planning") or {}
+        excluded = (review_input.get("deep_review") or {}).get("model_excluded_paths") or []
+        if excluded:
+            self.progress(
+                f"AI packet planner excluded {len(excluded)} path(s) from model review: "
+                + ", ".join(str(item.get("path") or "") for item in excluded[:5])
+            )
+        if planning:
+            self.progress(
+                "AI packet planner dedup/merge summary: "
+                f"{planning.get('pre_dedupe_chunk_count', len(chunks))} initial, "
+                f"{planning.get('post_dedupe_chunk_count', len(chunks))} after dedupe, "
+                f"{planning.get('post_merge_chunk_count', len(chunks))} after merge; "
+                f"{planning.get('merged_packet_count', 0)} merged packet(s)."
+            )
         if skipped_model_chunks:
             self.progress(
                 f"Circuit packet planner skipped {len(skipped_model_chunks)} low-signal chunk(s); "
@@ -208,25 +226,67 @@ class GatewayClaudeReviewer:
             output["chunk_review_outputs"] = []
             return output
 
-        chunk_outputs: list[dict[str, Any]] = []
         total_chunks = len(chunks)
-        self.eta = AdaptiveETA(total_requests=total_chunks + 1)
+        checkpoint = build_deep_review_checkpoint(
+            checkpoint_path,
+            review_input=review_input,
+            chunks=chunks,
+            model=self.config.gateway_model,
+            progress=self.progress,
+        )
+        restored_outputs = checkpoint.load_outputs() if checkpoint is not None else {}
+        if restored_outputs:
+            restored_count = len(restored_outputs)
+            remaining_count = max(0, total_chunks - restored_count)
+            self.progress(
+                f"Restored deep review checkpoint with {restored_count}/{total_chunks} completed packet(s); "
+                f"{remaining_count} packet(s) remain."
+            )
+        remaining_chunks = [chunk for chunk in chunks if str(chunk.get("id") or "") not in restored_outputs]
+        self.eta = AdaptiveETA(total_requests=len(remaining_chunks) + 1)
         selected_concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
         self.progress(
-            f"Deep model review started: {total_chunks} chunk(s) plus synthesis; "
+            f"Deep model review started: {total_chunks} chunk(s) plus synthesis "
+            f"({len(restored_outputs)} restored, {len(remaining_chunks)} pending); "
             f"concurrency {selected_concurrency}; "
             f"estimated whole-review time remaining: {self._eta_text()}."
         )
-        chunk_outputs = self._review_deep_chunks(
-            review_input,
-            deterministic_findings,
-            chunks,
-            deep_concurrency=selected_concurrency,
-        )
+        output_by_chunk_id: dict[str, dict[str, Any]] = dict(restored_outputs)
+        checkpoint_lock = threading.Lock()
+
+        def save_checkpoint_for_output(output: dict[str, Any]) -> None:
+            chunk_id = str(output.get("chunk_id") or "")
+            if not chunk_id:
+                return
+            output_by_chunk_id[chunk_id] = output
+            if checkpoint is None:
+                return
+            with checkpoint_lock:
+                checkpoint.save(output_by_chunk_id, chunks, status="in_progress")
+
+        if remaining_chunks:
+            self._review_deep_chunks(
+                review_input,
+                deterministic_findings,
+                remaining_chunks,
+                deep_concurrency=selected_concurrency,
+                total_planned_chunks=total_chunks,
+                on_chunk_output=save_checkpoint_for_output,
+            )
+        elif checkpoint is not None:
+            checkpoint.save(output_by_chunk_id, chunks, status="chunks_complete")
+
+        chunk_outputs = [
+            output_by_chunk_id[str(chunk.get("id") or "")]
+            for chunk in chunks
+            if str(chunk.get("id") or "") in output_by_chunk_id
+        ]
+        if checkpoint is not None:
+            checkpoint.save(output_by_chunk_id, chunks, status="chunks_complete")
 
         synthesis_started = time.monotonic()
         self.progress(
-            f"Synthesis started for {total_chunks} reviewed chunk(s); "
+            f"Synthesis started for {len(chunk_outputs)} reviewed chunk(s); "
             f"estimated whole-review time remaining: {self._eta_text()}."
         )
         synthesis_prompt = build_synthesis_prompt(
@@ -261,14 +321,25 @@ class GatewayClaudeReviewer:
         chunks: list[dict[str, Any]],
         *,
         deep_concurrency: int,
+        total_planned_chunks: int | None = None,
+        on_chunk_output: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         total_chunks = len(chunks)
         concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
         if concurrency <= 1:
-            return [
-                self._review_single_deep_chunk(review_input, deterministic_findings, chunk, position, total_chunks)
-                for position, chunk in enumerate(chunks, start=1)
-            ]
+            outputs = []
+            for position, chunk in enumerate(chunks, start=1):
+                output = self._review_single_deep_chunk(
+                    review_input,
+                    deterministic_findings,
+                    chunk,
+                    position,
+                    total_planned_chunks or total_chunks,
+                )
+                outputs.append(output)
+                if on_chunk_output is not None:
+                    on_chunk_output(output)
+            return outputs
 
         # Warm the OAuth token once so concurrent chunk workers do not all start
         # by attempting the same token exchange.
@@ -282,14 +353,17 @@ class GatewayClaudeReviewer:
                     deterministic_findings,
                     chunk,
                     position,
-                    total_chunks,
+                    total_planned_chunks or total_chunks,
                 ): position
                 for position, chunk in enumerate(chunks, start=1)
             }
             try:
                 for future in as_completed(futures):
                     position = futures[future]
-                    ordered_outputs[position - 1] = future.result()
+                    output = future.result()
+                    ordered_outputs[position - 1] = output
+                    if on_chunk_output is not None:
+                        on_chunk_output(output)
             except Exception:
                 for future in futures:
                     future.cancel()
@@ -309,9 +383,12 @@ class GatewayClaudeReviewer:
         file_chunk = chunk.get("chunk_index")
         file_total = chunk.get("chunk_total")
         chunk_started = time.monotonic()
+        creation_reason = str(chunk.get("packet_creation_reason") or chunk.get("model_review_reason") or "changed code")
+        merged_count = int(chunk.get("merged_chunk_count") or 1)
         self.progress(
             f"Deep-review chunk {position}/{total_chunks} started: "
-            f"{path} (file chunk {file_chunk}/{file_total}); "
+            f"{path} (file chunk {file_chunk}/{file_total}; strategy {chunk.get('chunk_strategy') or 'unknown'}; "
+            f"merged logical chunks {merged_count}; reason: {creation_reason}); "
             f"estimated whole-review time remaining: {self._eta_text()}."
         )
         chunk_input = build_chunk_review_input(review_input, chunk)
@@ -322,12 +399,16 @@ class GatewayClaudeReviewer:
             max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS if chunk.get("adaptive_retry") else CHUNK_MODEL_INPUT_CHARS,
         )
         estimated_request_seconds = self._estimated_request_seconds_for_prompt(len(chunk_prompt))
+        can_split_for_adaptive_retry = can_adaptively_split_chunk(
+            chunk,
+            max_chars=PROACTIVE_SUBCHUNK_DIFF_CHARS,
+        )
         if should_proactively_subchunk(
             chunk,
             chunk_prompt,
             chunk_deterministic,
             estimated_request_seconds=estimated_request_seconds,
-        ):
+        ) and can_split_for_adaptive_retry:
             output = self._review_chunk_as_adaptive_subchunks(
                 review_input,
                 deterministic_findings,
@@ -339,6 +420,7 @@ class GatewayClaudeReviewer:
                 ),
                 proactive=True,
             )
+            output = dict(output)
             output["chunk_id"] = chunk.get("id")
             output["chunk_path"] = chunk.get("path")
             output["chunk_index"] = chunk.get("chunk_index")
@@ -351,16 +433,44 @@ class GatewayClaudeReviewer:
             )
             return output
         try:
-            output = self._invoke_review(chunk_prompt, chunk_deterministic, request_max_attempts=1)
-        except GatewayTransientModelError as exc:
-            output = self._review_chunk_as_adaptive_subchunks(
-                review_input,
-                deterministic_findings,
-                chunk,
-                parent_position=position,
-                parent_total=total_chunks,
-                original_error=exc,
+            output = self._invoke_review(
+                chunk_prompt,
+                chunk_deterministic,
+                request_max_attempts=1 if can_split_for_adaptive_retry else None,
             )
+        except GatewayTransientModelError as exc:
+            if can_adaptively_split_chunk(chunk, max_chars=18_000):
+                output = self._review_chunk_as_adaptive_subchunks(
+                    review_input,
+                    deterministic_findings,
+                    chunk,
+                    parent_position=position,
+                    parent_total=total_chunks,
+                    original_error=exc,
+                )
+            else:
+                self.progress(
+                    f"Deep-review chunk {position}/{total_chunks} for {path} could not be split into multiple "
+                    "meaningful adaptive subchunks; retaining deterministic findings for this packet."
+                )
+                output = fallback_chunk_transient_output(chunk, chunk_deterministic, exc)
+        except GatewayModelFormatError as exc:
+            if can_adaptively_split_chunk(chunk, max_chars=18_000):
+                output = self._review_chunk_as_adaptive_subchunks(
+                    review_input,
+                    deterministic_findings,
+                    chunk,
+                    parent_position=position,
+                    parent_total=total_chunks,
+                    original_error=GatewayTransientModelError(str(exc)),
+                )
+            else:
+                self.progress(
+                    f"Deep-review chunk {position}/{total_chunks} for {path} returned malformed JSON after "
+                    "recovery and could not be split; retaining deterministic findings for this packet."
+                )
+                output = fallback_chunk_format_output(chunk, chunk_deterministic, exc)
+        output = dict(output)
         output["chunk_id"] = chunk.get("id")
         output["chunk_path"] = chunk.get("path")
         output["chunk_index"] = chunk.get("chunk_index")
@@ -389,6 +499,8 @@ class GatewayClaudeReviewer:
             max_chars=PROACTIVE_SUBCHUNK_DIFF_CHARS if proactive else 18_000,
             context_char_limit=PROACTIVE_SUBCHUNK_CONTEXT_CHARS if proactive else 30_000,
         )
+        if len(subchunks) <= 1:
+            raise original_error
         if proactive:
             for subchunk in subchunks:
                 subchunk["proactive_review"] = True
@@ -399,8 +511,6 @@ class GatewayClaudeReviewer:
                         if reason
                         else "proactive smaller packet for timeout-risk review"
                     )
-        if not subchunks:
-            subchunks = [build_single_focused_retry_chunk(chunk, proactive=proactive)]
         path = str(chunk.get("path") or "unknown file")
         if proactive:
             self.progress(
@@ -433,6 +543,7 @@ class GatewayClaudeReviewer:
                     "gateway failure; retaining deterministic findings for this slice."
                 )
                 sub_output = fallback_chunk_transient_output(subchunk, sub_deterministic, exc)
+            sub_output = dict(sub_output)
             sub_output["chunk_id"] = subchunk.get("id")
             sub_output["parent_chunk_id"] = subchunk.get("parent_chunk_id")
             sub_output["chunk_path"] = subchunk.get("path")
@@ -763,6 +874,115 @@ class GatewayClaudeReviewer:
         return avg_seconds * scale
 
 
+class DeepReviewCheckpoint:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        checkpoint_id: str,
+        progress: Callable[[str], None],
+    ) -> None:
+        self.path = path
+        self.checkpoint_id = checkpoint_id
+        self.progress = progress
+
+    def load_outputs(self) -> dict[str, dict[str, Any]]:
+        if not self.path.exists():
+            self.progress(f"No deep review checkpoint found at {self.path}; starting fresh.")
+            return {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self.progress(f"Could not read deep review checkpoint at {self.path}: {redact_text(str(exc))}. Starting fresh.")
+            return {}
+        if payload.get("checkpoint_id") != self.checkpoint_id:
+            self.progress("Deep review checkpoint exists but does not match this PR/head/model; ignoring stale checkpoint.")
+            return {}
+        outputs: dict[str, dict[str, Any]] = {}
+        for item in payload.get("chunk_outputs") or []:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = str(item.get("chunk_id") or "")
+            if chunk_id:
+                outputs[chunk_id] = item
+        self.progress(f"Deep review checkpoint restored from {self.path} with {len(outputs)} completed packet(s).")
+        return outputs
+
+    def save(
+        self,
+        output_by_chunk_id: dict[str, dict[str, Any]],
+        chunks: list[dict[str, Any]],
+        *,
+        status: str,
+    ) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        payload = {
+            "schema_version": "0.1",
+            "checkpoint_id": self.checkpoint_id,
+            "status": status,
+            "updated_at_epoch": now,
+            "total_chunk_count": len(chunks),
+            "completed_chunk_count": len(output_by_chunk_id),
+            "planned_chunk_ids": [chunk.get("id") for chunk in chunks],
+            "completed_chunk_ids": list(output_by_chunk_id.keys()),
+            "chunk_outputs": [
+                output_by_chunk_id[str(chunk.get("id") or "")]
+                for chunk in chunks
+                if str(chunk.get("id") or "") in output_by_chunk_id
+            ],
+        }
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp_path.write_text(json.dumps(redact_obj(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temp_path.replace(self.path)
+        self.progress(
+            f"Deep review checkpoint saved at {self.path}: "
+            f"{len(output_by_chunk_id)}/{len(chunks)} packet(s) complete."
+        )
+
+
+def build_deep_review_checkpoint(
+    checkpoint_path: str | Path | None,
+    *,
+    review_input: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    model: str,
+    progress: Callable[[str], None],
+) -> DeepReviewCheckpoint | None:
+    if checkpoint_path is None:
+        return None
+    return DeepReviewCheckpoint(
+        Path(checkpoint_path),
+        checkpoint_id=deep_review_checkpoint_id(review_input, chunks, model=model),
+        progress=progress,
+    )
+
+
+def deep_review_checkpoint_id(review_input: dict[str, Any], chunks: list[dict[str, Any]], *, model: str) -> str:
+    pr = review_input.get("pr") or review_input.get("pull_request") or {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    identity = {
+        "schema_version": "0.1",
+        "repo": review_input.get("repo") or (review_input.get("repository") or {}).get("full_name"),
+        "pr_number": pr.get("number"),
+        "base_sha": base.get("sha"),
+        "head_sha": head.get("sha"),
+        "model": model,
+        "chunks": [
+            {
+                "id": chunk.get("id"),
+                "path": chunk.get("path"),
+                "strategy": chunk.get("chunk_strategy"),
+                "diff_sha256": hashlib.sha256(str(chunk.get("diff") or "").encode("utf-8")).hexdigest(),
+            }
+            for chunk in chunks
+        ],
+    }
+    blob = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def should_include_model_in_body(endpoint: str) -> bool:
     return "/deployments/" not in endpoint
 
@@ -790,6 +1010,10 @@ def should_proactively_subchunk(
         return True
     changes = int(chunk.get("changes") or 0)
     return suffix == "py" and changes >= 250
+
+
+def can_adaptively_split_chunk(chunk: dict[str, Any], *, max_chars: int) -> bool:
+    return len(split_chunk_for_adaptive_retry(chunk, max_chars=max_chars, context_char_limit=1_000)) > 1
 
 
 def build_single_focused_retry_chunk(chunk: dict[str, Any], *, proactive: bool = False) -> dict[str, Any]:
@@ -1037,6 +1261,27 @@ def fallback_chunk_transient_output(
             "model_notes": (
                 f"Model review for `{path}` fell back to deterministic findings after a repeated transient "
                 f"gateway failure: {redact_text(str(error))}"
+            ),
+        },
+        deterministic_findings=deterministic_findings,
+    )
+
+
+def fallback_chunk_format_output(
+    chunk: dict[str, Any],
+    deterministic_findings: list[dict[str, Any]],
+    error: GatewayModelFormatError,
+) -> dict[str, Any]:
+    path = str(chunk.get("path") or "chunk")
+    return normalize_review_output(
+        {
+            "summary": f"Model review for {path} returned malformed JSON after recovery attempts.",
+            "overall_status": "needs_review" if deterministic_findings else "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": (
+                f"Model review for `{path}` fell back to deterministic findings after malformed model output: "
+                f"{redact_text(str(error))}"
             ),
         },
         deterministic_findings=deterministic_findings,

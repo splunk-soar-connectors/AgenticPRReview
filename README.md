@@ -111,6 +111,7 @@ review_output.json
 comment.md
 planned_comments.json
 planned_comments.md
+deep_review_checkpoint.json
 ```
 
 `runs/` is ignored because raw review artifacts can contain PR comments, CI log
@@ -125,14 +126,24 @@ than blindly reviewing whole files. Python changes are grouped around enclosing
 functions/classes, nearby hunk context, referenced helpers/constants/imports,
 and callers where available. JSON, YAML, TOML, and XML changes are grouped
 around the changed object, section, or element when the structure can be
-inferred. Low-signal chunks such as license/notice/readme and metadata-only
-changes are skipped for model review after deterministic checks run.
+inferred. Adjacent same-file logical units are merged when that removes
+duplicate context without exceeding the packet target. The bot invocation
+workflow `.github/workflows/agentic-pr-review.yml` is excluded from model
+review; deterministic checks can still inspect it. Low-signal chunks such as
+license/notice/readme and metadata-only changes are skipped for model review
+after deterministic checks run.
 
 Independent chunks can run concurrently to reduce wall-clock time. The default
 concurrency is automatic: small reviews can use more parallelism, while large or
 high-risk packets are reviewed with less concurrency to reduce CIRCUIT gateway
 pressure. Passing `--deep-concurrency N` sets a maximum cap, not a guaranteed
 floor.
+
+Deep model progress is checkpointed to `deep_review_checkpoint.json` after each
+completed packet. If the same run directory is reused for the same PR head,
+model, and packet plan, the bot restores completed packet outputs and resumes
+from the remaining packets before synthesis. Stale checkpoints are ignored when
+the PR head/base or packet hashes change.
 
 Useful controls:
 
@@ -265,7 +276,7 @@ out or executes the contributor branch. The caller passes explicit secrets
 rather than `secrets: inherit`; the reusable workflow validates that the caller
 and target repository belong to `splunk-soar-connectors`, grants `GITHUB_TOKEN`
 permissions at the job level, pins third-party actions by commit SHA, uses a
-30-minute timeout, and masks the just-in-time gateway token in GitHub Actions
+360-minute timeout, and masks the just-in-time gateway token in GitHub Actions
 logs. Keep SDK manifest generation and any PR-code execution disabled in public
 PR workflows.
 

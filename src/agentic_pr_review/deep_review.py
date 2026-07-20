@@ -33,8 +33,13 @@ PYTHON_SEMANTIC_MAX_SYMBOLS = 16
 PYTHON_SEMANTIC_MAX_SNIPPETS = 12
 PYTHON_FUNCTION_CHUNK_TARGET_CHARS = 12_000
 STRUCTURED_UNIT_CHUNK_TARGET_CHARS = 12_000
+MERGED_LOGICAL_PACKET_TARGET_CHARS = 22_000
 PYTHON_RELATED_CONTEXT_FILE_LIMIT = 20
 CONTEXT_AWARE_REVIEW_STRATEGY = "changed_hunks_enclosing_scope_semantic_context"
+
+AI_REVIEW_EXCLUDED_PATHS = {
+    ".github/workflows/agentic-pr-review.yml",
+}
 
 IGNORED_EXTERNAL_PYTHON_MODULES = {
     "abc",
@@ -169,6 +174,7 @@ class DeepPRCollector(PRCollector):
         base_files: dict[str, str] = {}
         skipped_binary: list[str] = []
         skipped_large_or_unavailable: list[str] = []
+        model_excluded_paths: list[dict[str, str]] = []
 
         for file_info in files:
             path = str(file_info.get("filename") or "")
@@ -199,15 +205,22 @@ class DeepPRCollector(PRCollector):
             if not diff.strip():
                 continue
             full_diffs[path] = diff
-            chunks.extend(
-                chunk_unified_diff(
-                    file_info,
-                    diff,
-                    max_chars=self.deep_chunk_chars,
-                    head_text=head_text or "",
-                    base_text=base_text or "",
-                )
+            file_chunks = chunk_unified_diff(
+                file_info,
+                diff,
+                max_chars=self.deep_chunk_chars,
+                head_text=head_text or "",
+                base_text=base_text or "",
             )
+            if is_ai_review_excluded_path(path):
+                model_excluded_paths.append(
+                    {
+                        "path": path,
+                        "reason": "bot invocation workflow is excluded from AI review packets",
+                    }
+                )
+                continue
+            chunks.extend(file_chunks)
 
         related_paths = sorted(collect_related_python_context_paths(head_files) - set(head_files))
         related_fetched: list[str] = []
@@ -218,6 +231,9 @@ class DeepPRCollector(PRCollector):
             head_files[related_path] = truncate_text(related_text, self.deep_max_file_chars)
             related_fetched.append(related_path)
 
+        original_chunk_count = len(chunks)
+        chunks, planning_stats = dedupe_and_merge_review_chunks(chunks, max_chars=self.deep_chunk_chars)
+
         self._merge_deep_files(review_input, head_files, base_files, chunks, full_diffs)
         review_input["deep_review"] = {
             "enabled": True,
@@ -225,9 +241,12 @@ class DeepPRCollector(PRCollector):
             "chunk_chars": self.deep_chunk_chars,
             "changed_file_count": len(files),
             "chunk_count": len(chunks),
+            "pre_dedupe_chunk_count": original_chunk_count,
             "chunks": chunks,
             "skipped_binary_paths": skipped_binary[:100],
             "skipped_large_or_unavailable_paths": skipped_large_or_unavailable[:100],
+            "model_excluded_paths": model_excluded_paths[:100],
+            "packet_planning": planning_stats,
             "errors": errors[:100],
             "related_context_paths": related_fetched[:100],
         }
@@ -236,10 +255,14 @@ class DeepPRCollector(PRCollector):
                 "deep_collection_enabled": True,
                 "deep_changed_file_count": len(files),
                 "deep_chunk_count": len(chunks),
+                "deep_pre_dedupe_chunk_count": original_chunk_count,
                 "deep_head_file_count": len(head_files),
                 "deep_base_file_count": len(base_files),
                 "deep_skipped_binary_count": len(skipped_binary),
                 "deep_skipped_large_or_unavailable_count": len(skipped_large_or_unavailable),
+                "deep_model_excluded_path_count": len(model_excluded_paths),
+                "deep_model_excluded_paths": model_excluded_paths[:20],
+                "deep_packet_planning": planning_stats,
                 "deep_error_count": len(errors),
                 "deep_errors": errors[:20],
                 "deep_related_context_file_count": len(related_fetched),
@@ -314,6 +337,262 @@ def generate_unified_diff(base_text: str, head_text: str, *, base_path: str, hea
             n=6,
         )
     )
+
+
+def is_ai_review_excluded_path(path: str) -> bool:
+    return path in AI_REVIEW_EXCLUDED_PATHS
+
+
+def dedupe_and_merge_review_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Remove duplicate packet work and merge adjacent small logical units.
+
+    The merge target is intentionally below the model prompt budget. It removes
+    redundant same-file setup/context without turning the review back into a
+    whole-file prompt.
+    """
+
+    duplicate_count = 0
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for chunk in chunks:
+        fingerprint = chunk_fingerprint(chunk)
+        if fingerprint in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fingerprint)
+        deduped.append(annotate_chunk_context_ranges(dict(chunk)))
+
+    target_chars = max(4_000, min(max_chars, MERGED_LOGICAL_PACKET_TARGET_CHARS))
+    merged: list[dict[str, Any]] = []
+    merge_events: list[dict[str, Any]] = []
+    current_batch: list[dict[str, Any]] = []
+
+    def flush_batch() -> None:
+        nonlocal current_batch
+        if not current_batch:
+            return
+        if len(current_batch) == 1:
+            merged.append(ensure_packet_creation_reason(current_batch[0]))
+            current_batch = []
+            return
+        packet = merge_chunk_batch(current_batch)
+        merge_events.append(
+            {
+                "path": packet.get("path"),
+                "merged_chunk_count": len(current_batch),
+                "merged_chunk_ids": [item.get("id") for item in current_batch],
+                "reason": packet.get("packet_creation_reason"),
+            }
+        )
+        merged.append(packet)
+        current_batch = []
+
+    for chunk in deduped:
+        if not is_mergeable_logical_chunk(chunk):
+            flush_batch()
+            merged.append(ensure_packet_creation_reason(chunk))
+            continue
+        if not current_batch:
+            current_batch = [chunk]
+            continue
+        candidate_chars = merged_diff_chars(current_batch) + len(str(chunk.get("diff") or ""))
+        if (
+            chunk.get("path") == current_batch[-1].get("path")
+            and chunk.get("status") == current_batch[-1].get("status")
+            and candidate_chars <= target_chars
+        ):
+            current_batch.append(chunk)
+            continue
+        flush_batch()
+        current_batch = [chunk]
+    flush_batch()
+
+    reindex_chunks_by_path(merged)
+    return merged, {
+        "pre_dedupe_chunk_count": len(chunks),
+        "post_dedupe_chunk_count": len(deduped),
+        "post_merge_chunk_count": len(merged),
+        "duplicate_chunk_count": duplicate_count,
+        "merged_packet_count": len(merge_events),
+        "merge_events": merge_events[:100],
+        "merge_target_chars": target_chars,
+    }
+
+
+def chunk_fingerprint(chunk: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(chunk.get("path") or ""),
+            str(chunk.get("previous_path") or ""),
+            str(chunk.get("status") or ""),
+            str(chunk.get("chunk_strategy") or ""),
+            str(chunk.get("python_scope") or ""),
+            str(chunk.get("logical_unit") or ""),
+            str(chunk.get("diff") or ""),
+        ]
+    )
+
+
+def is_mergeable_logical_chunk(chunk: dict[str, Any]) -> bool:
+    if chunk.get("adaptive_retry"):
+        return False
+    if int(chunk.get("diff_chars") or 0) >= MERGED_LOGICAL_PACKET_TARGET_CHARS:
+        return False
+    strategy = str(chunk.get("chunk_strategy") or "")
+    return strategy in {
+        "changed_hunks",
+        "python_function",
+        "json_object",
+        "json_array",
+        "yaml_section",
+        "toml_section",
+        "xml_element",
+    }
+
+
+def merged_diff_chars(chunks: list[dict[str, Any]]) -> int:
+    return sum(len(str(chunk.get("diff") or "")) for chunk in chunks) + max(0, len(chunks) - 1) * 6
+
+
+def annotate_chunk_context_ranges(chunk: dict[str, Any]) -> dict[str, Any]:
+    head_ranges, base_ranges = chunk_context_ranges(chunk)
+    if head_ranges:
+        chunk["context_ranges_head"] = head_ranges
+    if base_ranges:
+        chunk["context_ranges_base"] = base_ranges
+    chunk.setdefault("packet_creation_reason", describe_chunk_creation(chunk))
+    return chunk
+
+
+def chunk_context_ranges(chunk: dict[str, Any]) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    diff = str(chunk.get("diff") or "")
+    hunk_summaries = summarize_diff_hunks(diff)
+    head_ranges = [
+        (int(item["new_start"]), int(item["new_count"]))
+        for item in hunk_summaries
+        if int(item.get("new_count") or 0) > 0
+    ]
+    base_ranges = [
+        (int(item["old_start"]), int(item["old_count"]))
+        for item in hunk_summaries
+        if int(item.get("old_count") or 0) > 0
+    ]
+
+    scope_start = int(chunk.get("python_scope_start_line") or 0)
+    scope_end = int(chunk.get("python_scope_end_line") or 0)
+    if scope_start > 0 and scope_end >= scope_start:
+        target = base_ranges if chunk.get("status") == "removed" else head_ranges
+        target.insert(0, (scope_start, scope_end - scope_start + 1))
+
+    logical_start = int(chunk.get("logical_unit_start_line") or 0)
+    logical_end = int(chunk.get("logical_unit_end_line") or 0)
+    if logical_start > 0 and logical_end >= logical_start:
+        target = base_ranges if chunk.get("status") == "removed" else head_ranges
+        target.insert(0, (logical_start, logical_end - logical_start + 1))
+
+    return dedupe_ranges(head_ranges), dedupe_ranges(base_ranges)
+
+
+def dedupe_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    output: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for start, count in ranges:
+        key = (max(1, int(start)), max(1, int(count)))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(key)
+    return output
+
+
+def ensure_packet_creation_reason(chunk: dict[str, Any]) -> dict[str, Any]:
+    chunk.setdefault("packet_creation_reason", describe_chunk_creation(chunk))
+    return chunk
+
+
+def describe_chunk_creation(chunk: dict[str, Any]) -> str:
+    if chunk.get("python_scope"):
+        return (
+            f"changed Python {chunk.get('python_scope_kind') or 'scope'} "
+            f"`{chunk.get('python_scope')}` with enclosing scope and semantic context"
+        )
+    if chunk.get("logical_unit"):
+        return (
+            f"changed {chunk.get('logical_unit_kind') or 'logical unit'} "
+            f"`{chunk.get('logical_unit')}` with surrounding structured context"
+        )
+    return "changed hunks with surrounding context"
+
+
+def merge_chunk_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    first = dict(batch[0])
+    combined_diff = "\n\n".join(str(chunk.get("diff") or "").strip() for chunk in batch if str(chunk.get("diff") or "").strip())
+    included_scopes = []
+    for chunk in batch:
+        scope_name = chunk.get("python_scope") or chunk.get("logical_unit")
+        if not scope_name:
+            continue
+        included_scopes.append(
+            {
+                "name": scope_name,
+                "kind": chunk.get("python_scope_kind") or chunk.get("logical_unit_kind"),
+                "start_line": chunk.get("python_scope_start_line") or chunk.get("logical_unit_start_line"),
+                "end_line": chunk.get("python_scope_end_line") or chunk.get("logical_unit_end_line"),
+                "source_chunk_id": chunk.get("id"),
+            }
+        )
+
+    head_ranges: list[tuple[int, int]] = []
+    base_ranges: list[tuple[int, int]] = []
+    for chunk in batch:
+        head_ranges.extend(tuple(item) for item in (chunk.get("context_ranges_head") or []))
+        base_ranges.extend(tuple(item) for item in (chunk.get("context_ranges_base") or []))
+
+    strategy = str(first.get("chunk_strategy") or "changed_hunks")
+    first.update(
+        {
+            "id": "",
+            "diff": combined_diff,
+            "diff_chars": len(combined_diff),
+            "changed_hunk_count": sum(int(chunk.get("changed_hunk_count") or 1) for chunk in batch),
+            "chunk_strategy": f"{strategy}_group" if not strategy.endswith("_group") else strategy,
+            "merged_chunk_count": len(batch),
+            "merged_chunk_ids": [chunk.get("id") for chunk in batch],
+            "included_scopes": included_scopes[:50],
+            "context_ranges_head": dedupe_ranges(head_ranges),
+            "context_ranges_base": dedupe_ranges(base_ranges),
+            "packet_creation_reason": (
+                f"merged {len(batch)} adjacent logical chunks in `{first.get('path')}` "
+                "to avoid duplicate model review context while preserving all changed hunks"
+            ),
+        }
+    )
+    if included_scopes:
+        first["python_scope"] = None
+        first["python_scope_kind"] = None
+        first["python_scope_start_line"] = None
+        first["python_scope_end_line"] = None
+        first["logical_unit"] = None
+        first["logical_unit_kind"] = None
+        first["logical_unit_start_line"] = None
+        first["logical_unit_end_line"] = None
+    return first
+
+
+def reindex_chunks_by_path(chunks: list[dict[str, Any]]) -> None:
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for chunk in chunks:
+        by_path.setdefault(str(chunk.get("path") or ""), []).append(chunk)
+    for path, path_chunks in by_path.items():
+        total = len(path_chunks)
+        for index, chunk in enumerate(path_chunks, start=1):
+            chunk["id"] = f"{path}:{index}"
+            chunk["chunk_index"] = index
+            chunk["chunk_total"] = total
 
 
 def chunk_unified_diff(
@@ -882,9 +1161,11 @@ def yaml_scopes_from_source(source: str) -> list[dict[str, Any]]:
             "start_line": line_no,
             "end_line": len(lines),
         }
-        candidates.append(item)
         value_after_colon = line[match.end():].strip()
         is_container = not value_after_colon or value_after_colon.startswith(("#", "|", ">"))
+        is_low_value_nested_container = key in {"steps", "env", "with"}
+        if is_container and not is_low_value_nested_container:
+            candidates.append(item)
         if is_container:
             stack.append(item)
 
@@ -1233,6 +1514,12 @@ def classify_chunk_for_circuit(
     diff = str(chunk.get("diff") or "")
     diff_lower = diff.lower()
 
+    if is_ai_review_excluded_path(path):
+        return {
+            "action": "skip",
+            "priority": "low",
+            "reason": "bot invocation workflow is excluded from AI review packets",
+        }
     if name in LOW_SIGNAL_MODEL_FILENAMES:
         return {"action": "skip", "priority": "low", "reason": f"{name} is low-signal for model review"}
     if any(str(finding.get("file") or "") == path for finding in deterministic_findings if isinstance(finding, dict)):
@@ -1304,9 +1591,13 @@ def build_circuit_review_packet(
         for item in hunk_summaries
         if int(item.get("old_count") or 0) > 0
     ]
+    if chunk.get("context_ranges_head"):
+        head_ranges = [tuple(item) for item in chunk.get("context_ranges_head") or []]
+    if chunk.get("context_ranges_base"):
+        base_ranges = [tuple(item) for item in chunk.get("context_ranges_base") or []]
     scope_start = int(chunk.get("python_scope_start_line") or 0)
     scope_end = int(chunk.get("python_scope_end_line") or 0)
-    if path.endswith(".py") and scope_start > 0 and scope_end >= scope_start:
+    if path.endswith(".py") and scope_start > 0 and scope_end >= scope_start and not chunk.get("context_ranges_head"):
         scope_range = (scope_start, scope_end - scope_start + 1)
         if chunk.get("status") == "removed":
             if scope_range not in base_ranges:
@@ -1315,7 +1606,7 @@ def build_circuit_review_packet(
             head_ranges.insert(0, scope_range)
     logical_start = int(chunk.get("logical_unit_start_line") or 0)
     logical_end = int(chunk.get("logical_unit_end_line") or 0)
-    if logical_start > 0 and logical_end >= logical_start:
+    if logical_start > 0 and logical_end >= logical_start and not chunk.get("context_ranges_head"):
         logical_range = (logical_start, logical_end - logical_start + 1)
         if chunk.get("status") == "removed":
             if logical_range not in base_ranges:
@@ -1380,12 +1671,18 @@ def build_circuit_review_packet(
             "logical_unit_kind": chunk.get("logical_unit_kind"),
             "logical_unit_start_line": chunk.get("logical_unit_start_line"),
             "logical_unit_end_line": chunk.get("logical_unit_end_line"),
+            "included_scopes": chunk.get("included_scopes") or [],
+            "merged_chunk_count": chunk.get("merged_chunk_count"),
+            "merged_chunk_ids": chunk.get("merged_chunk_ids") or [],
         },
         "planner": {
             "priority": chunk.get("model_review_priority"),
             "reason": chunk.get("model_review_reason"),
+            "creation_reason": chunk.get("packet_creation_reason"),
             "diff_chars_before_packet": len(diff),
             "diff_truncated_for_packet": len(diff) > CIRCUIT_PACKET_DIFF_CHARS,
+            "context_ranges_head": head_ranges[:20],
+            "context_ranges_base": base_ranges[:20],
         },
         "diff": truncate_text(diff, CIRCUIT_PACKET_DIFF_CHARS),
         "changed_hunks": hunk_summaries[:24],

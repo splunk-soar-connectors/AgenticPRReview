@@ -6,6 +6,7 @@ from agentic_pr_review.deep_review import (
     build_chunk_review_input,
     chunk_unified_diff,
     collect_related_python_context_paths,
+    dedupe_and_merge_review_chunks,
     generate_unified_diff,
     infer_local_python_import_paths,
     plan_circuit_review_chunks,
@@ -331,7 +332,58 @@ class DeepReviewHelpersTest(unittest.TestCase):
 
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0]["chunk_strategy"], "yaml_section")
-        self.assertIn("jobs.test.steps.run", chunks[0]["logical_unit"])
+        self.assertIn("jobs.test", chunks[0]["logical_unit"])
+
+    def test_logical_packet_planner_merges_adjacent_python_scopes(self):
+        chunks = [
+            {
+                "id": "connector.py:1",
+                "path": "connector.py",
+                "status": "modified",
+                "chunk_strategy": "python_function",
+                "python_scope": "alpha",
+                "python_scope_kind": "function",
+                "python_scope_start_line": 10,
+                "python_scope_end_line": 20,
+                "diff": "@@ -10 +10 @@\n-return 1\n+return 2",
+                "diff_chars": 36,
+            },
+            {
+                "id": "connector.py:2",
+                "path": "connector.py",
+                "status": "modified",
+                "chunk_strategy": "python_function",
+                "python_scope": "beta",
+                "python_scope_kind": "function",
+                "python_scope_start_line": 30,
+                "python_scope_end_line": 40,
+                "diff": "@@ -30 +30 @@\n-return 3\n+return 4",
+                "diff_chars": 36,
+            },
+        ]
+
+        merged, stats = dedupe_and_merge_review_chunks(chunks, max_chars=60_000)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["chunk_strategy"], "python_function_group")
+        self.assertEqual(merged[0]["merged_chunk_count"], 2)
+        self.assertEqual([scope["name"] for scope in merged[0]["included_scopes"]], ["alpha", "beta"])
+        self.assertEqual(stats["merged_packet_count"], 1)
+
+    def test_packet_planner_excludes_bot_invocation_workflow_from_ai_review(self):
+        planned, skipped = plan_circuit_review_chunks(
+            [
+                {
+                    "id": ".github/workflows/agentic-pr-review.yml:1",
+                    "path": ".github/workflows/agentic-pr-review.yml",
+                    "diff": "+name: bot\n",
+                }
+            ],
+            [],
+        )
+
+        self.assertEqual(planned, [])
+        self.assertEqual(skipped[0]["reason"], "bot invocation workflow is excluded from AI review packets")
 
     def test_build_chunk_review_input_includes_primary_and_app_context(self):
         review_input = {

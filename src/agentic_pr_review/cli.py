@@ -225,6 +225,7 @@ def run_review(args: argparse.Namespace) -> int:
                     deterministic_findings,
                     max_chunks=args.deep_max_chunks,
                     deep_concurrency=args.deep_concurrency,
+                    checkpoint_path=run_dir / "deep_review_checkpoint.json",
                 )
             progress(f"Model review completed in {format_duration(time.monotonic() - stage_started)}.")
 
