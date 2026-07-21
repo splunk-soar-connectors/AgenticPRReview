@@ -6,6 +6,7 @@ from unittest.mock import patch
 from agentic_pr_review.github_comments import (
     build_comment_plan as real_build_comment_plan,
     collect_existing_markers,
+    filter_review_output_for_pr_context,
     parse_right_side_diff_lines,
     publish_comment_plan,
 )
@@ -246,6 +247,90 @@ class GitHubCommentsTest(unittest.TestCase):
 
         plan = build_comment_plan(review_output, review_input)
 
+        self.assertEqual(len(plan["comments"]), 1)
+
+    def test_unconnected_identifier_inference_is_filtered_before_publication(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,1 +20,2 @@\n"
+                        "+if not asset_id.isdigit():\n"
+                        "+    return phantom.APP_ERROR\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "needs_review",
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "asset_id validation rejects UUID assets",
+                    "category": "validation",
+                    "severity": "high",
+                    "confidence": "high",
+                    "source": "claude",
+                    "file": "connector.py",
+                    "line": 20,
+                    "evidence": "microsoftteams.json contains an appid UUID, so asset_id can be a UUID and this digit check is wrong.",
+                    "why_it_matters": "Valid assets would fail validation.",
+                    "suggested_fix": "Allow UUID values for asset_id.",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual(filtered["overall_status"], "looks_good")
+        self.assertEqual(filtered["behavioral_verification"]["suppressed_findings"][0]["reason"], "unconnected_identifier_inference")
+        self.assertEqual(plan["comments"], [])
+
+    def test_connected_identifier_evidence_is_not_filtered(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,1 +20,2 @@\n"
+                        "+asset_id = request.args.get('asset_id')\n"
+                        "+return int(asset_id)\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "needs_review",
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "asset_id request parameter is cast to int without validation",
+                    "category": "validation",
+                    "severity": "high",
+                    "confidence": "high",
+                    "source": "claude",
+                    "file": "connector.py",
+                    "line": 21,
+                    "evidence": "`asset_id` is assigned from the request parameter and then passed into `int(asset_id)` with no blank/non-numeric error handling.",
+                    "why_it_matters": "A malformed request can raise a raw ValueError instead of a controlled SOAR error.",
+                    "suggested_fix": "Validate the request parameter and return a controlled error before casting.",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(len(filtered["findings"]), 1)
         self.assertEqual(len(plan["comments"]), 1)
 
     def test_low_signal_docstring_line_reanchors_to_named_changed_code(self):

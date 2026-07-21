@@ -32,12 +32,12 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(normalize_deep_concurrency(0, len(small_chunks), small_chunks), 2)
         self.assertEqual(normalize_deep_concurrency(0, len(medium_chunks), medium_chunks), 2)
-        self.assertEqual(normalize_deep_concurrency(0, len(large_chunks), large_chunks), 1)
+        self.assertEqual(normalize_deep_concurrency(0, len(large_chunks), large_chunks), 2)
 
     def test_explicit_deep_concurrency_is_a_cap_not_a_floor(self):
         chunks = [{"diff_chars": 17_000}, {"diff_chars": 500}, {"diff_chars": 500}]
 
-        self.assertEqual(normalize_deep_concurrency(3, len(chunks), chunks), 1)
+        self.assertEqual(normalize_deep_concurrency(3, len(chunks), chunks), 3)
         self.assertEqual(normalize_deep_concurrency(1, len(chunks), chunks), 1)
 
     def test_runtime_config_selects_gateway_provider(self):

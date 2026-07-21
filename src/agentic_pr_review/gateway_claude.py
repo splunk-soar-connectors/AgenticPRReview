@@ -10,6 +10,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import random
 import threading
 import time
 from typing import Any, Callable
@@ -24,6 +25,7 @@ from .deep_review import (
     dedupe_findings,
     filter_findings_for_chunk,
     plan_circuit_review_chunks,
+    REVIEW_POLICY_VERSION,
     split_chunk_for_adaptive_retry,
 )
 from .json_utils import extract_json_object, truncate_text
@@ -37,6 +39,7 @@ GATEWAY_HEARTBEAT_SECONDS = 60
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 GATEWAY_AUTH_RETRY_STATUS_CODES = {401, 403}
 GATEWAY_RESPONSE_FORMAT_RETRY_STATUS_CODES = {400, 422}
+GATEWAY_TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 CHUNK_MODEL_INPUT_CHARS = 70_000
 ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS = 45_000
 PROACTIVE_SUBCHUNK_PROMPT_CHARS = 52_000
@@ -151,7 +154,17 @@ class GatewayClaudeReviewer:
         self._token_lock = threading.Lock()
         self._response_format_lock = threading.Lock()
         self._eta_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
         self._completed_model_prompt_chars: list[int] = []
+        self._model_metrics: dict[str, Any] = {
+            "model_http_attempts": 0,
+            "successful_model_calls": 0,
+            "transient_retries": 0,
+            "non_json_responses": 0,
+            "json_repair_model_calls": 0,
+            "strict_json_retry_calls": 0,
+            "new_chat_retries": 0,
+        }
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -236,11 +249,13 @@ class GatewayClaudeReviewer:
         )
         restored_outputs = checkpoint.load_outputs() if checkpoint is not None else {}
         if restored_outputs:
-            restored_count = len(restored_outputs)
+            planned_ids = {str(chunk.get("id") or "") for chunk in chunks}
+            restored_count = sum(1 for chunk_id in restored_outputs if chunk_id in planned_ids)
+            restored_subchunk_count = sum(1 for chunk_id in restored_outputs if ":retry-" in chunk_id)
             remaining_count = max(0, total_chunks - restored_count)
             self.progress(
                 f"Restored deep review checkpoint with {restored_count}/{total_chunks} completed packet(s); "
-                f"{remaining_count} packet(s) remain."
+                f"{restored_subchunk_count} adaptive subchunk(s) also cached; {remaining_count} packet(s) remain."
             )
         remaining_chunks = [chunk for chunk in chunks if str(chunk.get("id") or "") not in restored_outputs]
         self.eta = AdaptiveETA(total_requests=len(remaining_chunks) + 1)
@@ -264,6 +279,11 @@ class GatewayClaudeReviewer:
             with checkpoint_lock:
                 checkpoint.save(output_by_chunk_id, chunks, status="in_progress")
 
+        restored_subchunk_outputs = {
+            chunk_id: output
+            for chunk_id, output in output_by_chunk_id.items()
+            if ":retry-" in chunk_id
+        }
         if remaining_chunks:
             self._review_deep_chunks(
                 review_input,
@@ -272,6 +292,8 @@ class GatewayClaudeReviewer:
                 deep_concurrency=selected_concurrency,
                 total_planned_chunks=total_chunks,
                 on_chunk_output=save_checkpoint_for_output,
+                restored_subchunk_outputs=restored_subchunk_outputs,
+                on_subchunk_output=save_checkpoint_for_output,
             )
         elif checkpoint is not None:
             checkpoint.save(output_by_chunk_id, chunks, status="chunks_complete")
@@ -310,6 +332,7 @@ class GatewayClaudeReviewer:
             "model_skipped_chunk_count": len(skipped_model_chunks),
             "max_chunks": max_chunks,
             "model_packet_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
+            "model_metrics": self._model_metrics_snapshot(),
         }
         final_output["chunk_review_outputs"] = chunk_outputs
         return final_output
@@ -323,6 +346,8 @@ class GatewayClaudeReviewer:
         deep_concurrency: int,
         total_planned_chunks: int | None = None,
         on_chunk_output: Callable[[dict[str, Any]], None] | None = None,
+        restored_subchunk_outputs: dict[str, dict[str, Any]] | None = None,
+        on_subchunk_output: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         total_chunks = len(chunks)
         concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
@@ -335,6 +360,8 @@ class GatewayClaudeReviewer:
                     chunk,
                     position,
                     total_planned_chunks or total_chunks,
+                    restored_subchunk_outputs=restored_subchunk_outputs,
+                    on_subchunk_output=on_subchunk_output,
                 )
                 outputs.append(output)
                 if on_chunk_output is not None:
@@ -354,6 +381,8 @@ class GatewayClaudeReviewer:
                     chunk,
                     position,
                     total_planned_chunks or total_chunks,
+                    restored_subchunk_outputs=restored_subchunk_outputs,
+                    on_subchunk_output=on_subchunk_output,
                 ): position
                 for position, chunk in enumerate(chunks, start=1)
             }
@@ -378,6 +407,9 @@ class GatewayClaudeReviewer:
         chunk: dict[str, Any],
         position: int,
         total_chunks: int,
+        *,
+        restored_subchunk_outputs: dict[str, dict[str, Any]] | None = None,
+        on_subchunk_output: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         path = str(chunk.get("path") or "unknown file")
         file_chunk = chunk.get("chunk_index")
@@ -419,6 +451,8 @@ class GatewayClaudeReviewer:
                     "Proactively split timeout-risk CIRCUIT packet before first model request."
                 ),
                 proactive=True,
+                restored_subchunk_outputs=restored_subchunk_outputs,
+                on_subchunk_output=on_subchunk_output,
             )
             output = dict(output)
             output["chunk_id"] = chunk.get("id")
@@ -447,6 +481,8 @@ class GatewayClaudeReviewer:
                     parent_position=position,
                     parent_total=total_chunks,
                     original_error=exc,
+                    restored_subchunk_outputs=restored_subchunk_outputs,
+                    on_subchunk_output=on_subchunk_output,
                 )
             else:
                 self.progress(
@@ -463,6 +499,8 @@ class GatewayClaudeReviewer:
                     parent_position=position,
                     parent_total=total_chunks,
                     original_error=GatewayTransientModelError(str(exc)),
+                    restored_subchunk_outputs=restored_subchunk_outputs,
+                    on_subchunk_output=on_subchunk_output,
                 )
             else:
                 self.progress(
@@ -493,6 +531,8 @@ class GatewayClaudeReviewer:
         parent_total: int,
         original_error: GatewayTransientModelError,
         proactive: bool = False,
+        restored_subchunk_outputs: dict[str, dict[str, Any]] | None = None,
+        on_subchunk_output: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         subchunks = split_chunk_for_adaptive_retry(
             chunk,
@@ -501,6 +541,7 @@ class GatewayClaudeReviewer:
         )
         if len(subchunks) <= 1:
             raise original_error
+        self._add_eta_requests(max(0, len(subchunks) - 1))
         if proactive:
             for subchunk in subchunks:
                 subchunk["proactive_review"] = True
@@ -524,6 +565,15 @@ class GatewayClaudeReviewer:
             )
         sub_outputs: list[dict[str, Any]] = []
         for sub_position, subchunk in enumerate(subchunks, start=1):
+            subchunk_id = str(subchunk.get("id") or "")
+            if restored_subchunk_outputs and subchunk_id in restored_subchunk_outputs:
+                sub_output = dict(restored_subchunk_outputs[subchunk_id])
+                sub_outputs.append(sub_output)
+                self.progress(
+                    f"Adaptive subchunk {sub_position}/{len(subchunks)} restored for {path} "
+                    f"with {len(sub_output.get('findings') or [])} finding(s)."
+                )
+                continue
             self.progress(
                 f"Adaptive subchunk {sub_position}/{len(subchunks)} started for {path}; "
                 f"estimated whole-review time remaining: {self._eta_text()}."
@@ -550,6 +600,8 @@ class GatewayClaudeReviewer:
             sub_output["chunk_index"] = subchunk.get("chunk_index")
             sub_output["chunk_total"] = subchunk.get("chunk_total")
             sub_outputs.append(sub_output)
+            if on_subchunk_output is not None:
+                on_subchunk_output(sub_output)
             self.progress(
                 f"Adaptive subchunk {sub_position}/{len(subchunks)} completed for {path} "
                 f"with {len(sub_output.get('findings') or [])} finding(s)."
@@ -582,13 +634,13 @@ class GatewayClaudeReviewer:
             heartbeat_thread.start()
         request_succeeded = False
         try:
-            try:
-                response_payload = self._post_model_json(body, max_attempts=request_max_attempts)
-                request_succeeded = True
-            except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                raise GatewayTransientModelError(
-                    f"Gateway model invocation failed: {redact_text(format_http_error(exc))}"
-                ) from exc
+            response_payload = self._post_model_json(body, max_attempts=request_max_attempts)
+            request_succeeded = True
+            self._increment_model_metric("successful_model_calls")
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise GatewayTransientModelError(
+                f"Gateway model invocation failed: {redact_text(format_http_error(exc))}"
+            ) from exc
         finally:
             heartbeat_stop.set()
             if heartbeat_thread is not None:
@@ -601,6 +653,7 @@ class GatewayClaudeReviewer:
         try:
             raw_output = extract_json_object(text)
         except Exception as exc:  # noqa: BLE001 - keep raw model text for prototype debugging
+            self._increment_model_metric("non_json_responses")
             raw_output, response_payload, recovery_note = self._recover_non_json_response(text, user_prompt)
 
         normalized = normalize_review_output(raw_output, deterministic_findings=deterministic_findings)
@@ -619,6 +672,7 @@ class GatewayClaudeReviewer:
         if circuit_requests_new_chat(previous_text):
             self.progress("Gateway requested a new chat; retrying the original review as a fresh request.")
             try:
+                self._increment_model_metric("new_chat_retries")
                 fresh_payload = self._post_model_json(
                     self._model_body(build_fresh_chat_retry_prompt(original_user_prompt))
                 )
@@ -630,6 +684,7 @@ class GatewayClaudeReviewer:
 
         self.progress("Gateway model returned non-JSON; attempting one JSON repair request.")
         try:
+            self._increment_model_metric("json_repair_model_calls")
             repair_payload = self._post_model_json(self._model_body(build_json_repair_prompt(previous_text)))
             repair_text = extract_chat_completion_text(repair_payload)
             raw_output = extract_json_object(repair_text)
@@ -638,6 +693,7 @@ class GatewayClaudeReviewer:
             self.progress("Gateway JSON repair failed; retrying the original review with strict JSON-only instructions.")
 
         try:
+            self._increment_model_metric("strict_json_retry_calls")
             retry_payload = self._post_model_json(self._model_body(build_strict_json_retry_prompt(original_user_prompt)))
             retry_text = extract_chat_completion_text(retry_payload)
             raw_output = extract_json_object(retry_text)
@@ -698,6 +754,22 @@ class GatewayClaudeReviewer:
                     body = downgraded_body
                     continue
                 if exc.code not in GATEWAY_AUTH_RETRY_STATUS_CODES or auth_refreshed:
+                    if exc.code in GATEWAY_TRANSIENT_STATUS_CODES and attempt < max_attempts:
+                        delay = retry_after_delay_seconds(exc)
+                        if delay is None:
+                            delay = transient_retry_delay_seconds(
+                                base=self.config.gateway_request_retry_backoff_seconds,
+                                attempt=attempt,
+                            )
+                        self.progress(
+                            f"Gateway model request failed transiently on attempt {attempt}/{max_attempts}: "
+                            f"{redact_text(format_http_error(exc))}. Retrying in {format_duration(delay)}."
+                        )
+                        self._increment_model_metric("transient_retries")
+                        if delay > 0:
+                            time.sleep(delay)
+                        attempt += 1
+                        continue
                     raise
                 self.progress("Gateway model auth failed; refreshing token and retrying once.")
                 with self._token_lock:
@@ -708,11 +780,15 @@ class GatewayClaudeReviewer:
             except (TimeoutError, URLError, OSError) as exc:
                 if attempt >= max_attempts:
                     raise
-                delay = self.config.gateway_request_retry_backoff_seconds * attempt
+                delay = transient_retry_delay_seconds(
+                    base=self.config.gateway_request_retry_backoff_seconds,
+                    attempt=attempt,
+                )
                 self.progress(
                     f"Gateway model request failed transiently on attempt {attempt}/{max_attempts}: "
                     f"{redact_text(format_http_error(exc))}. Retrying in {format_duration(delay)}."
                 )
+                self._increment_model_metric("transient_retries")
                 if delay > 0:
                     time.sleep(delay)
                 attempt += 1
@@ -755,6 +831,7 @@ class GatewayClaudeReviewer:
         return None
 
     def _post_model_json_once(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._increment_model_metric("model_http_attempts")
         request = Request(
             str(self.config.gateway_base_url),
             data=json.dumps(body).encode("utf-8"),
@@ -855,6 +932,16 @@ class GatewayClaudeReviewer:
             if prompt_chars is not None:
                 self._completed_model_prompt_chars.append(max(1, int(prompt_chars)))
 
+    def _add_eta_requests(self, count: int) -> None:
+        eta_lock = getattr(self, "_eta_lock", None)
+        if eta_lock is None:
+            if self.eta is not None:
+                self.eta.add_requests(count)
+            return
+        with eta_lock:
+            if self.eta is not None:
+                self.eta.add_requests(count)
+
     def _estimated_request_seconds_for_prompt(self, prompt_chars: int) -> float | None:
         eta_lock = getattr(self, "_eta_lock", None)
         if eta_lock is None:
@@ -872,6 +959,25 @@ class GatewayClaudeReviewer:
             return None
         scale = max(0.5, min(4.0, max(1, int(prompt_chars)) / avg_chars))
         return avg_seconds * scale
+
+    def _increment_model_metric(self, key: str, count: int = 1) -> None:
+        with self._metrics_lock:
+            self._model_metrics[key] = int(self._model_metrics.get(key) or 0) + count
+
+    def _model_metrics_snapshot(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            metrics = dict(self._model_metrics)
+        eta_lock = getattr(self, "_eta_lock", None)
+        if eta_lock is None:
+            latencies = list(self.eta.completed_request_seconds if self.eta is not None else [])
+            prompt_chars = list(self._completed_model_prompt_chars)
+        else:
+            with eta_lock:
+                latencies = list(self.eta.completed_request_seconds if self.eta is not None else [])
+                prompt_chars = list(self._completed_model_prompt_chars)
+        metrics["latency_seconds"] = summarize_numeric_samples(latencies)
+        metrics["prompt_chars"] = summarize_numeric_samples(prompt_chars)
+        return metrics
 
 
 class DeepReviewCheckpoint:
@@ -964,6 +1070,7 @@ def deep_review_checkpoint_id(review_input: dict[str, Any], chunks: list[dict[st
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     identity = {
         "schema_version": "0.1",
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "repo": review_input.get("repo") or (review_input.get("repository") or {}).get("full_name"),
         "pr_number": pr.get("number"),
         "base_sha": base.get("sha"),
@@ -1076,12 +1183,12 @@ def recommended_deep_concurrency(total_chunks: int, chunks: list[dict[str, Any]]
     max_diff = max(diff_chars) if diff_chars else 0
     avg_diff = (sum(diff_chars) / len(diff_chars)) if diff_chars else 0
     high_priority_count = sum(1 for chunk in chunks if chunk.get("model_review_priority") == "high")
-    if max_diff >= 16_000 or avg_diff >= 9_000:
+    if max_diff >= 28_000 or avg_diff >= 16_000:
         return 1
     if total_chunks <= 3:
         return 3
-    if total_chunks >= 18 or high_priority_count >= 10:
-        return 1
+    if total_chunks >= 40 or high_priority_count >= 18:
+        return 2
     if total_chunks >= 7 or max_diff >= 8_000 or avg_diff >= 5_000 or high_priority_count >= 4:
         return 2
     return 3
@@ -1187,6 +1294,42 @@ def format_http_error(exc: BaseException) -> str:
         body = redact_text(read_error_body(exc))
         return f"HTTP {exc.code} {redact_text(exc.reason)}: {body}".strip()
     return redact_text(str(exc))
+
+
+def retry_after_delay_seconds(error: HTTPError) -> float | None:
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, min(float(value), 120.0))
+    except ValueError:
+        return None
+
+
+def transient_retry_delay_seconds(*, base: float, attempt: int) -> float:
+    exponential = max(0.0, float(base)) * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0.0, min(2.0, max(0.25, exponential / 2 or 0.25)))
+    return min(120.0, exponential + jitter)
+
+
+def summarize_numeric_samples(values: list[float] | list[int]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0}
+    ordered = sorted(float(value) for value in values)
+    return {
+        "count": len(ordered),
+        "avg": sum(ordered) / len(ordered),
+        "p50": percentile(ordered, 0.50),
+        "p95": percentile(ordered, 0.95),
+        "max": ordered[-1],
+    }
+
+
+def percentile(ordered_values: list[float], quantile: float) -> float:
+    if not ordered_values:
+        return 0.0
+    index = min(len(ordered_values) - 1, max(0, int(round((len(ordered_values) - 1) * quantile))))
+    return ordered_values[index]
 
 
 def read_error_body(error: HTTPError) -> str:

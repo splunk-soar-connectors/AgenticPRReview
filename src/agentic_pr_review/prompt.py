@@ -210,6 +210,23 @@ Evidence rules:
   `head_context_files`, `base_context_files`, and `semantic_context` together.
   Report only issues proven by those snippets and current PR metadata; put
   missing-context concerns in model_notes instead of findings.
+- When `review_packet.semantic_context.identifier_provenance` is present, use it
+  before making identifier-format, validation, routing, auth-state, or
+  source/sink claims. Trace the variable being criticized: where it enters the
+  scope, where it is assigned, what value shape is proven, and what execution
+  path reaches the sink.
+- Keep identifier roles separate. Asset ID, application/app ID, connector ID,
+  action ID, user ID, tenant ID, OAuth client ID, OAuth state, request token,
+  and config key are not interchangeable just because their names are similar
+  or one of them is a UUID/GUID.
+- Distinguish observations from conclusions. A UUID or appid found in a JSON
+  manifest is only repository evidence; it does not prove an `asset_id` or
+  other runtime variable contains UUIDs unless the code path explicitly connects
+  that value to the variable under review.
+- For behavioral findings, your internal evidence chain must connect variable
+  source, assignment/provenance, sink, expected runtime value, changed behavior,
+  and observable failure. If that chain is incomplete, lower confidence or put
+  the concern in model_notes instead of findings.
 - Historical examples can help you decide what to inspect and how to phrase a
   concise human-style comment, but do not cite historical PRs as evidence in an
   active finding. Cite the current file, line, diff, docs, comments, or CI log.
@@ -328,6 +345,8 @@ def build_synthesis_prompt(
         "instructions": [
             "Merge duplicate findings across chunks.",
             "Drop speculative, weak, already-fixed, README-only, or generic CI findings.",
+            "Drop behavioral identifier findings when the candidate evidence does not prove the reviewed variable's source, sink, expected runtime value, and failure path.",
+            "Do not merge evidence across different identifier roles such as asset ID and application ID unless a supplied assignment trace connects them.",
             "Keep only concrete findings that should be posted to an external contributor.",
             "Prefer exact file/line targets from chunk findings or deterministic findings.",
             "Use CI/check/comment context to confirm whether findings are real blockers.",
@@ -508,6 +527,56 @@ def compact_semantic_context(semantic_context: dict, *, limits: dict[str, int]) 
         copied["excerpt"] = truncate_text(str(copied.get("excerpt") or ""), min(limits["file"], 2_000))
         snippets.append(copied)
     output["snippets"] = snippets
+    if isinstance(semantic_context.get("identifier_provenance"), dict):
+        output["identifier_provenance"] = compact_identifier_provenance(
+            semantic_context["identifier_provenance"],
+            limits=limits,
+        )
+    return output
+
+
+def compact_identifier_provenance(provenance: dict, *, limits: dict[str, int]) -> dict:
+    output = {
+        key: provenance.get(key)
+        for key in ("strategy", "evidence_rules", "reason", "tracked_identifier_names")
+        if key in provenance
+    }
+    tracked = []
+    for item in (provenance.get("tracked_identifiers") or [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        copied = {
+            key: item.get(key)
+            for key in (
+                "name",
+                "role",
+                "role_reason",
+                "reference_lines",
+                "provenance_confidence",
+                "confidence_reason",
+                "review_guidance",
+            )
+            if key in item
+        }
+        trace = []
+        for step in (item.get("assignment_trace") or [])[:5]:
+            if not isinstance(step, dict):
+                continue
+            compact_step = dict(step)
+            compact_step["value"] = truncate_text(str(step.get("value") or ""), min(limits["patch"], 400))
+            compact_step["observation"] = truncate_text(str(step.get("observation") or ""), min(limits["patch"], 400))
+            trace.append(compact_step)
+        copied["assignment_trace"] = trace
+        tracked.append(copied)
+    output["tracked_identifiers"] = tracked
+    observations = []
+    for item in (provenance.get("repository_identifier_observations") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        copied["value_excerpt"] = truncate_text(str(item.get("value_excerpt") or ""), min(limits["patch"], 400))
+        observations.append(copied)
+    output["repository_identifier_observations"] = observations
     return output
 
 

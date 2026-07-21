@@ -126,12 +126,25 @@ than blindly reviewing whole files. Python changes are grouped around enclosing
 functions/classes, nearby hunk context, referenced helpers/constants/imports,
 and callers where available. JSON, YAML, TOML, and XML changes are grouped
 around the changed object, section, or element when the structure can be
-inferred. Adjacent same-file logical units are merged when that removes
-duplicate context without exceeding the packet target. The bot invocation
-workflow `.github/workflows/agentic-pr-review.yml` is excluded from model
-review; deterministic checks can still inspect it. Low-signal chunks such as
-license/notice/readme and metadata-only changes are skipped for model review
-after deterministic checks run.
+inferred.
+
+Before model review, the planner builds a bounded change-impact graph over the
+changed logical units. It links direct relationships such as same enclosing
+class/section, metadata-to-implementation mappings, test-to-source references,
+view/template references, and shared high-risk symbols. Packets are clustered
+from those graph relationships and must stay inside logical-unit, diff-size,
+context-range, and estimated-prompt budgets. This avoids the old failure mode
+where many unrelated functions in one file were merged into one oversized
+packet and then split into many serial timeout-retry subchunks.
+
+Adaptive chunking is now a fallback, not the normal path. When a merged packet
+must be split, the bot first splits it along semantic child packet boundaries
+such as functions, methods, JSON objects, YAML sections, and template sections.
+Only when there is no safe semantic split does it fall back to smaller diff
+hunks. The bot invocation workflow `.github/workflows/agentic-pr-review.yml` is
+excluded from model review; deterministic checks can still inspect it.
+Low-signal chunks such as license/notice/readme and metadata-only changes are
+skipped for model review after deterministic checks run.
 
 Independent chunks can run concurrently to reduce wall-clock time. The default
 concurrency is automatic: small reviews can use more parallelism, while large or
@@ -140,10 +153,18 @@ pressure. Passing `--deep-concurrency N` sets a maximum cap, not a guaranteed
 floor.
 
 Deep model progress is checkpointed to `deep_review_checkpoint.json` after each
-completed packet. If the same run directory is reused for the same PR head,
-model, and packet plan, the bot restores completed packet outputs and resumes
-from the remaining packets before synthesis. Stale checkpoints are ignored when
-the PR head/base or packet hashes change.
+completed packet and adaptive subchunk. The reusable workflow restores the
+previous run directory from a PR-scoped GitHub Actions cache before review and
+saves it again after the run, while still uploading the normal artifacts. If a
+compatible checkpoint is present for the same PR head, model, review-policy
+version, and packet plan, the bot restores completed outputs and resumes from
+the remaining packets before synthesis. Stale checkpoints are ignored when the
+PR head/base, packet hashes, model, or review policy change.
+
+Review artifacts include packet-planning diagnostics, coverage counts, impact
+graph summaries, model-call counts, JSON repair counts, prompt-size samples, and
+latency samples so slow runs can be debugged without guessing where the time was
+spent.
 
 Useful controls:
 

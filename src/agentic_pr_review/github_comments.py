@@ -118,23 +118,48 @@ def build_comment_plan(
 
 
 def filter_review_output_for_pr_context(review_output: dict[str, Any], review_input: dict[str, Any]) -> dict[str, Any]:
-    findings = [
-        finding
-        for finding in review_output.get("findings", []) or []
-        if isinstance(finding, dict) and not should_skip_finding_for_pr_context(finding, review_input)
-    ]
-    if len(findings) == len(review_output.get("findings", []) or []):
+    original_findings = [finding for finding in review_output.get("findings", []) or [] if isinstance(finding, dict)]
+    findings = []
+    suppressed: list[dict[str, Any]] = []
+    for finding in original_findings:
+        reason = finding_context_filter_reason(finding, review_input)
+        if reason:
+            suppressed.append(
+                {
+                    "id": finding.get("id"),
+                    "title": finding.get("title"),
+                    "file": finding.get("file"),
+                    "line": finding.get("line"),
+                    "reason": reason["reason"],
+                    "confidence_before": finding.get("confidence"),
+                    "confidence_after": reason.get("confidence_after", "suppressed"),
+                    "evidence_source": reason.get("evidence_source"),
+                    "reason_confidence_was_lowered": reason.get("detail"),
+                }
+            )
+            continue
+        findings.append(finding)
+    if len(findings) == len(original_findings):
         return review_output
 
     output = dict(review_output)
-    removed_count = len(review_output.get("findings", []) or []) - len(findings)
+    removed_count = len(original_findings) - len(findings)
     output["findings"] = findings
     if not findings and output.get("overall_status") in {"needs_review", "blocked_by_ci"}:
         output["overall_status"] = "looks_good"
-    note = (
-        f"Filtered {removed_count} stale removed-manifest finding(s) because this PR uses SDK metadata sources "
-        "instead of the deleted legacy app JSON."
-    )
+    output["behavioral_verification"] = {
+        "suppressed_count": removed_count,
+        "suppressed_findings": suppressed[:50],
+    }
+    reason_counts: dict[str, int] = {}
+    for item in suppressed:
+        reason_key = str(item.get("reason") or "unknown")
+        reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+    reason_text = ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items()))
+    note = f"Filtered {removed_count} finding(s) during PR-scope/evidence verification"
+    if reason_text:
+        note += f" ({reason_text})"
+    note += "."
     existing_notes = str(output.get("model_notes") or "").strip()
     output["model_notes"] = f"{existing_notes}\n{note}".strip() if existing_notes else note
     return output
@@ -416,6 +441,175 @@ def finding_identity(finding: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def finding_context_filter_reason(finding: dict[str, Any], review_input: dict[str, Any]) -> dict[str, str] | None:
+    if is_stale_removed_sdk_manifest_finding(finding, review_input):
+        return {
+            "reason": "stale_removed_sdk_manifest",
+            "detail": "deleted legacy app JSON is not the active metadata source for this SDK migration",
+            "evidence_source": "pr_scope",
+        }
+    if is_outside_changed_pr_scope(finding, review_input):
+        return {
+            "reason": "outside_changed_pr_scope",
+            "detail": "finding target is not tied to a changed file, changed hunk, CI blocker, or inferable changed anchor",
+            "evidence_source": "pr_scope",
+        }
+    unsupported_identifier_reason = unconnected_identifier_inference_reason(finding)
+    if unsupported_identifier_reason:
+        return unsupported_identifier_reason
+    return None
+
+
+def unconnected_identifier_inference_reason(finding: dict[str, Any]) -> dict[str, str] | None:
+    """Detect behavioral claims that join unrelated identifier evidence.
+
+    This is a deliberately narrow verifier. It does not second-guess normal
+    findings; it only suppresses model claims that use repository examples for
+    one identifier role as proof about a different runtime identifier without
+    stating a connecting assignment/path.
+    """
+
+    source = str(finding.get("source") or "").lower()
+    if source in {"deterministic", "static", "ci"}:
+        return None
+    category = str(finding.get("category") or "")
+    if category not in {
+        "api_auth_correctness",
+        "polling_checkpoint",
+        "output_schema_mismatch",
+        "soar_metadata",
+        "validation",
+        "general",
+    }:
+        return None
+
+    text = " ".join(
+        str(finding.get(key) or "")
+        for key in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference")
+    )
+    lowered = text.lower()
+    roles = identifier_roles_in_text(lowered)
+    if len(roles) < 2:
+        return None
+    if has_direct_identifier_connection(lowered):
+        return None
+
+    if "uuid" not in lowered and "guid" not in lowered and "format" not in lowered and "validation" not in lowered:
+        return None
+    if not mentions_repository_example_without_runtime_link(lowered):
+        return None
+
+    conflicting_roles = sorted(roles)
+    return {
+        "reason": "unconnected_identifier_inference",
+        "detail": (
+            "finding appears to infer runtime behavior across distinct identifier roles "
+            f"without an assignment/provenance chain: {', '.join(conflicting_roles)}"
+        ),
+        "evidence_source": "behavioral_evidence_verifier",
+        "confidence_after": "low",
+    }
+
+
+def identifier_roles_in_text(lowered: str) -> set[str]:
+    roles: set[str] = set()
+    patterns = {
+        "asset_id": (
+            r"\basset[_\s-]*id\b",
+            r"\bassetid\b",
+        ),
+        "application_id": (
+            r"\bapp[_\s-]*id\b",
+            r"\bappid\b",
+            r"\bapplication[_\s-]*id\b",
+            r"\bapplicationid\b",
+        ),
+        "connector_id": (
+            r"\bconnector[_\s-]*id\b",
+            r"\bconnectorid\b",
+        ),
+        "action_id": (
+            r"\baction[_\s-]*id\b",
+            r"\baction[_\s-]*identifier\b",
+        ),
+        "user_id": (
+            r"\buser[_\s-]*id\b",
+            r"\buserid\b",
+        ),
+        "tenant_id": (
+            r"\btenant[_\s-]*id\b",
+            r"\btenantid\b",
+        ),
+        "oauth_client_id": (
+            r"\bclient[_\s-]*id\b",
+            r"\bclientid\b",
+        ),
+        "guid_or_uuid": (
+            r"\buuid\b",
+            r"\bguid\b",
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        ),
+    }
+    for role, role_patterns in patterns.items():
+        if any(re.search(pattern, lowered) for pattern in role_patterns):
+            roles.add(role)
+    if "guid_or_uuid" in roles and len(roles) == 1:
+        roles.remove("guid_or_uuid")
+    return roles
+
+
+def has_direct_identifier_connection(lowered: str) -> bool:
+    connection_phrases = (
+        "assigned from",
+        "assigned to",
+        "comes from",
+        "derived from",
+        "populated from",
+        "loaded from",
+        "read from",
+        "passed from",
+        "passed into",
+        "mapped from",
+        "converted from",
+        "copied from",
+        "same value",
+        "same identifier",
+        "stored as",
+        "looked up by",
+        "assignment trace",
+        "provenance",
+        "runtime source",
+        "request parameter",
+        "asset configuration",
+        "connector state",
+    )
+    return any(phrase in lowered for phrase in connection_phrases)
+
+
+def mentions_repository_example_without_runtime_link(lowered: str) -> bool:
+    repository_phrases = (
+        ".json",
+        "manifest",
+        "repository",
+        "example",
+        "found in",
+        "contains",
+        "declares",
+        "metadata",
+    )
+    runtime_phrases = (
+        "function parameter",
+        "request parameter",
+        "asset configuration",
+        "connector state",
+        "api response",
+        "assignment trace",
+        "source variable",
+        "runtime value",
+    )
+    return any(phrase in lowered for phrase in repository_phrases) and not any(phrase in lowered for phrase in runtime_phrases)
+
+
 def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
     category = str(finding.get("category") or "")
     confidence = str(finding.get("confidence") or "").lower()
@@ -452,7 +646,7 @@ def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
 
 
 def should_skip_finding_for_pr_context(finding: dict[str, Any], review_input: dict[str, Any]) -> bool:
-    return is_stale_removed_sdk_manifest_finding(finding, review_input) or is_outside_changed_pr_scope(finding, review_input)
+    return finding_context_filter_reason(finding, review_input) is not None
 
 
 def is_outside_changed_pr_scope(finding: dict[str, Any], review_input: dict[str, Any]) -> bool:

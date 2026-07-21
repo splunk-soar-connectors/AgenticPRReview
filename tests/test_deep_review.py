@@ -3,6 +3,7 @@ import unittest
 
 from agentic_pr_review.deep_review import (
     DeepPRCollector,
+    PACKET_MAX_LOGICAL_UNITS,
     build_chunk_review_input,
     chunk_unified_diff,
     collect_related_python_context_paths,
@@ -280,6 +281,96 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertIn("caller of changed function `authenticate`", semantic_text)
         self.assertIn("test_connectivity", semantic_text)
 
+    def test_python_packet_tracks_asset_id_provenance_separately_from_app_id_examples(self):
+        base = (
+            "def validate_asset(asset_id):\n"
+            "    return bool(asset_id)\n"
+        )
+        head = (
+            "def validate_asset(asset_id):\n"
+            "    return asset_id.isdigit()\n"
+        )
+        diff = generate_unified_diff(base, head, base_path="connector.py", head_path="connector.py")
+        chunks = chunk_unified_diff(
+            {"filename": "connector.py", "status": "modified", "additions": 1, "deletions": 1, "changes": 2},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        chunk_input = build_chunk_review_input(
+            {
+                "repo": "owner/repo",
+                "pr": {"number": 1, "title": "test"},
+                "full_files": {
+                    "connector.py": head,
+                    "microsoftteams.json": '{"appid": "550e8400-e29b-41d4-a716-446655440000"}',
+                },
+                "base_files": {"connector.py": base},
+                "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+                "ci": {"check_runs": []},
+                "collector_notes": {},
+            },
+            chunks[0],
+        )
+        provenance = chunk_input["review_packet"]["semantic_context"]["identifier_provenance"]
+        tracked = {
+            item["name"]: item
+            for item in provenance["tracked_identifiers"]
+        }
+
+        self.assertEqual(tracked["asset_id"]["role"], "asset_id")
+        self.assertEqual(tracked["asset_id"]["assignment_trace"][0]["origin"], "function_parameter")
+        observations = provenance["repository_identifier_observations"]
+        self.assertTrue(any(item["identifier"] == "appid" and item["role"] == "application_id" for item in observations))
+        self.assertTrue(
+            any(
+                item["identifier"] == "appid"
+                and item["evidence_type"] == "repository_observation_not_runtime_proof"
+                for item in observations
+            )
+        )
+        self.assertIn("not proof", " ".join(provenance["evidence_rules"]))
+
+    def test_python_packet_traces_request_parameter_assignment(self):
+        base = (
+            "def handle_request(request):\n"
+            "    asset_id = request.args.get('asset_id')\n"
+            "    return asset_id\n"
+        )
+        head = base.replace("    return asset_id\n", "    return int(asset_id)\n")
+        diff = generate_unified_diff(base, head, base_path="connector.py", head_path="connector.py")
+        chunks = chunk_unified_diff(
+            {"filename": "connector.py", "status": "modified", "additions": 1, "deletions": 1, "changes": 2},
+            diff,
+            max_chars=60_000,
+            head_text=head,
+            base_text=base,
+        )
+
+        chunk_input = build_chunk_review_input(
+            {
+                "repo": "owner/repo",
+                "pr": {"number": 1, "title": "test"},
+                "full_files": {"connector.py": head},
+                "base_files": {"connector.py": base},
+                "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+                "ci": {"check_runs": []},
+                "collector_notes": {},
+            },
+            chunks[0],
+        )
+        tracked = {
+            item["name"]: item
+            for item in chunk_input["review_packet"]["semantic_context"]["identifier_provenance"]["tracked_identifiers"]
+        }
+
+        self.assertEqual(tracked["asset_id"]["role"], "asset_id")
+        self.assertTrue(
+            any(step["origin"] == "request_or_action_parameter" for step in tracked["asset_id"]["assignment_trace"])
+        )
+
     def test_json_diff_groups_by_changed_object(self):
         base = (
             "{\n"
@@ -334,7 +425,7 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertEqual(chunks[0]["chunk_strategy"], "yaml_section")
         self.assertIn("jobs.test", chunks[0]["logical_unit"])
 
-    def test_logical_packet_planner_merges_adjacent_python_scopes(self):
+    def test_logical_packet_planner_does_not_merge_unrelated_adjacent_python_scopes(self):
         chunks = [
             {
                 "id": "connector.py:1",
@@ -364,11 +455,76 @@ class DeepReviewHelpersTest(unittest.TestCase):
 
         merged, stats = dedupe_and_merge_review_chunks(chunks, max_chars=60_000)
 
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(stats["merged_packet_count"], 0)
+        self.assertEqual(stats["coverage"]["covered_logical_unit_count"], 2)
+
+    def test_dependency_planner_merges_related_same_class_methods(self):
+        chunks = [
+            {
+                "id": "connector.py:1",
+                "path": "connector.py",
+                "status": "modified",
+                "chunk_strategy": "python_function",
+                "python_scope": "Connector.authenticate",
+                "python_scope_kind": "function",
+                "python_scope_start_line": 10,
+                "python_scope_end_line": 20,
+                "diff": "@@ -10 +10 @@\n-return self.get_token()\n+return self.get_token(timeout=30)",
+                "diff_chars": 72,
+            },
+            {
+                "id": "connector.py:2",
+                "path": "connector.py",
+                "status": "modified",
+                "chunk_strategy": "python_function",
+                "python_scope": "Connector.get_token",
+                "python_scope_kind": "function",
+                "python_scope_start_line": 30,
+                "python_scope_end_line": 40,
+                "diff": "@@ -30 +30 @@\n-return requests.post(url)\n+return requests.post(url, timeout=timeout)",
+                "diff_chars": 86,
+            },
+        ]
+
+        merged, stats = dedupe_and_merge_review_chunks(chunks, max_chars=60_000)
+
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["chunk_strategy"], "python_function_group")
         self.assertEqual(merged[0]["merged_chunk_count"], 2)
-        self.assertEqual([scope["name"] for scope in merged[0]["included_scopes"]], ["alpha", "beta"])
+        self.assertEqual([scope["name"] for scope in merged[0]["included_scopes"]], ["Connector.authenticate", "Connector.get_token"])
+        self.assertEqual(merged[0]["packet_logical_unit_count"], 2)
         self.assertEqual(stats["merged_packet_count"], 1)
+        self.assertEqual(stats["impact_graph"]["edge_kinds"], {"same_enclosing_scope": 1})
+
+    def test_large_synthetic_change_stays_balanced_and_covers_every_unit(self):
+        chunks = []
+        for index in range(24):
+            chunks.append(
+                {
+                    "id": f"connector.py:{index + 1}",
+                    "path": "connector.py",
+                    "status": "modified",
+                    "chunk_strategy": "python_function",
+                    "python_scope": f"Connector.action_{index}",
+                    "python_scope_kind": "function",
+                    "python_scope_start_line": index * 20 + 1,
+                    "python_scope_end_line": index * 20 + 15,
+                    "diff": (
+                        f"@@ -{index * 20 + 1} +{index * 20 + 1} @@\n"
+                        f"-return self._make_rest_call('/old/{index}')\n"
+                        f"+return self._make_rest_call('/new/{index}', timeout=30)"
+                    ),
+                    "diff_chars": 120,
+                }
+            )
+
+        merged, stats = dedupe_and_merge_review_chunks(chunks, max_chars=60_000)
+
+        self.assertGreater(len(merged), 1)
+        self.assertTrue(all(int(packet.get("packet_logical_unit_count") or 1) <= PACKET_MAX_LOGICAL_UNITS for packet in merged))
+        self.assertEqual(stats["coverage"]["covered_logical_unit_count"], len(chunks))
+        self.assertEqual(stats["coverage"]["uncovered_logical_unit_ids"], [])
 
     def test_packet_planner_excludes_bot_invocation_workflow_from_ai_review(self):
         planned, skipped = plan_circuit_review_chunks(
@@ -549,6 +705,42 @@ class DeepReviewHelpersTest(unittest.TestCase):
         joined = "\n".join(item["diff"] for item in retry_chunks)
         self.assertIn("+new_0", joined)
         self.assertIn("+new_39", joined)
+
+    def test_adaptive_retry_splits_merged_packet_by_semantic_children(self):
+        children = []
+        for index in range(7):
+            children.append(
+                {
+                    "id": f"connector.py:{index + 1}",
+                    "path": "connector.py",
+                    "status": "modified",
+                    "chunk_strategy": "python_function",
+                    "python_scope": f"Connector.action_{index}",
+                    "python_scope_kind": "function",
+                    "python_scope_start_line": index * 20 + 1,
+                    "python_scope_end_line": index * 20 + 12,
+                    "diff": f"@@ -{index + 1} +{index + 1} @@\n-old_{index}\n+new_{index}",
+                    "diff_chars": 40,
+                }
+            )
+        merged = {
+            "id": "connector.py:1",
+            "path": "connector.py",
+            "status": "modified",
+            "diff": "\n\n".join(child["diff"] for child in children),
+            "diff_chars": 400,
+            "merged_child_chunks": children,
+        }
+
+        retry_chunks = split_chunk_for_adaptive_retry(merged, max_chars=120, context_char_limit=456)
+
+        self.assertGreater(len(retry_chunks), 1)
+        self.assertTrue(all(item["adaptive_retry"] for item in retry_chunks))
+        self.assertTrue(all(int(item.get("packet_logical_unit_count") or 1) <= 3 for item in retry_chunks))
+        self.assertTrue(all(item["context_char_limit"] == 456 for item in retry_chunks))
+        reviewed = "\n".join(item["diff"] for item in retry_chunks)
+        for index in range(7):
+            self.assertIn(f"+new_{index}", reviewed)
 
     def test_build_chunk_review_input_includes_related_view_template_context(self):
         review_input = {

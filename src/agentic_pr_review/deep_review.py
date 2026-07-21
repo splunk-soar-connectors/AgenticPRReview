@@ -31,9 +31,20 @@ CONTEXT_AWARE_HUNK_RADIUS = 45
 PYTHON_SEMANTIC_CONTEXT_CHARS = 12_000
 PYTHON_SEMANTIC_MAX_SYMBOLS = 16
 PYTHON_SEMANTIC_MAX_SNIPPETS = 12
+IDENTIFIER_PROVENANCE_MAX_IDENTIFIERS = 12
+IDENTIFIER_PROVENANCE_MAX_STEPS = 6
+IDENTIFIER_PROVENANCE_MAX_REPO_OBSERVATIONS = 10
 PYTHON_FUNCTION_CHUNK_TARGET_CHARS = 12_000
 STRUCTURED_UNIT_CHUNK_TARGET_CHARS = 12_000
 MERGED_LOGICAL_PACKET_TARGET_CHARS = 22_000
+REVIEW_POLICY_VERSION = "2026-07-21.dependency-aware-provenance-v2"
+PACKET_MAX_LOGICAL_UNITS = 6
+PACKET_SOFT_DIFF_CHARS = 14_000
+PACKET_HARD_DIFF_CHARS = 26_000
+PACKET_SOFT_ESTIMATED_PROMPT_CHARS = 48_000
+PACKET_HARD_CONTEXT_RANGE_COUNT = 24
+ADAPTIVE_PACKET_MAX_LOGICAL_UNITS = 3
+ADAPTIVE_SEMANTIC_HARD_DIFF_CHARS = 12_000
 PYTHON_RELATED_CONTEXT_FILE_LIMIT = 20
 CONTEXT_AWARE_REVIEW_STRATEGY = "changed_hunks_enclosing_scope_semantic_context"
 
@@ -129,6 +140,44 @@ RISKY_MODEL_TERMS = {
     "=======",
     ">>>>>>>",
 }
+
+BROAD_GRAPH_TERMS = {
+    "action",
+    "actions",
+    "app",
+    "apps",
+    "asset",
+    "base",
+    "client",
+    "connector",
+    "const",
+    "consts",
+    "data",
+    "helper",
+    "helpers",
+    "item",
+    "items",
+    "main",
+    "model",
+    "models",
+    "output",
+    "outputs",
+    "param",
+    "params",
+    "request",
+    "response",
+    "result",
+    "results",
+    "src",
+    "test",
+    "tests",
+    "view",
+    "views",
+}
+
+UUID_LITERAL_PATTERN = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 
 
 class DeepPRCollector(PRCollector):
@@ -348,11 +397,12 @@ def dedupe_and_merge_review_chunks(
     *,
     max_chars: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Remove duplicate packet work and merge adjacent small logical units.
+    """Remove duplicate packet work and cluster related logical units.
 
-    The merge target is intentionally below the model prompt budget. It removes
-    redundant same-file setup/context without turning the review back into a
-    whole-file prompt.
+    This is deliberately dependency-aware rather than file-aware. It can merge
+    multiple changed units when they are part of the same behavior, but it will
+    not combine unrelated functions simply because they are adjacent in one
+    large source file.
     """
 
     duplicate_count = 0
@@ -367,52 +417,16 @@ def dedupe_and_merge_review_chunks(
         deduped.append(annotate_chunk_context_ranges(dict(chunk)))
 
     target_chars = max(4_000, min(max_chars, MERGED_LOGICAL_PACKET_TARGET_CHARS))
-    merged: list[dict[str, Any]] = []
-    merge_events: list[dict[str, Any]] = []
-    current_batch: list[dict[str, Any]] = []
-
-    def flush_batch() -> None:
-        nonlocal current_batch
-        if not current_batch:
-            return
-        if len(current_batch) == 1:
-            merged.append(ensure_packet_creation_reason(current_batch[0]))
-            current_batch = []
-            return
-        packet = merge_chunk_batch(current_batch)
-        merge_events.append(
-            {
-                "path": packet.get("path"),
-                "merged_chunk_count": len(current_batch),
-                "merged_chunk_ids": [item.get("id") for item in current_batch],
-                "reason": packet.get("packet_creation_reason"),
-            }
-        )
-        merged.append(packet)
-        current_batch = []
-
-    for chunk in deduped:
-        if not is_mergeable_logical_chunk(chunk):
-            flush_batch()
-            merged.append(ensure_packet_creation_reason(chunk))
-            continue
-        if not current_batch:
-            current_batch = [chunk]
-            continue
-        candidate_chars = merged_diff_chars(current_batch) + len(str(chunk.get("diff") or ""))
-        if (
-            chunk.get("path") == current_batch[-1].get("path")
-            and chunk.get("status") == current_batch[-1].get("status")
-            and candidate_chars <= target_chars
-        ):
-            current_batch.append(chunk)
-            continue
-        flush_batch()
-        current_batch = [chunk]
-    flush_batch()
+    impact_graph = build_change_impact_graph(deduped)
+    merged, merge_events = dependency_aware_cluster_review_chunks(
+        deduped,
+        impact_graph,
+        max_chars=target_chars,
+    )
 
     reindex_chunks_by_path(merged)
     return merged, {
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "pre_dedupe_chunk_count": len(chunks),
         "post_dedupe_chunk_count": len(deduped),
         "post_merge_chunk_count": len(merged),
@@ -420,6 +434,411 @@ def dedupe_and_merge_review_chunks(
         "merged_packet_count": len(merge_events),
         "merge_events": merge_events[:100],
         "merge_target_chars": target_chars,
+        "impact_graph": summarize_impact_graph(impact_graph),
+        "packet_budget": {
+            "max_logical_units": PACKET_MAX_LOGICAL_UNITS,
+            "soft_diff_chars": PACKET_SOFT_DIFF_CHARS,
+            "hard_diff_chars": PACKET_HARD_DIFF_CHARS,
+            "soft_estimated_prompt_chars": PACKET_SOFT_ESTIMATED_PROMPT_CHARS,
+            "hard_context_range_count": PACKET_HARD_CONTEXT_RANGE_COUNT,
+        },
+        "coverage": build_packet_coverage_summary(deduped, merged),
+    }
+
+
+def build_change_impact_graph(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a bounded graph of changed logical units and direct dependencies."""
+
+    nodes = []
+    for index, chunk in enumerate(chunks):
+        nodes.append(
+            {
+                "index": index,
+                "id": str(chunk.get("id") or f"chunk-{index}"),
+                "path": str(chunk.get("path") or ""),
+                "status": str(chunk.get("status") or ""),
+                "strategy": str(chunk.get("chunk_strategy") or ""),
+                "unit": chunk_logical_unit_label(chunk),
+                "top_scope": chunk_top_scope(chunk),
+                "start_line": chunk_start_line(chunk),
+                "terms": sorted(chunk_terms_for_graph(chunk)),
+                "risk_terms": sorted(chunk_risk_terms(chunk)),
+            }
+        )
+
+    edges = []
+    for left_index, left in enumerate(nodes):
+        for right_index in range(left_index + 1, len(nodes)):
+            right = nodes[right_index]
+            edge = dependency_edge_between(left, right)
+            if edge is None:
+                continue
+            edges.append(
+                {
+                    "source": left["id"],
+                    "target": right["id"],
+                    "source_index": left_index,
+                    "target_index": right_index,
+                    **edge,
+                }
+            )
+    return {"nodes": nodes, "edges": edges}
+
+
+def dependency_edge_between(left: dict[str, Any], right: dict[str, Any]) -> dict[str, str] | None:
+    left_path = str(left.get("path") or "")
+    right_path = str(right.get("path") or "")
+    left_terms = set(left.get("terms") or [])
+    right_terms = set(right.get("terms") or [])
+    shared_terms = left_terms & right_terms
+    meaningful_shared_terms = meaningful_dependency_terms(shared_terms)
+    shared_risk_terms = set(left.get("risk_terms") or []) & set(right.get("risk_terms") or [])
+
+    if left_path == right_path and left.get("unit") == right.get("unit") and left.get("unit"):
+        return {"kind": "same_logical_unit", "strength": "strong", "reason": "same changed logical unit"}
+
+    if left_path == right_path and left.get("top_scope") and left.get("top_scope") == right.get("top_scope"):
+        return {"kind": "same_enclosing_scope", "strength": "strong", "reason": "same enclosing class or section"}
+
+    if left_path == right_path and shared_risk_terms:
+        return {
+            "kind": "shared_risk_path",
+            "strength": "medium",
+            "reason": "same file changes share connector-risk symbols",
+        }
+
+    if is_metadata_implementation_pair(left_path, right_path) and len(meaningful_shared_terms) >= 1:
+        return {
+            "kind": "metadata_implementation",
+            "strength": "strong",
+            "reason": "metadata object references implementation terms",
+        }
+
+    if is_test_source_pair(left_path, right_path) and len(meaningful_shared_terms) >= 1:
+        return {
+            "kind": "covered_by_test",
+            "strength": "medium",
+            "reason": "test change references source logical unit",
+        }
+
+    if is_view_template_pair(left_path, right_path) and len(meaningful_shared_terms) >= 1:
+        return {
+            "kind": "view_template",
+            "strength": "medium",
+            "reason": "view/template changes share rendering symbols",
+        }
+
+    if left_path == right_path and len(meaningful_shared_terms) >= 2 and line_distance(left, right) <= 120:
+        return {
+            "kind": "nearby_shared_symbols",
+            "strength": "medium",
+            "reason": "nearby changed units share symbols",
+        }
+
+    return None
+
+
+def dependency_aware_cluster_review_chunks(
+    chunks: list[dict[str, Any]],
+    impact_graph: dict[str, Any],
+    *,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    edges = impact_graph.get("edges") or []
+    components = connected_chunk_components(len(chunks), edges)
+    merged: list[dict[str, Any]] = []
+    merge_events: list[dict[str, Any]] = []
+
+    for component in components:
+        component_chunks = [chunks[index] for index in component]
+        batches = split_component_into_balanced_batches(
+            component_chunks,
+            max_chars=max_chars,
+        )
+        for batch in batches:
+            if len(batch) == 1:
+                single = ensure_packet_creation_reason(dict(batch[0]))
+                single.setdefault("packet_cluster_reason", "single logical unit or no direct dependency cluster")
+                single["source_chunk_ids"] = [str(batch[0].get("id") or "")]
+                single["packet_estimated_prompt_chars"] = estimate_packet_prompt_chars([single])
+                single["packet_logical_unit_count"] = 1
+                merged.append(single)
+                continue
+            packet_edges = edges_for_chunk_batch(edges, batch)
+            packet = merge_chunk_batch(
+                batch,
+                reason=(
+                    f"clustered {len(batch)} dependency-related logical units into a balanced packet "
+                    "without crossing packet budgets"
+                ),
+                impact_edges=packet_edges,
+            )
+            merge_events.append(
+                {
+                    "path": packet.get("path"),
+                    "paths": sorted({str(item.get("path") or "") for item in batch}),
+                    "merged_chunk_count": len(batch),
+                    "merged_chunk_ids": [item.get("id") for item in batch],
+                    "estimated_prompt_chars": packet.get("packet_estimated_prompt_chars"),
+                    "logical_unit_count": packet.get("packet_logical_unit_count"),
+                    "reason": packet.get("packet_creation_reason"),
+                    "impact_edge_count": len(packet_edges),
+                }
+            )
+            merged.append(packet)
+
+    return merged, merge_events
+
+
+def connected_chunk_components(total: int, edges: list[dict[str, Any]]) -> list[list[int]]:
+    parent = list(range(total))
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for edge in edges:
+        source = int(edge.get("source_index") or 0)
+        target = int(edge.get("target_index") or 0)
+        if 0 <= source < total and 0 <= target < total:
+            union(source, target)
+
+    grouped: dict[int, list[int]] = {}
+    for index in range(total):
+        grouped.setdefault(find(index), []).append(index)
+    return sorted((sorted(items) for items in grouped.values()), key=lambda items: items[0] if items else 0)
+
+
+def split_component_into_balanced_batches(
+    component_chunks: list[dict[str, Any]],
+    *,
+    max_chars: int,
+    max_units: int = PACKET_MAX_LOGICAL_UNITS,
+) -> list[list[dict[str, Any]]]:
+    if len(component_chunks) <= 1:
+        return [component_chunks]
+    ordered = sorted(component_chunks, key=chunk_sort_key)
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for chunk in ordered:
+        if not is_mergeable_logical_chunk(chunk):
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([chunk])
+            continue
+        if not current:
+            current = [chunk]
+            continue
+        candidate = current + [chunk]
+        if packet_fits_budget(candidate, max_chars=max_chars, max_units=max_units):
+            current = candidate
+            continue
+        batches.append(current)
+        current = [chunk]
+    if current:
+        batches.append(current)
+    return batches
+
+
+def packet_fits_budget(batch: list[dict[str, Any]], *, max_chars: int, max_units: int) -> bool:
+    if len(batch) > max_units:
+        return False
+    diff_chars = merged_diff_chars(batch)
+    if diff_chars > min(max_chars, PACKET_HARD_DIFF_CHARS):
+        return False
+    if diff_chars > PACKET_SOFT_DIFF_CHARS and len(batch) > 1:
+        return False
+    if packet_context_range_count(batch) > PACKET_HARD_CONTEXT_RANGE_COUNT:
+        return False
+    return estimate_packet_prompt_chars(batch) <= PACKET_SOFT_ESTIMATED_PROMPT_CHARS
+
+
+def chunk_sort_key(chunk: dict[str, Any]) -> tuple[str, int, str]:
+    return (str(chunk.get("path") or ""), chunk_start_line(chunk), str(chunk.get("id") or ""))
+
+
+def chunk_start_line(chunk: dict[str, Any]) -> int:
+    for key in (
+        "python_scope_start_line",
+        "logical_unit_start_line",
+    ):
+        value = chunk.get(key)
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    hunks = summarize_diff_hunks(str(chunk.get("diff") or ""))
+    if hunks:
+        return int(hunks[0].get("new_start") or hunks[0].get("old_start") or 0)
+    return 0
+
+
+def line_distance(left: dict[str, Any], right: dict[str, Any]) -> int:
+    left_line = int(left.get("start_line") or 0)
+    right_line = int(right.get("start_line") or 0)
+    if left_line <= 0 or right_line <= 0:
+        return 10_000
+    return abs(left_line - right_line)
+
+
+def chunk_logical_unit_label(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("python_scope") or chunk.get("logical_unit") or "")
+
+
+def chunk_top_scope(chunk: dict[str, Any]) -> str:
+    path = str(chunk.get("path") or "")
+    scope = str(chunk.get("python_scope") or "")
+    if scope and "." in scope:
+        return f"{path}:class:{scope.split('.', 1)[0]}"
+    logical = str(chunk.get("logical_unit") or "")
+    if logical and "." in logical:
+        return f"{path}:section:{logical.rsplit('.', 1)[0]}"
+    if logical.startswith(("identifier:", "action:")):
+        return f"{path}:action:{logical.split(':', 1)[1]}"
+    return ""
+
+
+def chunk_terms_for_graph(chunk: dict[str, Any]) -> set[str]:
+    terms = set(interesting_terms_from_diff(str(chunk.get("diff") or ""), str(chunk.get("path") or "")))
+    for value in (
+        chunk.get("python_scope"),
+        chunk.get("logical_unit"),
+        chunk.get("path"),
+    ):
+        terms.update(normalized_identifier_terms(str(value or "")))
+    return {term for term in terms if len(term) >= 3}
+
+
+def chunk_risk_terms(chunk: dict[str, Any]) -> set[str]:
+    text = f"{chunk.get('diff') or ''}\n{chunk.get('python_scope') or ''}\n{chunk.get('logical_unit') or ''}".lower()
+    output = set()
+    for term in RISKY_MODEL_TERMS:
+        normalized = term.strip().lower().rstrip(".(")
+        if normalized and normalized in text:
+            output.add(normalized)
+    return output
+
+
+def meaningful_dependency_terms(terms: set[str]) -> set[str]:
+    return {
+        term
+        for term in terms
+        if len(term) >= 4 and term not in BROAD_GRAPH_TERMS and not re.fullmatch(r"\d+", term)
+    }
+
+
+def normalized_identifier_terms(value: str) -> set[str]:
+    raw = re.split(r"[^A-Za-z0-9]+", value.replace("_", " "))
+    output = set()
+    for item in raw:
+        token = item.strip().lower()
+        if len(token) < 3:
+            continue
+        output.add(token)
+    return output
+
+
+def is_metadata_implementation_pair(left_path: str, right_path: str) -> bool:
+    paths = {left_path, right_path}
+    suffixes = {PurePosixPath(path).suffix.lower() for path in paths}
+    return ".json" in suffixes and any(path.endswith(".py") for path in paths)
+
+
+def is_test_source_pair(left_path: str, right_path: str) -> bool:
+    return is_test_path(left_path) != is_test_path(right_path) and (
+        left_path.endswith(".py") or right_path.endswith(".py")
+    )
+
+
+def is_view_template_pair(left_path: str, right_path: str) -> bool:
+    left_suffix = PurePosixPath(left_path).suffix.lower()
+    right_suffix = PurePosixPath(right_path).suffix.lower()
+    template_suffixes = {".html", ".xml", ".jinja", ".j2"}
+    return (
+        (left_suffix in template_suffixes and right_path.endswith(".py"))
+        or (right_suffix in template_suffixes and left_path.endswith(".py"))
+    )
+
+
+def estimate_packet_prompt_chars(batch: list[dict[str, Any]]) -> int:
+    diff_chars = merged_diff_chars(batch)
+    context_ranges = packet_context_range_count(batch)
+    related_context_allowance = 2_000 * min(4, len(batch))
+    scope_overhead = 600 * max(1, len(batch))
+    return diff_chars + (context_ranges * 450) + related_context_allowance + scope_overhead + 6_000
+
+
+def packet_context_range_count(batch: list[dict[str, Any]]) -> int:
+    count = 0
+    for chunk in batch:
+        count += len(chunk.get("context_ranges_head") or [])
+        count += len(chunk.get("context_ranges_base") or [])
+    return count
+
+
+def edges_for_chunk_batch(edges: list[dict[str, Any]], batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = {str(chunk.get("id") or "") for chunk in batch}
+    return [
+        edge
+        for edge in edges
+        if str(edge.get("source") or "") in ids and str(edge.get("target") or "") in ids
+    ]
+
+
+def summarize_impact_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    edges = graph.get("edges") or []
+    edge_kinds: dict[str, int] = {}
+    for edge in edges:
+        kind = str(edge.get("kind") or "unknown")
+        edge_kinds[kind] = edge_kinds.get(kind, 0) + 1
+    return {
+        "node_count": len(graph.get("nodes") or []),
+        "edge_count": len(edges),
+        "edge_kinds": edge_kinds,
+        "sample_edges": [
+            {
+                "source": edge.get("source"),
+                "target": edge.get("target"),
+                "kind": edge.get("kind"),
+                "reason": edge.get("reason"),
+            }
+            for edge in edges[:50]
+        ],
+    }
+
+
+def build_packet_coverage_summary(
+    original_chunks: list[dict[str, Any]],
+    packets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    covered_ids: set[str] = set()
+    for packet in packets:
+        merged_ids = packet.get("source_chunk_ids") or packet.get("merged_chunk_ids") or []
+        if merged_ids:
+            covered_ids.update(str(item) for item in merged_ids)
+        else:
+            covered_ids.add(str(packet.get("id") or ""))
+    original_ids = {str(chunk.get("id") or "") for chunk in original_chunks}
+    return {
+        "original_logical_unit_count": len(original_chunks),
+        "covered_logical_unit_count": len(original_ids & covered_ids),
+        "uncovered_logical_unit_ids": sorted(original_ids - covered_ids)[:100],
+        "packet_count": len(packets),
+        "max_packet_logical_units": max((int(packet.get("packet_logical_unit_count") or 1) for packet in packets), default=0),
+        "coverage_modes": {
+            "deep_ai_review_or_planned": len(packets),
+        },
     }
 
 
@@ -528,7 +947,12 @@ def describe_chunk_creation(chunk: dict[str, Any]) -> str:
     return "changed hunks with surrounding context"
 
 
-def merge_chunk_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+def merge_chunk_batch(
+    batch: list[dict[str, Any]],
+    *,
+    reason: str | None = None,
+    impact_edges: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     first = dict(batch[0])
     combined_diff = "\n\n".join(str(chunk.get("diff") or "").strip() for chunk in batch if str(chunk.get("diff") or "").strip())
     included_scopes = []
@@ -562,12 +986,21 @@ def merge_chunk_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
             "chunk_strategy": f"{strategy}_group" if not strategy.endswith("_group") else strategy,
             "merged_chunk_count": len(batch),
             "merged_chunk_ids": [chunk.get("id") for chunk in batch],
+            "source_chunk_ids": [str(chunk.get("id") or "") for chunk in batch],
             "included_scopes": included_scopes[:50],
             "context_ranges_head": dedupe_ranges(head_ranges),
             "context_ranges_base": dedupe_ranges(base_ranges),
+            "merged_child_chunks": [compact_child_chunk(chunk) for chunk in batch],
+            "packet_dependency_edges": compact_packet_edges(impact_edges or []),
+            "packet_estimated_prompt_chars": estimate_packet_prompt_chars(batch),
+            "packet_logical_unit_count": len(batch),
+            "packet_cluster_reason": reason or "dependency-aware logical unit cluster",
             "packet_creation_reason": (
-                f"merged {len(batch)} adjacent logical chunks in `{first.get('path')}` "
-                "to avoid duplicate model review context while preserving all changed hunks"
+                reason
+                or (
+                    f"merged {len(batch)} dependency-related logical chunks "
+                    "to avoid duplicate model review context while preserving all changed hunks"
+                )
             ),
         }
     )
@@ -581,6 +1014,49 @@ def merge_chunk_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         first["logical_unit_start_line"] = None
         first["logical_unit_end_line"] = None
     return first
+
+
+def compact_child_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "id",
+        "path",
+        "previous_path",
+        "status",
+        "additions",
+        "deletions",
+        "changes",
+        "file_type",
+        "chunk_strategy",
+        "context_strategy",
+        "changed_hunk_count",
+        "python_scope",
+        "python_scope_kind",
+        "python_scope_start_line",
+        "python_scope_end_line",
+        "logical_unit",
+        "logical_unit_kind",
+        "logical_unit_start_line",
+        "logical_unit_end_line",
+        "context_ranges_head",
+        "context_ranges_base",
+        "diff",
+        "diff_chars",
+    )
+    compact = {key: chunk.get(key) for key in keys if key in chunk}
+    compact["source_chunk_ids"] = [str(chunk.get("id") or "")]
+    return compact
+
+
+def compact_packet_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "kind": edge.get("kind"),
+            "reason": edge.get("reason"),
+        }
+        for edge in edges[:50]
+    ]
 
 
 def reindex_chunks_by_path(chunks: list[dict[str, Any]]) -> None:
@@ -1674,11 +2150,16 @@ def build_circuit_review_packet(
             "included_scopes": chunk.get("included_scopes") or [],
             "merged_chunk_count": chunk.get("merged_chunk_count"),
             "merged_chunk_ids": chunk.get("merged_chunk_ids") or [],
+            "source_chunk_ids": chunk.get("source_chunk_ids") or [],
+            "packet_logical_unit_count": chunk.get("packet_logical_unit_count"),
         },
         "planner": {
             "priority": chunk.get("model_review_priority"),
             "reason": chunk.get("model_review_reason"),
             "creation_reason": chunk.get("packet_creation_reason"),
+            "cluster_reason": chunk.get("packet_cluster_reason"),
+            "dependency_edges": chunk.get("packet_dependency_edges") or [],
+            "estimated_prompt_chars": chunk.get("packet_estimated_prompt_chars"),
             "diff_chars_before_packet": len(diff),
             "diff_truncated_for_packet": len(diff) > CIRCUIT_PACKET_DIFF_CHARS,
             "context_ranges_head": head_ranges[:20],
@@ -1909,6 +2390,15 @@ def build_semantic_context_for_packet(
             )
         )
 
+    identifier_provenance = build_identifier_provenance_context(
+        files,
+        primary_path=primary_path,
+        primary_text=primary_text,
+        chunk=chunk,
+        diff=diff,
+        referenced_symbols=symbols,
+    )
+
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[str, str, int | None]] = set()
     total_chars = 0
@@ -1927,14 +2417,484 @@ def build_semantic_context_for_packet(
         copied["excerpt"] = excerpt
         deduped.append(copied)
 
-    if not symbols and not deduped:
+    if not symbols and not deduped and not identifier_provenance:
         return {}
-    return {
+    context = {
         "strategy": "static_symbol_expansion_from_changed_code",
         "referenced_symbols": symbols,
         "snippet_count": len(deduped),
         "snippets": deduped,
     }
+    if identifier_provenance:
+        context["identifier_provenance"] = identifier_provenance
+    return context
+
+
+def build_identifier_provenance_context(
+    files: dict[str, str],
+    *,
+    primary_path: str,
+    primary_text: str,
+    chunk: dict[str, Any],
+    diff: str,
+    referenced_symbols: list[str],
+) -> dict[str, Any]:
+    identifiers = extract_important_identifiers(diff, referenced_symbols, chunk)
+    if not identifiers:
+        return {}
+
+    try:
+        tree = ast.parse(primary_text)
+    except SyntaxError:
+        return {
+            "strategy": "identifier_provenance_unavailable",
+            "reason": "primary Python file could not be parsed",
+            "tracked_identifier_names": identifiers[:IDENTIFIER_PROVENANCE_MAX_IDENTIFIERS],
+            "evidence_rule": (
+                "Repository examples are observations only; do not infer identifier formats "
+                "without an assignment or runtime evidence chain."
+            ),
+        }
+
+    scope_node = find_ast_scope_node_for_chunk(tree, chunk)
+    tracked = []
+    for identifier in identifiers[:IDENTIFIER_PROVENANCE_MAX_IDENTIFIERS]:
+        role = classify_identifier_role(identifier)
+        trace = trace_identifier_assignments(scope_node or tree, identifier, primary_text)
+        references = identifier_reference_lines(scope_node or tree, identifier)
+        confidence, reason = provenance_confidence(trace, references)
+        tracked.append(
+            {
+                "name": identifier,
+                "role": role["role"],
+                "role_reason": role["reason"],
+                "assignment_trace": trace[:IDENTIFIER_PROVENANCE_MAX_STEPS],
+                "reference_lines": references[:IDENTIFIER_PROVENANCE_MAX_STEPS],
+                "provenance_confidence": confidence,
+                "confidence_reason": reason,
+                "review_guidance": (
+                    "Do not infer this identifier's expected format from another identifier role "
+                    "unless the assignment trace or runtime evidence explicitly connects them."
+                ),
+            }
+        )
+
+    observations = repository_identifier_observations(
+        files,
+        primary_path=primary_path,
+        tracked_identifiers=tracked,
+    )
+    return {
+        "strategy": "bounded_python_identifier_provenance",
+        "tracked_identifiers": tracked,
+        "repository_identifier_observations": observations,
+        "evidence_rules": [
+            "Separate observed repository examples from runtime conclusions.",
+            "Application IDs, asset IDs, connector IDs, action IDs, user IDs, OAuth states, and tokens are distinct unless code connects them.",
+            "A UUID/GUID literal elsewhere in the repository is not proof that a reviewed variable accepts UUID/GUID values.",
+            "Publish an identifier-format or validation finding only when source, sink, expected value, and failure path are connected.",
+        ],
+    }
+
+
+def extract_important_identifiers(
+    diff: str,
+    referenced_symbols: list[str],
+    chunk: dict[str, Any],
+) -> list[str]:
+    ignored = {
+        "self",
+        "cls",
+        "none",
+        "true",
+        "false",
+        "return",
+        "import",
+        "from",
+        "class",
+        "def",
+        "with",
+        "data",
+        "result",
+        "response",
+        "action_result",
+        "phantom",
+    }
+    candidates: list[str] = []
+    changed_text_lines = []
+    for raw_line in diff.splitlines():
+        if raw_line.startswith(("+++", "---", "@@")):
+            continue
+        if raw_line.startswith(("+", "-")):
+            changed_text_lines.append(raw_line[1:])
+        elif raw_line.startswith(" "):
+            changed_text_lines.append(raw_line[1:])
+    changed_text = "\n".join(changed_text_lines)
+
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(r"\bself\.([A-Za-z_][A-Za-z0-9_]*)\b", changed_text)
+    )
+    candidates.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", changed_text))
+    candidates.extend(referenced_symbols)
+    for value in (
+        chunk.get("python_scope"),
+        chunk.get("logical_unit"),
+    ):
+        if value:
+            candidates.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", str(value)))
+
+    scored: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        name = candidate.strip()
+        lowered = name.lower()
+        if not name or lowered in ignored or name.startswith("__") or len(name) < 3:
+            continue
+        if lowered in seen:
+            continue
+        role = classify_identifier_role(name)["role"]
+        score = 0
+        if role != "generic_identifier":
+            score += 100
+        if re.search(r"(?:^|_)(id|uuid|guid|token|state|secret|key|config|param|user|tenant|client|asset|app|connector|action)(?:_|$)", lowered):
+            score += 40
+        if re.search(rf"\b{re.escape(name)}\s*=", changed_text):
+            score += 20
+        if name in referenced_symbols:
+            score += 10
+        if score <= 0:
+            continue
+        seen.add(lowered)
+        scored.append((-score, name))
+
+    return [name for _, name in sorted(scored)[:IDENTIFIER_PROVENANCE_MAX_IDENTIFIERS]]
+
+
+def classify_identifier_role(name: str) -> dict[str, str]:
+    lowered = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    compact = lowered.replace("_", "")
+    tokens = {token for token in lowered.split("_") if token}
+
+    if compact in {"assetid", "assetuuid", "assetguid"} or ("asset" in tokens and ("id" in tokens or "uuid" in tokens or "guid" in tokens)):
+        return {"role": "asset_id", "reason": "identifier name contains asset plus id/uuid/guid"}
+    if compact in {"appid", "applicationid", "applicationuuid", "applicationguid"} or (
+        ("app" in tokens or "application" in tokens) and ("id" in tokens or "uuid" in tokens or "guid" in tokens)
+    ):
+        return {"role": "application_id", "reason": "identifier name contains app/application plus id/uuid/guid"}
+    if "connector" in tokens and ("id" in tokens or "uuid" in tokens or "guid" in tokens):
+        return {"role": "connector_id", "reason": "identifier name contains connector plus id/uuid/guid"}
+    if "action" in tokens and ("id" in tokens or "identifier" in tokens):
+        return {"role": "action_id", "reason": "identifier name contains action plus id/identifier"}
+    if "tenant" in tokens and ("id" in tokens or "uuid" in tokens or "guid" in tokens):
+        return {"role": "tenant_id", "reason": "identifier name contains tenant plus id/uuid/guid"}
+    if "user" in tokens and ("id" in tokens or "uuid" in tokens or "guid" in tokens):
+        return {"role": "user_id", "reason": "identifier name contains user plus id/uuid/guid"}
+    if compact == "clientid" or ("client" in tokens and "id" in tokens):
+        return {"role": "oauth_client_id", "reason": "identifier name contains client plus id"}
+    if "token" in tokens or compact.endswith("token"):
+        return {"role": "token", "reason": "identifier name contains token"}
+    if "secret" in tokens or compact.endswith("secret"):
+        return {"role": "secret", "reason": "identifier name contains secret"}
+    if "state" in tokens or compact.endswith("state"):
+        return {"role": "state", "reason": "identifier name contains state"}
+    if "config" in tokens or compact.endswith("config"):
+        return {"role": "configuration", "reason": "identifier name contains config"}
+    if "uuid" in tokens or "guid" in tokens or compact.endswith(("uuid", "guid")):
+        return {"role": "guid_or_uuid", "reason": "identifier name contains uuid/guid"}
+    if lowered.endswith("_id") or compact.endswith("id"):
+        return {"role": "generic_id", "reason": "identifier name ends with id but no domain-specific prefix was found"}
+    return {"role": "generic_identifier", "reason": "no high-signal identifier role detected"}
+
+
+def find_ast_scope_node_for_chunk(tree: ast.AST, chunk: dict[str, Any]) -> ast.AST | None:
+    scope_name = str(chunk.get("python_scope") or "")
+    start = int(chunk.get("python_scope_start_line") or 0)
+    end = int(chunk.get("python_scope_end_line") or 0)
+    candidates: list[tuple[int, ast.AST]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        node_start = int(getattr(node, "lineno", 0) or 0)
+        node_end = int(getattr(node, "end_lineno", node_start) or node_start)
+        name = ast_qualified_name(tree, node)
+        if scope_name and (name == scope_name or name.endswith(f".{scope_name}") or scope_name.endswith(f".{node.name}")):
+            candidates.append((0, node))
+            continue
+        if start and end and node_start <= start <= node_end:
+            candidates.append((node_end - node_start, node))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: item[0])[0][1]
+
+
+def ast_qualified_name(tree: ast.AST, target: ast.AST) -> str:
+    names: list[str] = []
+
+    def walk_body(body: list[ast.stmt], prefix: list[str]) -> bool:
+        for node in body:
+            if node is target and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.extend(prefix + [node.name])
+                return True
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if walk_body(list(getattr(node, "body", []) or []), prefix + [node.name]):
+                    return True
+        return False
+
+    walk_body(list(getattr(tree, "body", []) or []), [])
+    return ".".join(names)
+
+
+def trace_identifier_assignments(
+    scope_node: ast.AST,
+    identifier: str,
+    source: str,
+    *,
+    _visited: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    visited = set(_visited or set())
+    if identifier in visited:
+        return []
+    visited.add(identifier)
+    lines = source.splitlines()
+    trace: list[dict[str, Any]] = []
+    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for arg in list(scope_node.args.args) + list(scope_node.args.kwonlyargs):
+            if arg.arg == identifier:
+                trace.append(
+                    {
+                        "line": int(getattr(arg, "lineno", getattr(scope_node, "lineno", 0)) or 0),
+                        "target": identifier,
+                        "value": "function parameter",
+                        "origin": "function_parameter",
+                        "observation": f"`{identifier}` enters this scope as a function parameter.",
+                    }
+                )
+        if scope_node.args.vararg and scope_node.args.vararg.arg == identifier:
+            trace.append(
+                {
+                    "line": int(getattr(scope_node.args.vararg, "lineno", getattr(scope_node, "lineno", 0)) or 0),
+                    "target": identifier,
+                    "value": "*args parameter",
+                    "origin": "function_parameter",
+                    "observation": f"`{identifier}` enters this scope through *args.",
+                }
+            )
+        if scope_node.args.kwarg and scope_node.args.kwarg.arg == identifier:
+            trace.append(
+                {
+                    "line": int(getattr(scope_node.args.kwarg, "lineno", getattr(scope_node, "lineno", 0)) or 0),
+                    "target": identifier,
+                    "value": "**kwargs parameter",
+                    "origin": "function_parameter",
+                    "observation": f"`{identifier}` enters this scope through **kwargs.",
+                }
+            )
+
+    for node in ast.walk(scope_node):
+        value_node: ast.AST | None = None
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            value_node = node.value
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            value_node = node.value
+            targets = [node.target]
+        elif isinstance(node, ast.AugAssign):
+            value_node = node.value
+            targets = [node.target]
+        elif isinstance(node, ast.NamedExpr):
+            value_node = node.value
+            targets = [node.target]
+        if value_node is None:
+            continue
+        for target in targets:
+            if not ast_target_matches_identifier(target, identifier):
+                continue
+            value_text = ast_unparse_safe(value_node)
+            line_no = int(getattr(node, "lineno", 0) or 0)
+            trace.append(
+                {
+                    "line": line_no,
+                    "target": ast_unparse_safe(target),
+                    "value": truncate_text(value_text, 220),
+                    "origin": classify_assignment_origin(value_text),
+                    "observation": source_line_observation(lines, line_no),
+                }
+            )
+            alias = direct_alias_identifier(value_node)
+            if alias and alias != identifier:
+                alias_trace = [
+                    item
+                    for item in trace_identifier_assignments(scope_node, alias, source, _visited=visited)
+                    if int(item.get("line") or 0) <= line_no
+                ]
+                for item in alias_trace[:2]:
+                    copied = dict(item)
+                    copied["via_alias"] = alias
+                    trace.append(copied)
+            if len(trace) >= IDENTIFIER_PROVENANCE_MAX_STEPS:
+                return dedupe_assignment_trace(trace)
+    return dedupe_assignment_trace(trace)
+
+
+def ast_target_matches_identifier(target: ast.AST, identifier: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == identifier
+    if isinstance(target, ast.Attribute):
+        return target.attr == identifier
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(ast_target_matches_identifier(item, identifier) for item in target.elts)
+    if isinstance(target, ast.Subscript):
+        return identifier in ast_unparse_safe(target)
+    return False
+
+
+def ast_unparse_safe(node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:  # pragma: no cover - ast.unparse is best-effort context only
+        return node.__class__.__name__
+
+
+def classify_assignment_origin(value_text: str) -> str:
+    lowered = value_text.lower()
+    if any(term in lowered for term in ("request.", "request[", ".args", ".get(", "get_param", "params.", "param.")):
+        return "request_or_action_parameter"
+    if any(term in lowered for term in ("get_config", "asset_config", "config.", "self._config", "self.get_config")):
+        return "asset_configuration"
+    if any(term in lowered for term in ("load_state", "save_state", "self._state", "state.")):
+        return "connector_state"
+    if any(term in lowered for term in ("response.json", "resp.json", "response[", "resp[", ".json()")):
+        return "api_response"
+    if any(term in lowered for term in ("os.environ", "getenv", "environ[")):
+        return "environment"
+    if UUID_LITERAL_PATTERN.search(value_text):
+        return "uuid_literal"
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$", value_text.strip()):
+        return "alias_or_attribute"
+    if "(" in value_text and ")" in value_text:
+        return "function_call"
+    return "expression"
+
+
+def direct_alias_identifier(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def source_line_observation(lines: list[str], line_no: int) -> str:
+    if line_no <= 0 or line_no > len(lines):
+        return ""
+    return truncate_text(lines[line_no - 1].strip(), 220)
+
+
+def identifier_reference_lines(scope_node: ast.AST, identifier: str) -> list[dict[str, Any]]:
+    references = []
+    for node in ast.walk(scope_node):
+        matched = False
+        if isinstance(node, ast.Name) and node.id == identifier:
+            matched = True
+        elif isinstance(node, ast.Attribute) and node.attr == identifier:
+            matched = True
+        if not matched:
+            continue
+        line_no = int(getattr(node, "lineno", 0) or 0)
+        if line_no <= 0:
+            continue
+        references.append({"line": line_no, "kind": node.__class__.__name__})
+    output = []
+    seen: set[int] = set()
+    for item in sorted(references, key=lambda value: int(value.get("line") or 0)):
+        line = int(item.get("line") or 0)
+        if line in seen:
+            continue
+        seen.add(line)
+        output.append(item)
+    return output
+
+
+def provenance_confidence(trace: list[dict[str, Any]], references: list[dict[str, Any]]) -> tuple[str, str]:
+    if any(item.get("origin") in {"function_parameter", "request_or_action_parameter", "asset_configuration", "connector_state", "api_response"} for item in trace):
+        return "high", "runtime source or assignment is visible in the reviewed scope"
+    if trace:
+        return "medium", "assignment is visible, but runtime source is indirect"
+    if references:
+        return "medium", "identifier is referenced but its assignment is outside the reviewed scope"
+    return "low", "identifier was inferred from text only and has no visible runtime trace"
+
+
+def dedupe_assignment_trace(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    seen: set[tuple[int, str, str]] = set()
+    for item in sorted(trace, key=lambda value: int(value.get("line") or 0)):
+        key = (int(item.get("line") or 0), str(item.get("target") or ""), str(item.get("value") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output[:IDENTIFIER_PROVENANCE_MAX_STEPS]
+
+
+def repository_identifier_observations(
+    files: dict[str, str],
+    *,
+    primary_path: str,
+    tracked_identifiers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    tracked_names = {str(item.get("name") or "").lower() for item in tracked_identifiers}
+    tracked_roles = {str(item.get("role") or "") for item in tracked_identifiers}
+    observations: list[dict[str, Any]] = []
+    for path, text in files.items():
+        if not text or path == primary_path:
+            continue
+        if PurePosixPath(path).suffix.lower() not in {".json", ".py", ".toml", ".yml", ".yaml", ".xml"}:
+            continue
+        for line_no, line in iter_lines(text):
+            if len(observations) >= IDENTIFIER_PROVENANCE_MAX_REPO_OBSERVATIONS:
+                return observations
+            if not (UUID_LITERAL_PATTERN.search(line) or any(name and name in line.lower() for name in tracked_names)):
+                continue
+            for name in identifier_like_names_in_line(line):
+                role = classify_identifier_role(name)
+                if role["role"] == "generic_identifier":
+                    continue
+                connected = name.lower() in tracked_names or role["role"] in tracked_roles
+                observations.append(
+                    {
+                        "path": path,
+                        "line": line_no,
+                        "identifier": name,
+                        "role": role["role"],
+                        "value_excerpt": truncate_text(line.strip(), 220),
+                        "connected_to_tracked_identifier": connected,
+                        "evidence_type": "repository_observation_not_runtime_proof" if not connected else "same_identifier_role_observation",
+                    }
+                )
+                if len(observations) >= IDENTIFIER_PROVENANCE_MAX_REPO_OBSERVATIONS:
+                    return observations
+    return observations
+
+
+def identifier_like_names_in_line(line: str) -> list[str]:
+    names: list[str] = []
+    names.extend(re.findall(r'"([^"]*(?:id|ID|uuid|UUID|guid|GUID|token|Token|state|State|key|Key)[^"]*)"\s*:', line))
+    names.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:id|ID|uuid|UUID|guid|GUID|token|Token|state|State|key|Key)[A-Za-z0-9_]*)\b", line))
+    output: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        cleaned = name.strip()
+        lowered = cleaned.lower()
+        if not cleaned or lowered in seen:
+            continue
+        seen.add(lowered)
+        output.append(cleaned)
+    return output
 
 
 def extract_python_referenced_symbols(diff: str) -> list[str]:
@@ -2403,6 +3363,47 @@ def split_chunk_for_adaptive_retry(
     max_chars: int = 18_000,
     context_char_limit: int = 30_000,
 ) -> list[dict[str, Any]]:
+    semantic_children = [
+        dict(item)
+        for item in (chunk.get("merged_child_chunks") or [])
+        if isinstance(item, dict) and str(item.get("diff") or "").strip()
+    ]
+    if len(semantic_children) > 1:
+        semantic_groups = split_semantic_children_for_adaptive_retry(
+            semantic_children,
+            max_chars=max_chars,
+        )
+        if len(semantic_groups) > 1:
+            parent_id = str(chunk.get("id") or chunk.get("path") or "chunk")
+            output: list[dict[str, Any]] = []
+            total = len(semantic_groups)
+            for index, group in enumerate(semantic_groups, start=1):
+                if len(group) == 1:
+                    child = dict(group[0])
+                    child.setdefault("packet_creation_reason", describe_chunk_creation(child))
+                else:
+                    child = merge_chunk_batch(
+                        group,
+                        reason=(
+                            "semantic adaptive split of a timeout-risk packet; "
+                            "keeps dependency-related child units together"
+                        ),
+                    )
+                child.update(
+                    {
+                        "id": f"{parent_id}:retry-{index}",
+                        "parent_chunk_id": parent_id,
+                        "adaptive_retry": True,
+                        "chunk_index": index,
+                        "chunk_total": total,
+                        "context_char_limit": context_char_limit,
+                        "model_review_priority": chunk.get("model_review_priority"),
+                        "model_review_reason": chunk.get("model_review_reason"),
+                    }
+                )
+                output.append(child)
+            return output
+
     diff = str(chunk.get("diff") or "")
     if not diff or len(diff) <= max_chars:
         return []
@@ -2436,6 +3437,33 @@ def split_chunk_for_adaptive_retry(
         )
         output.append(child)
     return output
+
+
+def split_semantic_children_for_adaptive_retry(
+    children: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> list[list[dict[str, Any]]]:
+    ordered = sorted(children, key=chunk_sort_key)
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for child in ordered:
+        if not current:
+            current = [child]
+            continue
+        candidate = current + [child]
+        if packet_fits_budget(
+            candidate,
+            max_chars=max(2_000, min(max_chars, ADAPTIVE_SEMANTIC_HARD_DIFF_CHARS)),
+            max_units=ADAPTIVE_PACKET_MAX_LOGICAL_UNITS,
+        ):
+            current = candidate
+            continue
+        groups.append(current)
+        current = [child]
+    if current:
+        groups.append(current)
+    return groups
 
 
 def is_related_view_context_file(path: str, primary_path: str) -> bool:
