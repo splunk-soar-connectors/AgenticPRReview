@@ -121,8 +121,8 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
 
-      - name: Restore review checkpoint cache
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57
+      - name: Restore and save review checkpoint cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
         with:
           path: AgenticPRReview/runs/
           key: pr-review-checkpoint-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -190,13 +190,6 @@ jobs:
           name: pr-review-${{ inputs.pr_number }}
           path: AgenticPRReview/runs/
           if-no-files-found: ignore
-
-      - name: Save review checkpoint cache
-        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57
-        if: always()
-        with:
-          path: AgenticPRReview/runs/
-          key: pr-review-checkpoint-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
 
 # This workflow intentionally does not pass --enable-sdk-manifest. It may run
 # from pull_request_target callers with repository secrets, so it must not
