@@ -16,6 +16,35 @@ TEXT_SUFFIXES = {".md", ".rst"}
 TEXT_CATEGORIES = {"docs_pr_accuracy", "precommit", "merge_conflict", "ci_synthesis"}
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 MARKER_PREFIX = "<!-- agentic-pr-review:"
+INLINE_PUBLICATION_DESTINATIONS = {"inline_blocking", "inline_non_blocking"}
+SUMMARY_PUBLICATION_DESTINATIONS = {"summary_high_priority", "summary_observation"}
+VALID_FINDING_CATEGORIES = {
+    "introduced_bug",
+    "introduced_regression",
+    "exposed_existing_bug",
+    "security_issue",
+    "pre_existing_issue",
+    "design_observation",
+    "maintainability_suggestion",
+    "repository_policy_suggestion",
+    "release_management_suggestion",
+    "insufficient_evidence",
+}
+VALID_CAUSALITIES = {
+    "introduced_by_pr",
+    "worsened_by_pr",
+    "exposed_by_pr",
+    "pre_existing_unrelated",
+    "unknown",
+}
+VALID_PUBLICATION_DESTINATIONS = {
+    "inline_blocking",
+    "inline_non_blocking",
+    "summary_high_priority",
+    "summary_observation",
+    "artifact_only",
+    "suppress",
+}
 GENERIC_CI_FIXES = (
     "resolve the pre-commit failure",
     "resolve the precommit failure",
@@ -86,7 +115,11 @@ def build_comment_plan(
             "publish_blocked_reason": "review_output.safe_to_publish is false",
         }
 
-    findings = findings_for_comments(review_output)
+    findings = [
+        calibrate_finding_for_publication(finding, review_input)
+        for finding in findings_for_comments(review_output)
+        if isinstance(finding, dict)
+    ]
     findings = [
         finding
         for finding in findings
@@ -94,6 +127,26 @@ def build_comment_plan(
     ]
     findings = group_related_findings_for_comments(findings)
     findings.sort(key=lambda item: SEVERITY_ORDER.get(str(item.get("severity", "medium")), 2))
+    summary_high_priority = [
+        comment_summary_item(finding)
+        for finding in findings
+        if str(finding.get("publication_destination") or "") == "summary_high_priority"
+    ]
+    summary_observations = [
+        comment_summary_item(finding)
+        for finding in findings
+        if str(finding.get("publication_destination") or "") == "summary_observation"
+    ]
+    artifact_only = [
+        comment_summary_item(finding)
+        for finding in findings
+        if str(finding.get("publication_destination") or "") == "artifact_only"
+    ]
+    findings = [
+        finding
+        for finding in findings
+        if str(finding.get("publication_destination") or "") in INLINE_PUBLICATION_DESTINATIONS
+    ]
     if max_comments is not None and max_comments > 0:
         findings = findings[:max_comments]
     diff_index = build_diff_index(review_input.get("changed_files", []))
@@ -114,6 +167,15 @@ def build_comment_plan(
         "pr_number": (review_input.get("pr") or {}).get("number"),
         "head_sha": ((review_input.get("pr") or {}).get("head") or {}).get("sha"),
         "comments": comments,
+        "summary_high_priority": summary_high_priority,
+        "summary_observations": summary_observations,
+        "artifact_only_count": len(artifact_only),
+        "publication_calibration": {
+            "inline_comment_count": len(comments),
+            "summary_high_priority_count": len(summary_high_priority),
+            "summary_observation_count": len(summary_observations),
+            "artifact_only_count": len(artifact_only),
+        },
     }
 
 
@@ -122,6 +184,7 @@ def filter_review_output_for_pr_context(review_output: dict[str, Any], review_in
     findings = []
     suppressed: list[dict[str, Any]] = []
     for finding in original_findings:
+        finding = calibrate_finding_for_publication(finding, review_input)
         reason = finding_context_filter_reason(finding, review_input)
         if reason:
             suppressed.append(
@@ -181,6 +244,409 @@ def findings_for_comments(review_output: dict[str, Any]) -> list[dict[str, Any]]
     return findings
 
 
+def calibrate_finding_for_publication(finding: dict[str, Any], review_input: dict[str, Any]) -> dict[str, Any]:
+    calibrated = dict(finding)
+    text = all_comment_finding_text(calibrated)
+    changed_relation = changed_relation_for_finding(calibrated, review_input)
+    if (
+        changed_relation == "unchanged_file_context"
+        and str(calibrated.get("category") or "") == "docs_pr_accuracy"
+        and can_infer_changed_anchor(calibrated, review_input)
+    ):
+        changed_relation = "inferable_changed_anchor"
+    causality = normalize_causality(calibrated.get("causality"))
+    if causality == "unknown":
+        causality = infer_causality(calibrated, changed_relation=changed_relation, text=text)
+    finding_category = normalize_finding_category(
+        calibrated.get("finding_category")
+        or calibrated.get("defect_category")
+        or calibrated.get("category")
+    )
+    if not finding_category:
+        finding_category = infer_publication_finding_category(calibrated, causality=causality, text=text)
+    merge_blocking = infer_merge_blocking(calibrated, finding_category=finding_category, causality=causality, text=text)
+    root_cause = str(calibrated.get("root_cause") or infer_root_cause(calibrated, text=text)).strip()
+    destination = normalize_publication_destination(calibrated.get("publication_destination"))
+    if not destination:
+        destination = infer_publication_destination(
+            calibrated,
+            finding_category=finding_category,
+            causality=causality,
+            merge_blocking=merge_blocking,
+            root_cause=root_cause,
+            changed_relation=changed_relation,
+            text=text,
+        )
+
+    calibrated.update(
+        {
+            "finding_category": finding_category,
+            "causality": causality,
+            "publication_destination": destination,
+            "merge_blocking": merge_blocking,
+            "root_cause": root_cause or None,
+            "changed_relation": changed_relation,
+            "calibration": {
+                "changed_relation": changed_relation,
+                "concern_domains": sorted(concern_domains_for_text(text)),
+                "has_concrete_failure_scenario": has_concrete_failure_scenario(calibrated, text=text),
+                "multi_concern": is_multi_concern_finding(calibrated, text=text),
+                "broad_architectural_observation": is_broad_architectural_observation(calibrated, text=text),
+            },
+        }
+    )
+    return calibrated
+
+
+def normalize_finding_category(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text in VALID_FINDING_CATEGORIES else ""
+
+
+def normalize_causality(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text in VALID_CAUSALITIES else "unknown"
+
+
+def normalize_publication_destination(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text in VALID_PUBLICATION_DESTINATIONS else ""
+
+
+def changed_relation_for_finding(finding: dict[str, Any], review_input: dict[str, Any]) -> str:
+    path = str(finding.get("file") or "").strip()
+    if not path:
+        return "no_file"
+    changed = {
+        str(item.get("filename")): item
+        for item in review_input.get("changed_files", [])
+        if isinstance(item, dict) and item.get("filename")
+    }
+    file_info = changed.get(path)
+    if not file_info:
+        return "unchanged_file_context"
+    status = str(file_info.get("status") or "")
+    if status == "added":
+        return "added_file"
+    if status == "removed":
+        return "removed_file"
+    line = normalize_line(finding.get("line_start", finding.get("line")))
+    patch = str(file_info.get("patch") or "")
+    if line is None:
+        return "changed_file_no_line"
+    entries = parse_right_side_diff_entries(patch)
+    for entry in entries:
+        if int(entry.get("line") or 0) == line:
+            return "added_changed_line" if entry.get("kind") == "added" else "context_line_in_changed_hunk"
+    if file_info.get("deep_patch_reconstructed"):
+        return "changed_file_deep_patch"
+    return "line_outside_changed_hunk"
+
+
+def infer_causality(finding: dict[str, Any], *, changed_relation: str, text: str) -> str:
+    category = str(finding.get("category") or "")
+    if category in {"precommit", "merge_conflict"}:
+        return "exposed_by_pr"
+    if changed_relation in {"added_file", "removed_file", "added_changed_line", "inferable_changed_anchor"}:
+        return "introduced_by_pr"
+    if any(term in text for term in ("removed", "dropped", "no longer", "now fails", "now validates", "changed from", "regression")):
+        return "introduced_by_pr"
+    if changed_relation in {"context_line_in_changed_hunk", "changed_file_no_line", "changed_file_deep_patch"}:
+        return "exposed_by_pr"
+    if changed_relation in {"unchanged_file_context", "line_outside_changed_hunk"}:
+        return "pre_existing_unrelated"
+    return "unknown"
+
+
+def infer_publication_finding_category(finding: dict[str, Any], *, causality: str, text: str) -> str:
+    category = str(finding.get("category") or "")
+    if category in VALID_FINDING_CATEGORIES:
+        return category
+    if any(term in text for term in ("pudb.set_trace", "breakpoint(", "interactive debugger", "set_trace()")):
+        return "introduced_bug"
+    if category == "unsafe_logging" or any(term in text for term in ("leaked token", "exposed token", "credential", "authorization header", "verify=false")):
+        return "security_issue"
+    if category in {"precommit", "merge_conflict"}:
+        return "introduced_bug"
+    if any(term in text for term in ("app_version", "version bump", "release note", "release_notes", "unreleased.md")):
+        return "release_management_suggestion"
+    if category in {"docs_pr_accuracy", "missing_tests"}:
+        return "repository_policy_suggestion"
+    if is_broad_architectural_observation(finding, text=text):
+        return "design_observation"
+    if causality == "pre_existing_unrelated":
+        return "pre_existing_issue"
+    if causality == "exposed_by_pr":
+        return "exposed_existing_bug"
+    if category in {"polling_checkpoint", "output_schema_mismatch", "api_auth_correctness", "pagination", "validation", "soar_metadata"}:
+        return "introduced_regression"
+    if any(term in text for term in ("may be", "might", "unclear", "verify whether", "verify that", "confirm whether", "confirm that")):
+        return "insufficient_evidence"
+    return "introduced_bug"
+
+
+def infer_merge_blocking(
+    finding: dict[str, Any],
+    *,
+    finding_category: str,
+    causality: str,
+    text: str,
+) -> bool:
+    severity = str(finding.get("severity") or "medium").lower()
+    category = str(finding.get("category") or "")
+    if isinstance(finding.get("merge_blocking"), bool):
+        return bool(finding["merge_blocking"])
+    if category in {"precommit", "merge_conflict"}:
+        return True
+    if finding_category == "security_issue" and severity in {"critical", "high"}:
+        return True
+    if any(term in text for term in ("pudb.set_trace", "breakpoint(", "interactive debugger", "syntaxerror", "importerror", "unboundlocalerror")):
+        return True
+    if any(term in text for term in ("credential", "secret", "token")) and any(term in text for term in ("log", "expose", "leak")):
+        return True
+    if severity == "critical" and causality in {"introduced_by_pr", "worsened_by_pr", "exposed_by_pr"}:
+        return True
+    return False
+
+
+def infer_root_cause(finding: dict[str, Any], *, text: str) -> str:
+    domains = concern_domains_for_text(text)
+    if len(domains) == 1:
+        return next(iter(domains))
+    title = str(finding.get("title") or "").strip()
+    return title[:120]
+
+
+def infer_publication_destination(
+    finding: dict[str, Any],
+    *,
+    finding_category: str,
+    causality: str,
+    merge_blocking: bool,
+    root_cause: str,
+    changed_relation: str,
+    text: str,
+) -> str:
+    if finding_category == "insufficient_evidence":
+        return "suppress"
+    if causality == "pre_existing_unrelated":
+        return "artifact_only"
+    if is_multi_concern_finding(finding, text=text):
+        return "summary_high_priority" if has_concrete_failure_scenario(finding, text=text) else "summary_observation"
+    if finding_category in {"design_observation", "maintainability_suggestion"}:
+        return "summary_observation"
+    if finding_category in {"repository_policy_suggestion", "release_management_suggestion"}:
+        if explicit_repository_rule_present(finding, text=text):
+            return "summary_high_priority"
+        if finding_category == "repository_policy_suggestion" and str(finding.get("category") or "") in {
+            "docs_pr_accuracy",
+            "missing_tests",
+        } and changed_relation in {
+            "added_file",
+            "removed_file",
+            "added_changed_line",
+            "context_line_in_changed_hunk",
+            "inferable_changed_anchor",
+        }:
+            return "inline_non_blocking"
+        return "artifact_only"
+    if causality == "unknown" and changed_relation not in {"added_file", "removed_file", "added_changed_line"}:
+        return "artifact_only"
+    if not has_concrete_failure_scenario(finding, text=text) and not has_changed_line_concrete_evidence(
+        finding,
+        changed_relation=changed_relation,
+        text=text,
+    ):
+        return "summary_observation"
+    if causality not in {"introduced_by_pr", "worsened_by_pr", "exposed_by_pr"}:
+        return "artifact_only"
+    if merge_blocking or str(finding.get("severity") or "").lower() in {"critical", "high"}:
+        return "inline_blocking"
+    return "inline_non_blocking"
+
+
+def explicit_repository_rule_present(finding: dict[str, Any], *, text: str) -> bool:
+    if str(finding.get("repository_rule") or "").strip():
+        return True
+    return any(term in text for term in ("contributing.md", "conventions.md", "required", "must", "static test", "pre-commit"))
+
+
+def has_concrete_failure_scenario(finding: dict[str, Any], *, text: str) -> bool:
+    category = str(finding.get("category") or "")
+    if category == "merge_conflict" and has_specific_merge_blocker_details(text):
+        return True
+    if category == "precommit" and has_actionable_precommit_details(text):
+        return True
+    if all(str(finding.get(key) or "").strip() for key in ("execution_path", "trigger", "observable_failure")):
+        return True
+    concrete_terms = (
+        "pudb.set_trace",
+        "breakpoint(",
+        "interactive debugger",
+        "will raise",
+        "can raise",
+        "raises ",
+        "unboundlocalerror",
+        "importerror",
+        "syntaxerror",
+        "valueerror",
+        "hang",
+        "timeout",
+        "fails",
+        "fail ",
+        "data loss",
+        "duplicate",
+        "token",
+        "secret",
+        "authorization header",
+        "verify=false",
+        "verify_server_cert",
+        "save_artifact() return",
+        "save_container() return",
+        "action_result.data",
+        "not declared",
+        "malformed json",
+        "jsonl",
+        "source_data_identifier",
+        "mergeable_state=dirty",
+        "merge conflict",
+        "hook id:",
+        "ruff",
+        "f401",
+    )
+    return any(term in text for term in concrete_terms)
+
+
+def has_changed_line_concrete_evidence(finding: dict[str, Any], *, changed_relation: str, text: str) -> bool:
+    if changed_relation not in {
+        "added_file",
+        "removed_file",
+        "added_changed_line",
+        "context_line_in_changed_hunk",
+        "inferable_changed_anchor",
+    }:
+        return False
+    if str(finding.get("confidence") or "").lower() != "high":
+        return False
+    if is_multi_concern_finding(finding, text=text) or is_broad_architectural_observation(finding, text=text):
+        return False
+    if any(phrase in text for phrase in ("may be", "might", "unclear", "verify whether", "confirm whether")):
+        return False
+    concrete_verbs = (
+        "wrong",
+        "missing",
+        "without",
+        "does not",
+        "do not",
+        "cannot",
+        "can fail",
+        "can break",
+        "will fail",
+        "will raise",
+        "raises",
+        "not declared",
+        "not included",
+        "undefined",
+        "unreachable",
+        "fails",
+        "invalid",
+        "mismatch",
+        "regression",
+    )
+    return any(term in text for term in concrete_verbs)
+
+
+def is_multi_concern_finding(finding: dict[str, Any], *, text: str) -> bool:
+    domains = concern_domains_for_text(text)
+    if len(domains) >= 3:
+        return True
+    title = str(finding.get("title") or "").lower()
+    broad_titles = (
+        "external api request handling has tls, timeout, or debug-data safety gaps",
+        "on_poll container/artifact behavior does not meet soar polling expectations",
+        "polling implementation has multiple",
+        "multiple soar contract issues",
+    )
+    return any(phrase in title for phrase in broad_titles)
+
+
+def is_broad_architectural_observation(finding: dict[str, Any], *, text: str) -> bool:
+    category = str(finding.get("category") or "")
+    if category == "polling_checkpoint" and len(concern_domains_for_text(text) & {
+        "poll_controls",
+        "checkpoint_state",
+        "container_label",
+        "artifact_metadata",
+        "save_return_handling",
+        "deduplication",
+    }) >= 3:
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "subsystem may not follow",
+            "recommended soar conventions",
+            "broad polling",
+            "redesign",
+            "architecture",
+        )
+    )
+
+
+def concern_domains_for_text(text: str) -> set[str]:
+    domains: set[str] = set()
+    checks = {
+        "request_timeout": ("timeout", "hang indefinitely", "requests can hang"),
+        "tls_verification": ("verify_server_cert", "tls", "certificate verification", "verify=false"),
+        "debug_data_logging": ("debug data", "debug_print", "response text", "response headers", "auth headers", "logging"),
+        "rate_limit_handling": ("429", "rate limit", "retry-after", "backoff"),
+        "test_connectivity": ("test_connectivity", "test connectivity", "fixed indicator", "quota"),
+        "version_release": ("app_version", "version bump", "release note", "release_notes", "unreleased.md"),
+        "poll_controls": ("poll controls", "is_poll_now", "start_time", "end_time", "container_count", "artifact_count"),
+        "checkpoint_state": ("checkpoint", "save_state", "load_state", "state persistence"),
+        "container_label": ("container label", "container omits label", "without a label"),
+        "artifact_metadata": ("artifact metadata", "artifact label", "dynamic cef", "cef keys", "source_data_identifier"),
+        "save_return_handling": ("save_artifact return", "save_artifact() return", "save_container return", "save return values"),
+        "deduplication": ("duplicate container", "duplicate artifact", "dedup"),
+        "output_schema": ("action_result.data", "action_result.summary", "output schema", "not declared"),
+        "interactive_debugger": ("pudb.set_trace", "breakpoint(", "interactive debugger", "set_trace()"),
+    }
+    for domain, needles in checks.items():
+        if any(needle in text for needle in needles):
+            domains.add(domain)
+    return domains
+
+
+def comment_summary_item(finding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": finding.get("id"),
+        "title": finding.get("title"),
+        "file": finding.get("file"),
+        "line": finding.get("line"),
+        "severity": finding.get("severity"),
+        "confidence": finding.get("confidence"),
+        "finding_category": finding.get("finding_category"),
+        "causality": finding.get("causality"),
+        "publication_destination": finding.get("publication_destination"),
+        "root_cause": finding.get("root_cause"),
+        "why_not_inline": inline_downgrade_reason(finding),
+    }
+
+
+def inline_downgrade_reason(finding: dict[str, Any]) -> str:
+    destination = str(finding.get("publication_destination") or "")
+    if destination in INLINE_PUBLICATION_DESTINATIONS:
+        return ""
+    calibration = finding.get("calibration") if isinstance(finding.get("calibration"), dict) else {}
+    if calibration.get("multi_concern"):
+        return "multiple unrelated concern domains need separate evidence before inline publication"
+    if not calibration.get("has_concrete_failure_scenario"):
+        return "no concrete PR-caused failure scenario was established"
+    if finding.get("causality") in {"unknown", "pre_existing_unrelated"}:
+        return "PR causality is not strong enough for an inline comment"
+    return "finding is better suited for summary or artifact review"
+
+
 def group_related_findings_for_comments(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     passthrough: list[dict[str, Any]] = []
@@ -212,17 +678,18 @@ def comment_group_key(finding: dict[str, Any]) -> str | None:
     title = str(finding.get("title") or "").lower()
     file_path = str(finding.get("file") or "")
 
-    if (
-        "verify_server_cert" in text
-        or ("tls" in text and "verify" in text)
-        or "direct requests call does not set a timeout" in title
-        or "requests are missing explicit timeouts" in title
-        or ("debug data" in text and ("response text" in text or "headers" in text))
-        or "http 429" in text
-        or "rate limit" in text
-        or "fixed indicator" in text
-    ):
-        return "network_request_safety"
+    if "direct requests call does not set a timeout" in title or "requests are missing explicit timeouts" in title or "timeout" in text:
+        return "network_request_timeout"
+    if "verify_server_cert" in text or ("tls" in text and "verify" in text) or "verify=false" in text:
+        return "tls_verification"
+    if "debug data" in text and ("response text" in text or "headers" in text):
+        return "debug_data_logging"
+    if "http 429" in text or "rate limit" in text or "retry-after" in text:
+        return "rate_limit_handling"
+    if "fixed indicator" in text or "test_connectivity" in text or "test connectivity" in text:
+        return "test_connectivity_endpoint"
+    if "app_version" in text or "version bump" in text:
+        return "release_management_version"
     if "action_result.data" in text and (
         "no data output" in text
         or "declares no data output" in text
@@ -239,24 +706,22 @@ def comment_group_key(finding: dict[str, Any]) -> str | None:
         and ("actionresult" in text or "action result" in text or "handler" in text)
     ) or "dashboard/date" in text:
         return "custom_view_result_rendering"
-    if category in {"polling_checkpoint", "soar_metadata"} and any(
-        term in text
-        for term in (
-            "on_poll",
-            "save_artifact",
-            "save_container",
-            "artifact label",
-            "dynamic cef",
-            "polling artifacts",
-            "polling state",
-            "poll controls",
-        )
-    ):
-        return "polling_container_artifact_contract"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("save_artifact return" in text or "save_artifact() return" in text):
+        return "save_artifact_return_handling"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("save_container return" in text or "save_container() return" in text):
+        return "save_container_return_handling"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("container label" in text or "without a label" in text):
+        return "polling_container_label"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("dynamic cef" in text or "cef keys" in text or "artifact metadata" in text):
+        return "polling_artifact_metadata"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("poll controls" in text or "is_poll_now" in text or "start_time" in text):
+        return "polling_controls"
+    if category in {"polling_checkpoint", "soar_metadata"} and ("checkpoint" in text or "save_state" in text or "load_state" in text):
+        return "polling_checkpoint_state"
     if ("pagination has no maximum page guard" in title or ("pagination" in title and "no upper bound" in title)) and any(
         term in text for term in ("on_poll", "polling", "dashboard", "ioc_view", "feed")
     ):
-        return "polling_container_artifact_contract"
+        return "pagination_bounds"
     if "pagination has no maximum page guard" in title or ("pagination" in title and "no upper bound" in title):
         return "pagination_bounds"
     if (
@@ -296,10 +761,20 @@ def merge_comment_group(key: str, items: list[dict[str, Any]]) -> dict[str, Any]
 
 def grouped_title(key: str, items: list[dict[str, Any]]) -> str:
     titles = {
-        "network_request_safety": "External API request handling has TLS, timeout, or debug-data safety gaps",
+        "network_request_timeout": "External API requests are missing bounded timeouts",
+        "tls_verification": "TLS verification is disabled or not configurable",
+        "debug_data_logging": "Debug output can include sensitive response data",
+        "rate_limit_handling": "Rate-limit responses are handled as generic API failures",
+        "test_connectivity_endpoint": "test connectivity uses a heavyweight or mismatched API path",
+        "release_management_version": "Release metadata does not match the behavior change",
         "action_metadata_contract": "Action output and indicator metadata are incomplete",
         "custom_view_result_rendering": "Custom views or dashboard wiring do not render action results correctly",
-        "polling_container_artifact_contract": "on_poll container/artifact behavior does not meet SOAR polling expectations",
+        "save_artifact_return_handling": "on_poll ignores artifact save failures",
+        "save_container_return_handling": "on_poll ignores container save failures",
+        "polling_container_label": "on_poll creates containers without a routable label",
+        "polling_artifact_metadata": "Polling artifacts use weak or unstable metadata",
+        "polling_controls": "on_poll does not honor SOAR poll controls",
+        "polling_checkpoint_state": "Polling state does not provide a reliable checkpoint",
         "pagination_bounds": "Polling or dashboard pagination lacks bounded page/result limits",
         "runtime_error_handling": "Runtime error paths can fail silently or crash with raw exceptions",
     }
@@ -319,12 +794,18 @@ def grouped_evidence(key: str, items: list[dict[str, Any]]) -> str:
             locations.append(location)
     location_text = ", ".join(dedupe_text(locations)[:8])
     root = str(items[0].get("evidence") or "").strip()
-    if key == "polling_container_artifact_contract":
-        root = "The polling implementation has multiple SOAR contract issues around poll controls, labels, save results, state/checkpointing, or artifact metadata."
-    elif key == "action_metadata_contract":
+    if key == "action_metadata_contract":
         root = "The action metadata is incomplete for the data and indicators the connector exposes."
-    elif key == "network_request_safety":
-        root = "External API request handling has concrete safety gaps around TLS verification, timeouts, debug data, rate limits, or test-connectivity endpoint choice."
+    elif key == "network_request_timeout":
+        root = "The changed request path can make external API calls without a bounded timeout."
+    elif key == "tls_verification":
+        root = "The changed request path disables TLS verification or lacks an asset setting to control it."
+    elif key == "debug_data_logging":
+        root = "The changed debug path can record full response text, headers, or other sensitive operational data."
+    elif key == "rate_limit_handling":
+        root = "The changed API path does not distinguish HTTP 429/rate-limit responses from generic failures."
+    elif key == "test_connectivity_endpoint":
+        root = "The changed test-connectivity path calls an endpoint that does not cleanly validate the asset's required API/auth behavior."
     elif key == "custom_view_result_rendering":
         root = "The custom view/dashboard path does not reliably render the completed action result data."
     elif key == "runtime_error_handling":
@@ -336,10 +817,19 @@ def grouped_evidence(key: str, items: list[dict[str, Any]]) -> str:
 
 def grouped_why(key: str, items: list[dict[str, Any]]) -> str:
     why_by_key = {
-        "network_request_safety": "Connector users need bounded, verifiable, and non-leaky API calls so credentials, threat-intel data, and SOAR workers are protected.",
+        "network_request_timeout": "A hung external API call can tie up a SOAR worker and leave the action running indefinitely.",
+        "tls_verification": "External API traffic should be verifiable by default and configurable when users need custom certificate behavior.",
+        "debug_data_logging": "Debug logs can persist sensitive tenant data, headers, or API payloads beyond the action run.",
+        "rate_limit_handling": "Users need clear retry/rate-limit feedback instead of a generic server error when the API asks the client to back off.",
+        "test_connectivity_endpoint": "test connectivity should validate credentials without consuming action quota or testing a different path than real actions use.",
         "action_metadata_contract": "SOAR playbooks and the datapath picker rely on app metadata matching emitted data, summaries, and typed indicator inputs.",
         "custom_view_result_rendering": "Custom views can fail at render time, show empty data, or re-call external APIs with missing parameters.",
-        "polling_container_artifact_contract": "Polling bugs create duplicate or unroutable containers/artifacts and can hide ingestion failures from users.",
+        "save_artifact_return_handling": "Failed artifact creation should fail the poll or appear in the summary instead of being silently ignored.",
+        "save_container_return_handling": "Failed container creation should stop dependent artifact work and surface a controlled SOAR error.",
+        "polling_container_label": "Unlabeled containers may not route correctly in SOAR deployments.",
+        "polling_artifact_metadata": "Weak artifact labels, CEF keys, or SDIs reduce deduplication and playbook routing quality.",
+        "polling_controls": "Scheduled and manual polls need predictable bounds so users can control ingestion volume and time windows.",
+        "polling_checkpoint_state": "Polling checkpoints protect against duplicate ingestion and data loss across repeated scheduled runs.",
         "pagination_bounds": "A bad API response or very large feed can consume worker or web-process resources without a clear stopping point.",
         "runtime_error_handling": "Raw crashes and silent partial success make polling/action results unreliable and hard for users to troubleshoot.",
     }
@@ -348,10 +838,20 @@ def grouped_why(key: str, items: list[dict[str, Any]]) -> str:
 
 def grouped_fix(key: str, items: list[dict[str, Any]]) -> str:
     fix_by_key = {
-        "network_request_safety": "Add a secure `verify_server_cert` config path, pass explicit request timeouts, remove full response/header debug data, handle 429s distinctly when applicable, and make test connectivity use a lightweight auth/status path instead of a quota-consuming sample lookup.",
+        "network_request_timeout": "Pass an explicit `timeout=` through the shared request helper/session call and cover the timeout/error path in tests.",
+        "tls_verification": "Expose a `verify_server_cert` asset setting if needed, default it to verification enabled, and pass it consistently to external requests.",
+        "debug_data_logging": "Remove full response/header/body debug data or redact sensitive fields before logging.",
+        "rate_limit_handling": "Detect HTTP 429 separately, surface `Retry-After`/rate-limit reset details when present, and add bounded retry/backoff only where safe.",
+        "test_connectivity_endpoint": "Use a lightweight auth/status endpoint for test connectivity and keep quota-consuming sample lookups in normal actions.",
+        "release_management_version": "Update release metadata only when the repository rules require it for this behavior change.",
         "action_metadata_contract": "Declare the emitted `action_result.data.*` and `action_result.summary.*` paths, and add `contains` metadata for hash/IP/URL/domain parameters.",
         "custom_view_result_rendering": "Render SOAR's existing action result data in the view, import `ActionResult` explicitly if still needed, and avoid re-calling action handlers from GET parameters.",
-        "polling_container_artifact_contract": "Rework on_poll to use standard poll controls, persist checkpoints only after successful ingestion, set container/artifact labels, check save return values, and map indicators to stable CEF fields.",
+        "save_artifact_return_handling": "Check the `save_artifact()` return tuple and fail or summarize the poll when artifact creation fails.",
+        "save_container_return_handling": "Check the `save_container()` result before adding artifacts and return a controlled error if container creation fails.",
+        "polling_container_label": "Populate the container label from asset configuration or the connector's documented default label before saving it.",
+        "polling_artifact_metadata": "Use stable artifact labels, standard CEF field names, and deterministic SDIs based on vendor object identity.",
+        "polling_controls": "Read and apply SOAR poll parameters such as Poll Now, time bounds, container_count, and artifact_count where supported.",
+        "polling_checkpoint_state": "Persist checkpoint state only after successful ingestion and use it to bound future scheduled polls.",
         "pagination_bounds": "Add a configurable max page/result guard and report clearly when a poll or dashboard view hits that bound.",
         "runtime_error_handling": "Validate response shapes before indexing, return APP_ERROR for unknown actions, and surface malformed JSONL/feed lines as an error or counted warning instead of silently continuing.",
     }
@@ -428,7 +928,23 @@ def dedupe_text(values: list[str]) -> list[str]:
 def all_comment_finding_text(finding: dict[str, Any]) -> str:
     return " ".join(
         str(finding.get(key) or "")
-        for key in ("title", "category", "file", "code_reference", "evidence", "why_it_matters", "suggested_fix")
+        for key in (
+            "title",
+            "category",
+            "review_area",
+            "finding_category",
+            "file",
+            "code_reference",
+            "evidence",
+            "changed_line_evidence",
+            "execution_path",
+            "trigger",
+            "observable_failure",
+            "root_cause",
+            "repository_rule",
+            "why_it_matters",
+            "suggested_fix",
+        )
     ).lower()
 
 
@@ -442,6 +958,20 @@ def finding_identity(finding: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def finding_context_filter_reason(finding: dict[str, Any], review_input: dict[str, Any]) -> dict[str, str] | None:
+    if str(finding.get("publication_destination") or "") == "suppress":
+        return {
+            "reason": "publication_destination_suppress",
+            "detail": "publication calibration marked this finding for suppression",
+            "evidence_source": "publication_calibration",
+            "confidence_after": "low",
+        }
+    if str(finding.get("finding_category") or "") == "insufficient_evidence":
+        return {
+            "reason": "insufficient_evidence",
+            "detail": "finding did not establish enough connected evidence for publication",
+            "evidence_source": "publication_calibration",
+            "confidence_after": "low",
+        }
     if is_stale_removed_sdk_manifest_finding(finding, review_input):
         return {
             "reason": "stale_removed_sdk_manifest",
@@ -613,10 +1143,13 @@ def mentions_repository_example_without_runtime_link(lowered: str) -> bool:
 def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
     category = str(finding.get("category") or "")
     confidence = str(finding.get("confidence") or "").lower()
+    destination = str(finding.get("publication_destination") or "")
     text = " ".join(
         str(finding.get(key) or "")
         for key in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference")
     ).lower()
+    if destination and destination not in INLINE_PUBLICATION_DESTINATIONS:
+        return True
     if not is_actionable_review_finding(finding):
         return True
     if confidence in {"medium", "low"}:
@@ -864,7 +1397,13 @@ def build_comment_for_finding(
         "title": title,
         "severity": finding.get("severity", "medium"),
         "confidence": finding.get("confidence", "high"),
+        "confidence_score": finding.get("confidence_score"),
         "category": finding.get("category", "general"),
+        "finding_category": finding.get("finding_category"),
+        "causality": finding.get("causality"),
+        "publication_destination": finding.get("publication_destination"),
+        "merge_blocking": finding.get("merge_blocking"),
+        "root_cause": finding.get("root_cause"),
         "finding_type": finding_type,
         "comment_style": comment_style_for(finding, finding_type, target),
         "github_comment_type": target["github_comment_type"],
@@ -1153,7 +1692,9 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     title = first_sentence(str(finding.get("title") or "Review finding."))
     evidence = concise_comment_text(str(finding.get("evidence") or ""), max_chars=650, max_sentences=3)
     why = concise_comment_text(str(finding.get("why_it_matters") or ""), max_chars=420, max_sentences=2)
-    fix = concise_comment_text(str(finding.get("suggested_fix") or ""), max_chars=800, max_sentences=4)
+    fix = concise_fix_text(finding)
+    changed_line_evidence = concise_comment_text(str(finding.get("changed_line_evidence") or ""), max_chars=360, max_sentences=2)
+    failure_scenario = concise_failure_scenario(finding)
     code_reference = str(finding.get("code_reference") or "").strip()
     location = format_conversation_location(target)
     anchor_text = concise_anchor_text(str(target.get("anchor_text") or ""))
@@ -1169,12 +1710,70 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
         lines.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
         lines.append(f"Current line: `{anchor_text}`")
+    if changed_line_evidence:
+        lines.append(f"Changed behavior: {changed_line_evidence}")
+    if failure_scenario:
+        lines.append(f"Failure scenario: {failure_scenario}")
     if why:
         lines.append(f"Impact: {why}")
     if fix:
         lines.append(f"How to fix: {fix}")
 
     return clamp_text("\n\n".join(lines), 1900)
+
+
+def concise_fix_text(finding: dict[str, Any]) -> str:
+    fix = concise_comment_text(str(finding.get("suggested_fix") or ""), max_chars=850, max_sentences=4)
+    if not fix:
+        return ""
+    fix = clarify_known_fix_patterns(finding, fix)
+    repository_rule = str(finding.get("repository_rule") or "").strip()
+    if repository_rule and "rule:" not in fix.lower() and repository_rule not in fix:
+        fix = f"{fix} Rule: {repository_rule}"
+    return fix
+
+
+def clarify_known_fix_patterns(finding: dict[str, Any], fix: str) -> str:
+    text = all_comment_finding_text(finding)
+    generic_fix = len(fix) < 45 or fix.lower().strip(".") in {"fix this", "address this", "resolve this"}
+    if "pudb.set_trace" in text or "interactive debugger" in text:
+        if generic_fix or "pudb" not in fix.lower():
+            return (
+                "Remove the committed `import pudb` and `pudb.set_trace()` calls. "
+                "If a local breakpoint is still useful, keep it out of committed runtime code."
+            )
+    if "request_timeout" in str(finding.get("root_cause") or "") or "missing bounded timeout" in text:
+        if "timeout=" not in fix.lower():
+            return (
+                f"{fix} Pass an explicit `timeout=` through the shared request helper or session call, "
+                "and add a test that exercises the timeout/error path."
+            )
+    if "tls_verification" in str(finding.get("root_cause") or "") or "verify_server_cert" in text:
+        if "verify_server_cert" not in fix:
+            return (
+                f"{fix} Add or reuse a `verify_server_cert` asset setting, default verification on, "
+                "and pass that value to every external request."
+            )
+    if "debug_data_logging" in str(finding.get("root_cause") or ""):
+        if "redact" not in fix.lower():
+            return f"{fix} Redact or remove response bodies, headers, tokens, and tenant data before debug logging."
+    return fix
+
+
+def concise_failure_scenario(finding: dict[str, Any]) -> str:
+    parts = []
+    trigger = str(finding.get("trigger") or "").strip()
+    execution_path = str(finding.get("execution_path") or "").strip()
+    observable_failure = str(finding.get("observable_failure") or "").strip()
+    if trigger:
+        parts.append(f"trigger: {trigger}")
+    if execution_path:
+        parts.append(f"path: {execution_path}")
+    if observable_failure:
+        parts.append(f"failure: {observable_failure}")
+    if not parts:
+        return ""
+    return concise_comment_text("; ".join(parts), max_chars=500, max_sentences=3)
 
 
 def comment_style_for(finding: dict[str, Any], finding_type: str, target: dict[str, Any]) -> str:
@@ -1323,11 +1922,34 @@ def render_comment_plan(plan: dict[str, Any]) -> str:
         lines.extend(
             [
                 f"{index}. `{comment.get('github_comment_type')}` / `{comment.get('finding_type')}` / `{target}`",
+                (
+                    f"   - Calibration: `{comment.get('finding_category')}` / "
+                    f"`{comment.get('causality')}` / `{comment.get('publication_destination')}` / "
+                    f"merge_blocking=`{comment.get('merge_blocking')}`"
+                ),
                 "",
                 comment.get("body") or "",
                 "",
             ]
         )
+    if plan.get("summary_high_priority"):
+        lines.extend(["### Summary High Priority", ""])
+        for item in plan.get("summary_high_priority") or []:
+            lines.append(
+                f"- `{item.get('publication_destination')}` `{item.get('finding_category')}` "
+                f"`{item.get('causality')}`: {item.get('title')} ({item.get('why_not_inline')})"
+            )
+        lines.append("")
+    if plan.get("summary_observations"):
+        lines.extend(["### Additional Design Observations", ""])
+        for item in plan.get("summary_observations") or []:
+            lines.append(
+                f"- `{item.get('finding_category')}` `{item.get('causality')}`: "
+                f"{item.get('title')} ({item.get('why_not_inline')})"
+            )
+        lines.append("")
+    if plan.get("artifact_only_count"):
+        lines.extend(["### Artifact Only", "", f"- `{plan.get('artifact_only_count')}` finding(s) kept out of PR comments.", ""])
     return redact_text("\n".join(lines).rstrip() + "\n")
 
 

@@ -69,6 +69,21 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "category": {
                         "type": "string",
                         "enum": [
+                            "introduced_bug",
+                            "introduced_regression",
+                            "exposed_existing_bug",
+                            "security_issue",
+                            "pre_existing_issue",
+                            "design_observation",
+                            "maintainability_suggestion",
+                            "repository_policy_suggestion",
+                            "release_management_suggestion",
+                            "insufficient_evidence",
+                        ],
+                    },
+                    "review_area": {
+                        "type": "string",
+                        "enum": [
                             "api_auth_correctness",
                             "polling_checkpoint",
                             "output_schema_mismatch",
@@ -84,12 +99,43 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                             "general",
                         ],
                     },
+                    "causality": {
+                        "type": "string",
+                        "enum": [
+                            "introduced_by_pr",
+                            "worsened_by_pr",
+                            "exposed_by_pr",
+                            "pre_existing_unrelated",
+                            "unknown",
+                        ],
+                    },
                     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "confidence_score": {"type": "number", "minimum": 0, "maximum": 1},
+                    "merge_blocking": {"type": "boolean"},
+                    "publication_destination": {
+                        "type": "string",
+                        "enum": [
+                            "inline_blocking",
+                            "inline_non_blocking",
+                            "summary_high_priority",
+                            "summary_observation",
+                            "artifact_only",
+                            "suppress",
+                        ],
+                    },
                     "file": {"type": ["string", "null"]},
                     "line": {"type": ["integer", "null"]},
+                    "line_start": {"type": ["integer", "null"]},
+                    "line_end": {"type": ["integer", "null"]},
                     "code_reference": {"type": ["string", "null"]},
                     "evidence": {"type": "string"},
+                    "changed_line_evidence": {"type": ["string", "null"]},
+                    "execution_path": {"type": ["string", "null"]},
+                    "trigger": {"type": ["string", "null"]},
+                    "observable_failure": {"type": ["string", "null"]},
+                    "root_cause": {"type": ["string", "null"]},
+                    "repository_rule": {"type": ["string", "null"]},
                     "why_it_matters": {"type": "string"},
                     "suggested_fix": {"type": "string"},
                     "suggested_code": {"type": ["string", "null"]},
@@ -99,12 +145,25 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "id",
                     "title",
                     "category",
+                    "review_area",
+                    "causality",
                     "severity",
                     "confidence",
+                    "confidence_score",
+                    "merge_blocking",
+                    "publication_destination",
                     "file",
                     "line",
+                    "line_start",
+                    "line_end",
                     "code_reference",
                     "evidence",
+                    "changed_line_evidence",
+                    "execution_path",
+                    "trigger",
+                    "observable_failure",
+                    "root_cause",
+                    "repository_rule",
                     "why_it_matters",
                     "suggested_fix",
                     "suggested_code",
@@ -1215,13 +1274,26 @@ def build_json_repair_prompt(previous_response: str) -> str:
         "    {\n"
         '      "id": "short-stable-id",\n'
         '      "title": "clear finding title",\n'
-        '      "category": "api_auth_correctness|polling_checkpoint|output_schema_mismatch|unsafe_logging|soar_metadata|docs_pr_accuracy|pagination|validation|missing_tests|precommit|merge_conflict|ci_synthesis|general",\n'
+        '      "category": "introduced_bug|introduced_regression|exposed_existing_bug|security_issue|pre_existing_issue|design_observation|maintainability_suggestion|repository_policy_suggestion|release_management_suggestion|insufficient_evidence",\n'
+        '      "review_area": "api_auth_correctness|polling_checkpoint|output_schema_mismatch|unsafe_logging|soar_metadata|docs_pr_accuracy|pagination|validation|missing_tests|precommit|merge_conflict|ci_synthesis|general",\n'
+        '      "causality": "introduced_by_pr|worsened_by_pr|exposed_by_pr|pre_existing_unrelated|unknown",\n'
         '      "severity": "critical|high|medium|low|info",\n'
         '      "confidence": "high|medium|low",\n'
+        '      "confidence_score": 0.95,\n'
+        '      "merge_blocking": true,\n'
+        '      "publication_destination": "inline_blocking|inline_non_blocking|summary_high_priority|summary_observation|artifact_only|suppress",\n'
         '      "file": "path or null",\n'
         '      "line": 123,\n'
+        '      "line_start": 123,\n'
+        '      "line_end": null,\n'
         '      "code_reference": "reference or null",\n'
         '      "evidence": "specific evidence",\n'
+        '      "changed_line_evidence": "changed line or null",\n'
+        '      "execution_path": "entry point to sink or null",\n'
+        '      "trigger": "input/state trigger or null",\n'
+        '      "observable_failure": "observed failure or null",\n'
+        '      "root_cause": "single root cause",\n'
+        '      "repository_rule": "explicit rule or null",\n'
         '      "why_it_matters": "why this matters",\n'
         '      "suggested_fix": "actionable fix",\n'
         '      "suggested_code": null,\n'

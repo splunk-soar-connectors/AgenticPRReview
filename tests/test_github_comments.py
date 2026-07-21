@@ -1603,6 +1603,184 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertIn("Add useful debug_print", body)
         self.assertNotIn("Remove unnecessary", body)
 
+    def test_interactive_debugger_is_inline_blocking(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1,2 +1,4 @@\n"
+                        " import os\n"
+                        "+import pudb\n"
+                        "+pudb.set_trace()\n"
+                        " def handle_action():\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "debugger",
+                    "title": "Interactive debugger left in runtime code",
+                    "category": "general",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 3,
+                    "evidence": "The changed line calls `pudb.set_trace()` in module/runtime code.",
+                    "changed_line_evidence": "`pudb.set_trace()` was added by this PR.",
+                    "execution_path": "module import or action execution reaches the committed debugger call",
+                    "trigger": "the connector module is imported or the action path reaches this line",
+                    "observable_failure": "execution can pause waiting for an interactive terminal or fail if `pudb` is not installed",
+                    "root_cause": "interactive_debugger",
+                    "why_it_matters": "SOAR workers cannot rely on an interactive debugger being available.",
+                    "suggested_fix": "Fix this.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["publication_destination"], "inline_blocking")
+        self.assertEqual(comment["finding_category"], "introduced_bug")
+        self.assertEqual(comment["causality"], "introduced_by_pr")
+        self.assertTrue(comment["merge_blocking"])
+        self.assertIn("How to fix:", comment["body"])
+        self.assertIn("Remove the committed `import pudb`", comment["body"])
+
+    def test_broad_polling_redesign_comment_is_not_inline(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -100,2 +100,2 @@\n"
+                        "+container[\"artifacts\"] = artifacts\n"
+                        "+self.save_container(container)\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "polling-broad",
+                    "title": "on_poll container/artifact behavior does not meet SOAR polling expectations",
+                    "category": "polling_checkpoint",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 101,
+                    "evidence": (
+                        "Near `container[\"artifacts\"] = artifacts`, the polling subsystem also lacks poll controls, "
+                        "checkpoint persistence, labels, artifact metadata, save_artifact return handling, duplicate "
+                        "container handling, and ingestion failure handling."
+                    ),
+                    "why_it_matters": "These are useful polling design concerns, but the finding does not prove that the changed assignment introduced each failure.",
+                    "suggested_fix": "Redesign polling to handle all SOAR conventions.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertGreaterEqual(
+            plan["publication_calibration"]["summary_high_priority_count"]
+            + plan["publication_calibration"]["summary_observation_count"],
+            1,
+        )
+        summary_items = plan["summary_high_priority"] + plan["summary_observations"]
+        self.assertIn("multiple unrelated concern domains", summary_items[0]["why_not_inline"])
+
+    def test_mixed_api_request_mega_comment_is_not_inline(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -50,1 +50,1 @@\n+response = requests.get(url, verify=self._verify)\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "mixed-request",
+                    "title": "External API request handling has TLS, timeout, debug-data, rate-limit, test-connectivity, and version gaps",
+                    "category": "api_auth_correctness",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 50,
+                    "evidence": (
+                        "The changed request call lacks a timeout, TLS verification may be disabled, debug data can include "
+                        "response headers, rate limits are generic, test_connectivity uses a fixed indicator, and app_version "
+                        "may need a version bump."
+                    ),
+                    "why_it_matters": "Some of these may be real concerns, but they are unrelated root causes with different fixes.",
+                    "suggested_fix": "Fix request safety, TLS, debug logging, rate limits, test connectivity, and release metadata.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertEqual(plan["publication_calibration"]["summary_high_priority_count"], 1)
+        self.assertEqual(plan["summary_high_priority"][0]["why_not_inline"], "multiple unrelated concern domains need separate evidence before inline publication")
+
+    def test_single_timeout_root_cause_still_publishes_inline(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -50,1 +50,1 @@\n+response = requests.get(url)\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "timeout",
+                    "title": "External API request is missing a bounded timeout",
+                    "category": "api_auth_correctness",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 50,
+                    "evidence": "The changed line calls `requests.get(url)` without passing `timeout=`.",
+                    "changed_line_evidence": "`requests.get(url)` was added without a timeout argument.",
+                    "execution_path": "action handler -> request helper -> `requests.get(url)`",
+                    "trigger": "the external API or network connection stalls",
+                    "observable_failure": "the SOAR worker can hang until the process-level network timeout fires",
+                    "root_cause": "request_timeout",
+                    "why_it_matters": "A hung request can tie up a SOAR worker.",
+                    "suggested_fix": "Add a bounded timeout.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["publication_destination"], "inline_non_blocking")
+        self.assertIn("timeout=", comment["body"])
+        self.assertIn("Failure scenario:", comment["body"])
+
     def test_collect_existing_markers(self):
         review_input = {
             "comments": {

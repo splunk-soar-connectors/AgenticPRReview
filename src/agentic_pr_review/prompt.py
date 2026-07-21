@@ -197,6 +197,26 @@ Strict output rules:
 - Every finding must include evidence, why_it_matters, and suggested_fix. If you
   cannot fill those with concrete facts from the supplied context, omit the
   finding.
+- Every finding must classify the issue type and PR causality. In the JSON
+  schema, put the issue type in `category` using exactly one of:
+  introduced_bug, introduced_regression, exposed_existing_bug, security_issue,
+  pre_existing_issue, design_observation, maintainability_suggestion,
+  repository_policy_suggestion, release_management_suggestion,
+  insufficient_evidence.
+- Put the older checklist/review area in `review_area`, not in `category`.
+- Every finding must classify causality as introduced_by_pr, worsened_by_pr,
+  exposed_by_pr, pre_existing_unrelated, or unknown. Do not present a finding
+  as an inline/blocking defect unless the supplied context connects it to a
+  changed line or changed behavior.
+- Every finding must choose `publication_destination`: inline_blocking,
+  inline_non_blocking, summary_high_priority, summary_observation,
+  artifact_only, or suppress. Inline destinations are for concrete PR-caused
+  defects, regressions, security issues, CI blockers, data loss/corruption, or
+  explicit repository-rule violations. Put broad design observations and
+  repository-wide improvements in summary/artifact destinations.
+- For inline findings, include changed_line_evidence, execution_path, trigger,
+  observable_failure, and root_cause. If you cannot provide these, downgrade to
+  summary_observation, artifact_only, or suppress.
 - Only report issues in these areas: app JSON parameter/action/output schema
   mismatch; connector implementation mismatch; README/manual docs mismatch;
   missing or weak tests with a concrete changed behavior; invalid conventional
@@ -269,6 +289,19 @@ Evidence rules:
   behind, or otherwise not mergeable. A mergeability finding is useful only when
   it explains the concrete blocker: where it appears, why it blocks merge, and
   the specific fix, such as a conflict file or a named failing hook/test.
+- Do not combine unrelated concerns in one finding. Timeouts, TLS verification,
+  debug logging, rate-limit handling, test-connectivity design, and version
+  bumping are separate root causes. Poll controls, checkpointing, container
+  labels, artifact metadata, and save return handling are also separate root
+  causes unless one changed code path directly connects them into one failure.
+- Distinguish correctness from policy. Version bumps and release notes are
+  release-management findings unless an explicit repository rule makes them
+  merge-blocking. Preferred patterns are not correctness bugs without a concrete
+  failure scenario or rule citation.
+- Before returning a finding, adversarially check it: could it be pre-existing,
+  is the changed line responsible, is the evidence connected to runtime
+  behavior, is it one root cause, is the impact realistic, and would a human
+  reviewer consider it actionable?
 - Avoid nitpicks and broad style comments.
 - Do not artificially cap the review at a small number of findings. Report all
   high-confidence correctness, security, SOAR contract, metadata, polling,
@@ -295,13 +328,26 @@ Required JSON shape:
     {
       "id": "short-stable-id",
       "title": "clear finding title",
-      "category": "api_auth_correctness|polling_checkpoint|output_schema_mismatch|unsafe_logging|soar_metadata|docs_pr_accuracy|pagination|validation|missing_tests|precommit|merge_conflict|ci_synthesis|general",
+      "category": "introduced_bug|introduced_regression|exposed_existing_bug|security_issue|pre_existing_issue|design_observation|maintainability_suggestion|repository_policy_suggestion|release_management_suggestion|insufficient_evidence",
+      "review_area": "api_auth_correctness|polling_checkpoint|output_schema_mismatch|unsafe_logging|soar_metadata|docs_pr_accuracy|pagination|validation|missing_tests|precommit|merge_conflict|ci_synthesis|general",
+      "causality": "introduced_by_pr|worsened_by_pr|exposed_by_pr|pre_existing_unrelated|unknown",
       "severity": "critical|high|medium|low|info",
       "confidence": "high|medium|low",
+      "confidence_score": 0.0,
+      "merge_blocking": true,
+      "publication_destination": "inline_blocking|inline_non_blocking|summary_high_priority|summary_observation|artifact_only|suppress",
       "file": "path or null",
       "line": 123,
+      "line_start": 123,
+      "line_end": null,
       "code_reference": "function/action/parameter/output path/hook/commit reference when line is null, or null",
       "evidence": "specific evidence from code/comment/CI",
+      "changed_line_evidence": "the changed line or changed behavior responsible for the issue, or null",
+      "execution_path": "runtime path from entry point to sink, or null",
+      "trigger": "input/state/check condition that triggers the bug, or null",
+      "observable_failure": "actual failure users/CI/SOAR observe, or null",
+      "root_cause": "single root cause",
+      "repository_rule": "explicit rule if this is policy-driven, or null",
       "why_it_matters": "why this matters for a SOAR connector",
       "suggested_fix": "actionable fix",
       "suggested_code": "exact replacement code for the GitHub suggestion block, or null",
@@ -347,6 +393,9 @@ def build_synthesis_prompt(
             "Drop speculative, weak, already-fixed, README-only, or generic CI findings.",
             "Drop behavioral identifier findings when the candidate evidence does not prove the reviewed variable's source, sink, expected runtime value, and failure path.",
             "Do not merge evidence across different identifier roles such as asset ID and application ID unless a supplied assignment trace connects them.",
+            "Keep one root cause per finding; split timeout, TLS, logging, rate-limit, test-connectivity, polling, checkpoint, artifact, and version concerns instead of creating mega-findings.",
+            "Classify each finding with category, review_area, causality, publication_destination, merge_blocking, and root_cause.",
+            "Inline destinations require a concrete PR-caused failure scenario; broad design or release-management observations should go to summary/artifact destinations.",
             "Keep only concrete findings that should be posted to an external contributor.",
             "Prefer exact file/line targets from chunk findings or deterministic findings.",
             "Use CI/check/comment context to confirm whether findings are real blockers.",

@@ -176,6 +176,44 @@ class ModelsTest(unittest.TestCase):
 
         self.assertEqual(output["findings"], [])
 
+    def test_normalize_finding_maps_new_category_schema_to_review_area(self):
+        finding = normalize_finding(
+            {
+                "id": "f1",
+                "title": "Interactive debugger left in runtime code",
+                "category": "introduced_bug",
+                "review_area": "general",
+                "causality": "introduced_by_pr",
+                "severity": "high",
+                "confidence_score": 0.96,
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": "connector.py",
+                "line_start": 10,
+                "line_end": 11,
+                "evidence": "`pudb.set_trace()` was added.",
+                "changed_line_evidence": "`pudb.set_trace()` was added by the PR.",
+                "execution_path": "module import reaches the debugger",
+                "trigger": "the module is imported",
+                "observable_failure": "execution blocks waiting for a terminal",
+                "root_cause": "interactive_debugger",
+                "why_it_matters": "SOAR workers cannot interact with a debugger.",
+                "suggested_fix": "Remove the debugger call.",
+            },
+            default_source="claude",
+        )
+
+        self.assertEqual(finding["category"], "general")
+        self.assertEqual(finding["review_area"], "general")
+        self.assertEqual(finding["finding_category"], "introduced_bug")
+        self.assertEqual(finding["causality"], "introduced_by_pr")
+        self.assertEqual(finding["publication_destination"], "inline_blocking")
+        self.assertEqual(finding["confidence"], "high")
+        self.assertEqual(finding["confidence_score"], 0.96)
+        self.assertTrue(finding["merge_blocking"])
+        self.assertEqual(finding["line"], 10)
+        self.assertEqual(finding["line_start"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

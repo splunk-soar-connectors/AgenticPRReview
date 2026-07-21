@@ -23,6 +23,33 @@ ALLOWED_CATEGORIES = {
     "ci_synthesis",
     "general",
 }
+ALLOWED_FINDING_CATEGORIES = {
+    "introduced_bug",
+    "introduced_regression",
+    "exposed_existing_bug",
+    "security_issue",
+    "pre_existing_issue",
+    "design_observation",
+    "maintainability_suggestion",
+    "repository_policy_suggestion",
+    "release_management_suggestion",
+    "insufficient_evidence",
+}
+ALLOWED_CAUSALITIES = {
+    "introduced_by_pr",
+    "worsened_by_pr",
+    "exposed_by_pr",
+    "pre_existing_unrelated",
+    "unknown",
+}
+ALLOWED_PUBLICATION_DESTINATIONS = {
+    "inline_blocking",
+    "inline_non_blocking",
+    "summary_high_priority",
+    "summary_observation",
+    "artifact_only",
+    "suppress",
+}
 REQUIRED_TEXT_FIELDS = ("evidence", "why_it_matters", "suggested_fix")
 SPECULATIVE_PHRASES = (
     "cannot confirm",
@@ -47,28 +74,131 @@ def normalize_finding(raw: dict[str, Any], *, default_source: str) -> dict[str, 
     severity = str(raw.get("severity", "medium")).lower()
     if severity not in ALLOWED_SEVERITIES:
         severity = "medium"
-    confidence = str(raw.get("confidence", "medium")).lower()
+    confidence, confidence_score = normalize_confidence(raw.get("confidence"), raw.get("confidence_score"))
+    raw_category = str(raw.get("category") or "general").strip()
+    if raw_category in ALLOWED_FINDING_CATEGORIES:
+        finding_category = raw_category
+        category = str(raw.get("review_area") or raw.get("area") or raw.get("legacy_category") or "").strip()
+    else:
+        category = raw_category
+        finding_category = str(raw.get("finding_category") or raw.get("defect_category") or "").strip()
+    if finding_category not in ALLOWED_FINDING_CATEGORIES:
+        finding_category = infer_finding_category(raw, category=category)
+    causality = str(raw.get("causality") or "").strip()
+    if causality not in ALLOWED_CAUSALITIES:
+        causality = "unknown"
+    publication_destination = str(raw.get("publication_destination") or "").strip()
+    if publication_destination not in ALLOWED_PUBLICATION_DESTINATIONS:
+        publication_destination = "artifact_only" if finding_category in {"design_observation", "maintainability_suggestion"} else "inline_non_blocking"
     if confidence not in {"high", "medium", "low"}:
         confidence = "medium"
-    category = str(raw.get("category") or "general").strip()
     if category not in ALLOWED_CATEGORIES:
-        category = "general"
+        category = infer_review_area(raw)
+    merge_blocking = raw.get("merge_blocking")
+    if not isinstance(merge_blocking, bool):
+        merge_blocking = bool(severity in {"critical"} or category in {"precommit", "merge_conflict"})
     return {
         "id": str(raw.get("id") or ""),
         "title": str(raw.get("title") or "Untitled finding").strip(),
         "category": category,
+        "review_area": category,
+        "finding_category": finding_category,
+        "causality": causality,
         "severity": severity,
         "confidence": confidence,
+        "confidence_score": confidence_score,
+        "merge_blocking": merge_blocking,
+        "publication_destination": publication_destination,
         "file": raw.get("file"),
-        "line": raw.get("line"),
+        "line": raw.get("line_start", raw.get("line")),
+        "line_start": raw.get("line_start", raw.get("line")),
+        "line_end": raw.get("line_end"),
         "code_reference": normalize_optional_text(raw.get("code_reference")),
         "evidence": str(raw.get("evidence") or "").strip(),
         "why_it_matters": str(raw.get("why_it_matters") or "").strip(),
         "suggested_fix": str(raw.get("suggested_fix") or "").strip(),
         "suggested_code": normalize_optional_text(raw.get("suggested_code")),
+        "changed_line_evidence": normalize_optional_text(raw.get("changed_line_evidence")),
+        "execution_path": normalize_optional_text(raw.get("execution_path")),
+        "trigger": normalize_optional_text(raw.get("trigger")),
+        "observable_failure": normalize_optional_text(raw.get("observable_failure")),
+        "root_cause": normalize_optional_text(raw.get("root_cause")),
+        "repository_rule": normalize_optional_text(raw.get("repository_rule")),
         "source": str(raw.get("source") or default_source),
         "url": raw.get("url"),
     }
+
+
+def normalize_confidence(confidence: Any, confidence_score: Any = None) -> tuple[str, float]:
+    if isinstance(confidence, (int, float)):
+        score = max(0.0, min(1.0, float(confidence)))
+        if score >= 0.85:
+            return "high", score
+        if score >= 0.55:
+            return "medium", score
+        return "low", score
+    if isinstance(confidence_score, (int, float)):
+        score = max(0.0, min(1.0, float(confidence_score)))
+        if not confidence:
+            if score >= 0.85:
+                return "high", score
+            if score >= 0.55:
+                return "medium", score
+            return "low", score
+    else:
+        score = 0.5
+    label = str(confidence or "medium").lower()
+    if label == "high":
+        return "high", max(score, 0.9)
+    if label == "low":
+        return "low", min(score, 0.35)
+    return "medium", score if confidence_score is not None else 0.65
+
+
+def infer_finding_category(raw: dict[str, Any], *, category: str) -> str:
+    text = " ".join(
+        str(raw.get(field) or "")
+        for field in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference")
+    ).lower()
+    if any(phrase in text for phrase in ("pudb.set_trace", "breakpoint(", "interactive debugger", "set_trace()")):
+        return "introduced_bug"
+    if category == "unsafe_logging" or any(term in text for term in ("token", "secret", "authorization header", "credentials exposed")):
+        return "security_issue"
+    if category in {"precommit", "merge_conflict"}:
+        return "introduced_bug"
+    if any(term in text for term in ("app_version", "version bump", "release note", "release_notes", "unreleased.md")):
+        return "release_management_suggestion"
+    if category in {"docs_pr_accuracy", "missing_tests"}:
+        return "repository_policy_suggestion"
+    if any(phrase in text for phrase in SPECULATIVE_PHRASES):
+        return "insufficient_evidence"
+    if category in {"polling_checkpoint", "output_schema_mismatch", "api_auth_correctness", "pagination", "validation", "soar_metadata"}:
+        return "introduced_regression"
+    return "introduced_bug"
+
+
+def infer_review_area(raw: dict[str, Any]) -> str:
+    text = " ".join(
+        str(raw.get(field) or "")
+        for field in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference")
+    ).lower()
+    if any(term in text for term in ("oauth", "token", "auth", "client credentials")):
+        return "api_auth_correctness"
+    if any(term in text for term in ("poll", "checkpoint", "save_artifact", "save_container", "source_data_identifier")):
+        return "polling_checkpoint"
+    if any(term in text for term in ("output", "action_result.data", "summary", "schema")):
+        return "output_schema_mismatch"
+    if any(term in text for term in ("log", "debug", "secret", "authorization header", "token")):
+        return "unsafe_logging"
+    if any(term in text for term in ("read_only", "app json", "app_version", "python_version", "manifest")):
+        return "soar_metadata"
+    if any(term in text for term in ("readme", "docs", "release note")):
+        return "docs_pr_accuracy"
+    if "pagination" in text or "page" in text:
+        return "pagination"
+    if "test" in text:
+        return "missing_tests"
+    return "general"
 
 
 def normalize_review_output(raw: dict[str, Any], *, deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -161,6 +291,11 @@ def normalize_optional_text(value: Any) -> str | None:
 
 def is_actionable_review_finding(finding: dict[str, Any]) -> bool:
     """Return True only for findings with enough evidence to show a user."""
+
+    if str(finding.get("finding_category") or "") == "insufficient_evidence":
+        return False
+    if str(finding.get("publication_destination") or "") == "suppress":
+        return False
 
     file_path = str(finding.get("file") or "").strip()
     if not file_path or file_path.lower() in {"none", "null", "conversation"}:

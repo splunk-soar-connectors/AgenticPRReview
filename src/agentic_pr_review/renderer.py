@@ -38,10 +38,18 @@ def render_comment(review_output: dict[str, Any], review_input: dict[str, Any], 
             confidence = finding.get("confidence", "medium")
             severity = finding.get("severity", "medium")
             category = finding.get("category", "general")
+            finding_category = finding.get("finding_category", "introduced_bug")
+            causality = finding.get("causality", "unknown")
+            destination = finding.get("publication_destination", "artifact_only")
+            merge_blocking = finding.get("merge_blocking", False)
             lines.extend(
                 [
                     f"{index}. **{finding.get('title', 'Finding')}**",
-                    f"   - Severity: `{severity}` | Confidence: `{confidence}` | Category: `{category}`",
+                    (
+                        f"   - Severity: `{severity}` | Confidence: `{confidence}` | Area: `{category}` | "
+                        f"Type: `{finding_category}` | Causality: `{causality}`"
+                    ),
+                    f"   - Publication: `{destination}` | Merge blocking: `{merge_blocking}`",
                 ]
             )
             if location:
