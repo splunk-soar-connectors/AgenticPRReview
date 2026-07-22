@@ -2168,6 +2168,189 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertIn("HTTP 429 rate limits are handled as generic API errors", titles)
         self.assertIn("Test connectivity consumes a real action endpoint with a fixed indicator", titles)
 
+    def test_full_sdk_migration_zero_pytest_collection_is_flagged(self):
+        review_input = {
+            "pr": {"title": "sdk migration", "body": ""},
+            "changed_files": [
+                {"filename": "legacy.json", "status": "removed", "patch": ""},
+                {"filename": "pyproject.toml", "status": "added", "patch": ""},
+                {"filename": "src/app.py", "status": "added", "patch": ""},
+            ],
+            "full_files": {
+                "pyproject.toml": "[project]\nname = \"sample\"\n[tool.soar.app]\nmain_module = \"src.app:app\"\n",
+                "src/app.py": (
+                    "from soar_sdk.app import App\n"
+                    "from soar_sdk.asset import BaseAsset\n"
+                    "app = App(name='sample', appid='12345678-1234-5678-9012-123456789012', app_type='information', logo='logo.svg', logo_dark='logo_dark.svg', product_vendor='Vendor', product_name='Product', publisher='Vendor', asset_cls=BaseAsset)\n"
+                    "@app.test_connectivity()\n"
+                    "def test_connectivity() -> None:\n"
+                    "    pass\n"
+                ),
+            },
+            "base_files": {"legacy.json": '{"actions": [{"identifier": "lookup", "output": []}]}'},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "failed_check_logs": [
+                    {"name": "pytest", "log_excerpt": "collected 0 items\nno tests ran\nProcess completed with exit code 5"}
+                ],
+            },
+        }
+
+        self.assertIn("Full SDK migration CI collected zero tests", self.titles(review_input))
+
+    def test_generated_manifest_contract_drift_is_flagged(self):
+        review_input = {
+            "pr": {"title": "sdk migration", "body": ""},
+            "changed_files": [
+                {"filename": "legacy.json", "status": "removed", "patch": ""},
+                {"filename": "pyproject.toml", "status": "added", "patch": ""},
+                {"filename": "src/app.py", "status": "added", "patch": ""},
+            ],
+            "full_files": {
+                "pyproject.toml": "[tool.soar.app]\nmain_module = \"src.app:app\"\n",
+                "src/app.py": "from soar_sdk.app import App\napp = App(name='sample')\n",
+            },
+            "base_files": {
+                "legacy.json": (
+                    '{"actions": [{"identifier": "lookup", "action": "lookup", '
+                    '"parameters": {"domain": {"required": true, "contains": ["domain"], "default": "example.com"}}, '
+                    '"output": ['
+                    '{"data_path": "action_result.data.*.id"},'
+                    '{"data_path": "action_result.data.*.risk"},'
+                    '{"data_path": "action_result.data.*.score"},'
+                    '{"data_path": "action_result.summary.total_objects"}'
+                    ']}]}'
+                )
+            },
+            "sdk_manifest": {
+                "attempted": True,
+                "status": "success",
+                "manifest": {
+                    "actions": [
+                        {
+                            "identifier": "lookup",
+                            "action": "lookup",
+                            "parameters": {"domain": {"required": False}},
+                            "output": [{"data_path": "action_result.status"}],
+                        }
+                    ]
+                },
+            },
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        titles = self.titles(review_input)
+
+        self.assertIn("Generated SDK manifest drops legacy output datapaths", titles)
+        self.assertIn("Generated SDK manifest changes legacy action parameter metadata", titles)
+
+    def test_generic_sdk_strict_raw_output_model_is_flagged(self):
+        review_input = {
+            "pr": {"title": "sdk migration", "body": ""},
+            "changed_files": [
+                {"filename": "legacy.json", "status": "removed", "patch": ""},
+                {"filename": "pyproject.toml", "status": "added", "patch": ""},
+                {"filename": "src/app.py", "status": "added", "patch": ""},
+            ],
+            "full_files": {
+                "pyproject.toml": "[tool.soar.app]\nmain_module = \"src.app:app\"\n",
+                "src/app.py": (
+                    "from soar_sdk.action_results import ActionOutput\n"
+                    "from soar_sdk.app import App\n"
+                    "from soar_sdk.params import Params\n"
+                    "app = App(name='sample')\n"
+                    "class LookupOutput(ActionOutput):\n"
+                    "    id: str\n"
+                    "    name: str\n"
+                    "    status: str\n"
+                    "    severity: str\n"
+                    "@app.test_connectivity()\n"
+                    "def test_connectivity() -> None:\n"
+                    "    pass\n"
+                    "@app.action()\n"
+                    "def lookup(params: Params) -> LookupOutput:\n"
+                    "    response_json = call_vendor()\n"
+                    "    return LookupOutput(**response_json)\n"
+                ),
+            },
+            "base_files": {"legacy.json": '{"actions": [{"identifier": "lookup", "output": []}]}'},
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        self.assertIn("SDK output model validates raw API responses with many required fields", self.titles(review_input))
+
+    def test_make_request_security_contracts_are_flagged(self):
+        review_input = {
+            "pr": {"title": "sdk app", "body": ""},
+            "changed_files": [{"filename": "src/app.py", "status": "added", "patch": ""}],
+            "full_files": {
+                "src/app.py": (
+                    "import httpx\n"
+                    "from soar_sdk.action_results import MakeRequestOutput\n"
+                    "from soar_sdk.app import App\n"
+                    "from soar_sdk.params import MakeRequestParams, Param\n"
+                    "app = App(name='sample')\n"
+                    "class CustomMakeRequestParams(MakeRequestParams):\n"
+                    "    verify_ssl: bool = Param(default=False)\n"
+                    "@app.make_request()\n"
+                    "def make_request(params: MakeRequestParams) -> MakeRequestOutput:\n"
+                    "    headers = {'Authorization': f'Bearer {asset.token}'}\n"
+                    "    headers.update(params.headers or {})\n"
+                    "    url = params.endpoint\n"
+                    "    response = httpx.request(params.http_method, url, headers=headers, verify=params.verify_ssl)\n"
+                    "    return MakeRequestOutput(status_code=response.status_code, response_body=response.text)\n"
+                )
+            },
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        titles = self.titles(review_input)
+
+        self.assertIn("`make request` verify_ssl defaults to false", titles)
+        self.assertIn("`make request` lets user headers override connector auth headers", titles)
+        self.assertIn("`make request` endpoint is not product-scoped", titles)
+
+    def test_sdk_validation_cookbook_patterns_are_flagged(self):
+        review_input = {
+            "pr": {"title": "sdk migration", "body": ""},
+            "changed_files": [
+                {"filename": "legacy.json", "status": "removed", "patch": ""},
+                {"filename": "pyproject.toml", "status": "added", "patch": ""},
+                {"filename": "src/app.py", "status": "added", "patch": ""},
+            ],
+            "full_files": {
+                "pyproject.toml": "[tool.soar.app]\nmain_module = \"src.app:app\"\n",
+                "src/app.py": (
+                    "from soar_sdk.action_results import ActionOutput\n"
+                    "from soar_sdk.app import App\n"
+                    "from soar_sdk.params import Params\n"
+                    "app = App(name='sample')\n"
+                    "class LookupParams(Params):\n"
+                    "    page_size: float\n"
+                    "    indicators: str\n"
+                    "    item_id: str\n"
+                    "@app.test_connectivity()\n"
+                    "def test_connectivity() -> None:\n"
+                    "    pass\n"
+                    "@app.action()\n"
+                    "def lookup(params: LookupParams) -> ActionOutput:\n"
+                    "    page_size = int(params.page_size)\n"
+                    "    indicators = params.indicators.split(',')\n"
+                    "    endpoint = f'/api/items/{params.item_id}/children'\n"
+                    "    return ActionOutput()\n"
+                ),
+            },
+            "base_files": {"legacy.json": '{"actions": [{"identifier": "lookup", "output": []}]}'},
+            "ci": {"check_runs": [], "statuses": []},
+        }
+
+        titles = self.titles(review_input)
+
+        self.assertIn("SDK action coerces bounded numeric parameter without range validation", titles)
+        self.assertIn("SDK action splits a list parameter without removing blank values", titles)
+        self.assertIn("SDK action interpolates a parameter into a URL path without encoding", titles)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,16 @@ High-value review pattern library:
   or reshaped nested output datapaths, strict SDK models that validate raw API
   responses without normalization, and migration PR bodies that overclaim output
   compatibility.
+- Full SDK migrations need migration-grade evidence: tests for auth modes,
+  generated metadata/manifest output, output serialization against
+  sparse/minimal responses, validation failures, representative actions, and
+  non-2xx/error handling. `pytest` collecting zero tests is a high-signal
+  blocker for a full migration.
+- Generated SDK metadata is part of runtime behavior. Compare generated
+  manifest and README/datapath rows against `set_summary()`, SDK summary_type,
+  ActionOutput fields, returned/add_data data, required flags, defaults,
+  contains, and cef_types. If the generated manifest contracts legacy outputs
+  or parameter metadata, treat that as a playbook-contract risk.
 - SDK migration tests must import the app through the package entry point used
   by `[tool.soar.app].main_module`; adding `src/` to `sys.path` and importing
   `app` as a top-level module can fail when `src/app.py` uses package-relative
@@ -118,6 +128,11 @@ High-value review pattern library:
   Dynamic attributes added with `object.__setattr__()` after Pydantic model
   construction are suspicious unless the model explicitly supports and emits
   those extra fields.
+- Make-request actions need a dedicated security/contract review: TLS must be
+  safe by default, connector auth headers should not be accidentally overridden
+  by user headers, parse errors must not echo secret-bearing headers/bodies,
+  non-2xx behavior must match declared outputs, and endpoints should stay
+  scoped to the product API boundary.
 - SDK output models built directly from vendor API dictionaries must tolerate
   valid sparse responses. For Microsoft Graph OneDrive/driveItem responses,
   fields and facets such as owner, quota, created/modified timestamps, webUrl,
@@ -132,9 +147,18 @@ High-value review pattern library:
   retry/backoff for transient 429/5xx responses.
 - Missing validation: blank strings, missing
   cross-field validators, unencoded IDs interpolated into URLs.
+- Validation cookbook for connector params: preserve positive-integer and range
+  checks, UUID/GUID validation only when the runtime variable provenance proves
+  that format, non-empty normalized comma/allow-list values, bounded page sizes,
+  no silent `int(...)` truncation, and URL/path-segment encoding for user,
+  tenant, group, repository, folder, file, and vendor object identifiers.
 - Search APIs with query syntax need query parameter
   construction plus escaping/validation of user values before inserting them
   into `domain:...`, `ip:...`, or similar expressions.
+- Auth/OAuth review should cover every supported credential mode, partial
+  credentials, token refresh and 401 retry behavior, OAuth state validation,
+  refresh-token scope requirements, and docs/release notes that still advertise
+  auth modes the executable code no longer supports.
 - CEF/output metadata should match the field semantics. A user display name,
   message, tenant value, or API identifier should not be tagged as a file path
   unless it is actually a filesystem path.

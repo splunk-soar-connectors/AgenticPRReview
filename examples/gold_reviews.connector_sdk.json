@@ -176,6 +176,41 @@
       "bot_coverage": ["deterministic", "prompt"]
     },
     {
+      "id": "full_sdk_migration_gate",
+      "source_reviews": ["43-report-scan-2026-07-22"],
+      "category": "missing_tests",
+      "summary": "Full SDK migrations should not receive a merge recommendation without collected tests, generated manifest/package inspection, and coverage of auth, metadata, output serialization, validation, representative actions, and error handling.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "generated_manifest_contract_sync",
+      "source_reviews": ["43-report-scan-2026-07-22", "taniumrest-37", "cyberintpremiumioc-2"],
+      "category": "output_schema_mismatch",
+      "summary": "Generated manifest/README metadata must match runtime set_summary/add_data/ActionOutput behavior, including output datapaths, summary_type, required flags, defaults, contains, and cef_types.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "make_request_security_contract",
+      "source_reviews": ["43-report-scan-2026-07-22", "github-39", "urlscan-52"],
+      "category": "api_auth_correctness",
+      "summary": "Generic make request actions need safe TLS defaults, product-scoped endpoints, auth-header precedence, secret-safe parse errors, non-2xx output semantics, and focused tests.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "validation_cookbook",
+      "source_reviews": ["43-report-scan-2026-07-22", "github-39", "taniumrest-37", "urlscan-52"],
+      "category": "validation",
+      "summary": "Connector validation should cover positive integers, ranges, UUIDs only with proven provenance, non-empty normalized lists, page sizes, path segment encoding, and no silent truncation.",
+      "bot_coverage": ["deterministic", "prompt"]
+    },
+    {
+      "id": "auth_matrix_testing",
+      "source_reviews": ["43-report-scan-2026-07-22", "github-39", "microsoftonedrive-36"],
+      "category": "api_auth_correctness",
+      "summary": "Auth-sensitive PRs should test every supported auth mode, partial credentials, token refresh, 401 retry, OAuth state validation, refresh-token scope requirements, and docs accuracy.",
+      "bot_coverage": ["prompt"]
+    },
+    {
       "id": "docs_pr_accuracy",
       "source_reviews": ["ip2locationioapi-11", "taniumrest-34", "github-39", "urlscan-52"],
       "category": "docs_pr_accuracy",

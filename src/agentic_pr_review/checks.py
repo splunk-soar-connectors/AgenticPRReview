@@ -119,13 +119,17 @@ def run_deterministic_checks(review_input: dict[str, Any]) -> list[dict[str, Any
     findings.extend(check_sdk_summary_type_missing(full_files))
     findings.extend(check_sdk_app_contracts(review_input, full_files))
     findings.extend(check_sdk_migration_parity(review_input, full_files))
+    findings.extend(check_sdk_full_migration_gate(review_input, full_files))
     findings.extend(check_sdk_large_output_schema_contractions(review_input, full_files))
+    findings.extend(check_sdk_generic_strict_output_models(review_input, full_files))
     findings.extend(check_sdk_pat_only_auth_regression(review_input, full_files))
     findings.extend(check_sdk_issue_number_validation_regressions(review_input, full_files))
     findings.extend(check_sdk_make_request_dynamic_output_serialization(full_files))
     findings.extend(check_sdk_make_request_missing_tests(review_input, full_files))
+    findings.extend(check_make_request_security_contracts(review_input, full_files))
     findings.extend(check_sdk_tests_import_package_app_as_top_level(review_input, full_files))
     findings.extend(check_sdk_manifest_result(review_input))
+    findings.extend(check_sdk_generated_manifest_contract_drift(review_input))
     findings.extend(check_microsoft_graph_sdk_response_modeling(review_input, full_files))
     findings.extend(check_large_file_transfer_patterns(review_input, full_files))
     findings.extend(check_upload_session_resilience(review_input, full_files))
@@ -146,6 +150,7 @@ def run_deterministic_checks(review_input: dict[str, Any]) -> list[dict[str, Any
     findings.extend(check_unreachable_code(review_input, full_files))
     findings.extend(check_branch_local_exception_imports(full_files))
     findings.extend(check_sdk_numeric_validation_regressions(review_input, full_files))
+    findings.extend(check_sdk_validation_cookbook_regressions(review_input, full_files))
     findings.extend(check_graph_target_user_id_normalization(full_files))
     findings.extend(check_obviously_wrong_output_cef_types(full_files))
     findings.extend(check_search_query_user_input_interpolation(full_files))
@@ -1947,6 +1952,189 @@ def check_sdk_make_request_missing_tests(
     ]
 
 
+def check_make_request_security_contracts(
+    review_input: dict[str, Any],
+    full_files: dict[str, str],
+) -> list[dict[str, Any]]:
+    inventory = build_sdk_review_inventory(review_input, full_files)
+    if not inventory["is_sdk_app"]:
+        return []
+
+    actions = [
+        action
+        for action in inventory["python"].get("action_registrations", [])
+        if action.get("registration_type") == "make_request" or action.get("identifier") == "make_request"
+    ]
+    if not actions:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    entries = make_request_function_entries(actions, full_files)
+
+    verify_default = make_request_verify_ssl_default_false(full_files)
+    if verify_default:
+        file_path, line, evidence = verify_default
+        findings.append(
+            {
+                "title": "`make request` verify_ssl defaults to false",
+                "category": "api_auth_correctness",
+                "severity": "high",
+                "confidence": "high",
+                "file": file_path,
+                "line": line,
+                "code_reference": "verify_ssl",
+                "evidence": evidence,
+                "why_it_matters": "Arbitrary make-request actions are commonly used for live API troubleshooting; silently defaulting TLS verification off weakens every request made through that action.",
+                "suggested_fix": "Default `verify_ssl` to true, honor the asset-level TLS setting when one exists, and require an explicit user choice before disabling certificate verification.",
+            }
+        )
+
+    for entry in entries:
+        body = entry["body"]
+        lowered = body.lower()
+        if (
+            ("authorization" in lowered or "api-key" in lowered or "api_key" in lowered or "bearer " in lowered)
+            and (
+                re.search(r"\bheaders\.update\s*\(\s*params\.headers", body)
+                or re.search(r"\{\s*\*\*headers\s*,\s*\*\*params\.headers", body)
+                or re.search(r"\bheaders\s*=\s*headers\s*\|\s*params\.headers", body)
+            )
+        ):
+            findings.append(
+                {
+                    "title": "`make request` lets user headers override connector auth headers",
+                    "category": "api_auth_correctness",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": entry["file"],
+                    "line": line_in_body(entry, "headers.update") or line_in_body(entry, "params.headers") or entry["line"],
+                    "code_reference": entry["function"],
+                    "evidence": "The make-request handler builds connector auth headers and then merges `params.headers` after them.",
+                    "why_it_matters": "A user-supplied Authorization or API-key header can replace the connector's authenticated header, changing the auth context or leaking confusing failures through a generic make-request path.",
+                    "suggested_fix": "Merge user headers first and then apply connector auth headers, or explicitly reject user-supplied auth header names for make request.",
+                }
+            )
+            break
+
+    for entry in entries:
+        body = entry["body"]
+        if not make_request_uses_unscoped_endpoint(body):
+            continue
+        findings.append(
+            {
+                "title": "`make request` endpoint is not product-scoped",
+                "category": "api_auth_correctness",
+                "severity": "medium",
+                "confidence": "high",
+                "file": entry["file"],
+                "line": line_in_body(entry, "params.endpoint") or entry["line"],
+                "code_reference": entry["function"],
+                "evidence": "`params.endpoint` is passed as the request URL without visible base-URL joining or absolute-URL rejection.",
+                "why_it_matters": "A connector make-request action should be constrained to the product API boundary; sending arbitrary absolute URLs through the connector auth/session path can create surprising SSRF-like behavior or incorrect auth routing.",
+                "suggested_fix": "Require relative endpoints, reject absolute URLs, and join the path to the connector's product base URL before issuing the request.",
+            }
+        )
+        break
+
+    for entry in entries:
+        body = entry["body"]
+        if not make_request_parse_error_echoes_user_secrets(body):
+            continue
+        findings.append(
+            {
+                "title": "`make request` parse errors can echo user-supplied secrets",
+                "category": "unsafe_logging",
+                "severity": "medium",
+                "confidence": "high",
+                "file": entry["file"],
+                "line": line_in_body(entry, "params.headers") or line_in_body(entry, "params.body") or entry["line"],
+                "code_reference": entry["function"],
+                "evidence": "The make-request parser formats raw user headers/body into an exception or action-result message.",
+                "why_it_matters": "Make-request headers and bodies often contain bearer tokens, API keys, cookies, or tenant data; parse errors should not echo them back into SOAR logs or action messages.",
+                "suggested_fix": "Report only the invalid field name and parse error class, and redact or omit the raw header/body value from user-facing messages.",
+            }
+        )
+        break
+
+    return findings
+
+
+def make_request_function_entries(
+    actions: list[dict[str, Any]],
+    full_files: dict[str, str],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for action in actions:
+        file_path = str(action.get("implementation_file") or action.get("file") or "")
+        function_name = str(action.get("function") or "")
+        if not file_path or not function_name:
+            continue
+        text = full_files.get(file_path, "")
+        body = function_body_text(text, function_name)
+        if not body:
+            continue
+        entries.append(
+            {
+                "file": file_path,
+                "line": int(action.get("implementation_line") or action.get("line") or 1),
+                "function": function_name,
+                "body": body,
+            }
+        )
+    return entries
+
+
+def make_request_verify_ssl_default_false(full_files: dict[str, str]) -> tuple[str, int, str] | None:
+    pattern = re.compile(
+        r"verify_ssl\s*:\s*[^=\n]+=\s*(?:Param\s*\([^)]*default\s*=\s*False|False\b)",
+        re.S,
+    )
+    call_pattern = re.compile(r"verify_ssl\s*=\s*Param\s*\([^)]*default\s*=\s*False", re.S)
+    for path, text in full_files.items():
+        if not path.endswith(".py") or "verify_ssl" not in text:
+            continue
+        match = pattern.search(text) or call_pattern.search(text)
+        if not match:
+            continue
+        line = text[: match.start()].count("\n") + 1
+        return path, line, line_from_match(text, match.start())
+    return None
+
+
+def make_request_uses_unscoped_endpoint(body: str) -> bool:
+    if not re.search(r"\bparams\.endpoint\b", body):
+        return False
+    direct_patterns = (
+        r"\burl\s*=\s*params\.endpoint\b",
+        r"\bendpoint\s*=\s*params\.endpoint\b",
+        r"\b(?:requests|httpx)\.(?:get|post|put|patch|delete|request)\s*\([^)]*params\.endpoint",
+        r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:get|post|put|patch|delete|request)\s*\([^)]*params\.endpoint",
+    )
+    if not any(re.search(pattern, body, flags=re.S) for pattern in direct_patterns):
+        return False
+    safe_terms = ("urljoin(", "urlparse(", "base_url", "asset.base_url", "startswith('/')", "startswith(\"/\")")
+    return not any(term in body for term in safe_terms)
+
+
+def make_request_parse_error_echoes_user_secrets(body: str) -> bool:
+    if not any(term in body for term in ("params.headers", "params.body", "params.query_parameters")):
+        return False
+    secret_field_pattern = r"params\.(?:headers|body|query_parameters)"
+    return bool(
+        re.search(r"(?:ActionFailure|ValueError|set_status|raise)\s*\([^)]*" + secret_field_pattern, body, flags=re.S)
+        or re.search(r"f[\"'][^\"']*\{" + secret_field_pattern, body)
+        or re.search(r"str\s*\(\s*" + secret_field_pattern, body)
+    )
+
+
+def line_in_body(entry: dict[str, Any], needle: str) -> int | None:
+    body = str(entry.get("body") or "")
+    local = find_line(body, needle)
+    if local is None:
+        return None
+    return int(entry.get("line") or 1) + local - 1
+
+
 def check_sdk_tests_import_package_app_as_top_level(
     review_input: dict[str, Any],
     full_files: dict[str, str],
@@ -2163,6 +2351,137 @@ def check_sdk_large_output_schema_contractions(
     return findings[:3]
 
 
+def check_sdk_generic_strict_output_models(
+    review_input: dict[str, Any],
+    full_files: dict[str, str],
+) -> list[dict[str, Any]]:
+    inventory = build_sdk_review_inventory(review_input, full_files)
+    if not inventory["is_sdk_migration"]:
+        return []
+    if has_sparse_response_tests(full_files):
+        return []
+
+    call_sites = raw_output_model_call_sites(full_files)
+    if not call_sites:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for path, text in full_files.items():
+        if not path.endswith(".py") or is_test_path(path):
+            continue
+        classes = extract_sdk_output_classes(text)
+        if not classes:
+            continue
+        for class_name, info in classes.items():
+            if class_name.endswith("SummaryOutput") or class_name.endswith("Params") or class_name == "MakeRequestOutput":
+                continue
+            if class_name not in call_sites:
+                continue
+            required_fields = [
+                field
+                for field in info.get("fields", [])
+                if field_is_required_like(field) and not sdk_field_annotation_is_permissive(str(field.get("annotation") or ""))
+            ]
+            if len(required_fields) < 3:
+                continue
+            call_site = call_sites[class_name][0]
+            examples = [
+                f"{field['name']}: {field['annotation']}"
+                for field in required_fields[:8]
+            ]
+            findings.append(
+                {
+                    "title": "SDK output model validates raw API responses with many required fields",
+                    "category": "output_schema_mismatch",
+                    "severity": "medium",
+                    "confidence": "medium",
+                    "file": path,
+                    "line": int(required_fields[0]["line"]),
+                    "code_reference": class_name,
+                    "evidence": (
+                        f"`{class_name}` has {len(required_fields)} required modeled fields "
+                        f"({examples}) and is built from raw response-shaped data at "
+                        f"{call_site['file']}:{call_site['line']}."
+                    ),
+                    "why_it_matters": "Full SDK migrations replace legacy raw `add_data()` behavior with typed output construction. Vendor APIs often omit optional fields, so strict models can make successful API calls fail locally before SOAR receives data.",
+                    "suggested_fix": "Default API response fields to optional/permissive unless the vendor contract proves they are always present, and add sparse/minimal response fixtures that construct the SDK output model.",
+                }
+            )
+            break
+    return findings[:3]
+
+
+def has_sparse_response_tests(full_files: dict[str, str]) -> bool:
+    test_text = "\n".join(text for path, text in full_files.items() if is_test_path(path)).lower()
+    return any(
+        term in test_text
+        for term in (
+            "sparse",
+            "minimal",
+            "missing field",
+            "missing_field",
+            "optional",
+            "model_validate",
+            "model_dump",
+            "payload variant",
+            "response variant",
+        )
+    )
+
+
+def sdk_field_annotation_is_permissive(annotation: str) -> bool:
+    lowered = annotation.lower().replace("typing.", "")
+    return bool(re.search(r"\b(any|dict|mapping|object)\b", lowered)) or "permissive" in lowered
+
+
+def raw_output_model_call_sites(full_files: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
+    output: dict[str, list[dict[str, Any]]] = {}
+    raw_names = {
+        "response",
+        "response_body",
+        "response_data",
+        "response_json",
+        "result",
+        "result_json",
+        "payload",
+        "payload_json",
+        "data",
+        "item",
+        "row",
+        "record",
+    }
+    for path, text in full_files.items():
+        if not path.endswith(".py") or is_test_path(path):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            class_name: str | None = None
+            raw_argument = False
+            if isinstance(node.func, ast.Name) and node.func.id.endswith("Output"):
+                class_name = node.func.id
+                raw_argument = any(keyword.arg is None for keyword in node.keywords)
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"model_validate", "parse_obj"}
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id.endswith("Output")
+            ):
+                class_name = node.func.value.id
+                raw_argument = any(
+                    isinstance(arg, ast.Name) and arg.id in raw_names
+                    for arg in node.args[:1]
+                )
+            if not class_name or not raw_argument:
+                continue
+            output.setdefault(class_name, []).append({"file": path, "line": node.lineno})
+    return output
+
+
 def collect_sdk_output_models(full_files: dict[str, str]) -> dict[str, dict[str, Any]]:
     models: dict[str, dict[str, Any]] = {}
     for path, text in full_files.items():
@@ -2285,6 +2604,134 @@ def check_sdk_migration_missing_regression_tests(
             "suggested_fix": "Add mocked regression tests for migrated output models, action summaries, parameter validation/failure paths, and representative API responses before merge.",
         }
     ]
+
+
+def check_sdk_full_migration_gate(
+    review_input: dict[str, Any],
+    full_files: dict[str, str],
+) -> list[dict[str, Any]]:
+    inventory = build_sdk_review_inventory(review_input, full_files)
+    if not inventory["is_sdk_migration"]:
+        return []
+
+    target_file = sdk_target_file(inventory)
+    target_line = 1
+    if inventory["python"].get("app_instances"):
+        target_file = inventory["python"]["app_instances"][0]["file"]
+        target_line = inventory["python"]["app_instances"][0]["line"]
+
+    findings: list[dict[str, Any]] = []
+    if sdk_pytest_collected_zero_tests(review_input):
+        findings.append(
+            {
+                "title": "Full SDK migration CI collected zero tests",
+                "category": "missing_tests",
+                "severity": "high",
+                "confidence": "high",
+                "file": "pyproject.toml" if "pyproject.toml" in full_files else target_file,
+                "line": find_line(full_files.get("pyproject.toml", ""), "[tool.pytest") or target_line,
+                "code_reference": "pytest",
+                "evidence": "CI output indicates pytest collected no tests or exited with the no-tests status for this SDK migration.",
+                "why_it_matters": "A full SDK migration rewrites auth, metadata, output serialization, validation, action dispatch, and error handling. A green-looking migration with zero collected tests gives no regression evidence.",
+                "suggested_fix": "Add checked-in pytest tests and fix the pytest discovery configuration so CI collects them before merge.",
+            }
+        )
+
+    manifest_result = review_input.get("sdk_manifest")
+    if isinstance(manifest_result, dict) and manifest_result.get("attempted") is False:
+        findings.append(
+            {
+                "title": "Full SDK migration skipped generated manifest inspection",
+                "category": "soar_metadata",
+                "severity": "high",
+                "confidence": "medium",
+                "file": "pyproject.toml" if "pyproject.toml" in full_files else target_file,
+                "line": find_line(full_files.get("pyproject.toml", ""), "main_module") or target_line,
+                "code_reference": "soarapps manifests create",
+                "evidence": "The review context explicitly says SDK manifest generation was not attempted for a full SDK migration.",
+                "why_it_matters": "The generated manifest is the packaged metadata users receive; SDK migrations can look correct in Python while generated actions, config fields, summary metadata, or output paths are wrong.",
+                "suggested_fix": "Run `soarapps manifests create` or package build for the migrated SDK app and review the generated manifest before merge.",
+            }
+        )
+
+    test_files = {
+        path: text
+        for path, text in full_files.items()
+        if is_test_path(path) and path.endswith(".py") and not path.endswith("__init__.py")
+    }
+    if not test_files:
+        return findings
+
+    coverage = sdk_migration_test_coverage_topics(test_files, inventory)
+    missing_topics = [name for name, present in coverage.items() if not present]
+    if len(missing_topics) >= 3:
+        first_test = sorted(test_files)[0]
+        findings.append(
+            {
+                "title": "SDK migration tests miss core migration-risk areas",
+                "category": "missing_tests",
+                "severity": "medium",
+                "confidence": "medium",
+                "file": first_test,
+                "line": 1,
+                "code_reference": "SDK migration test coverage",
+                "evidence": f"Checked-in tests are present, but these migration gate areas were not visibly covered: {missing_topics}.",
+                "why_it_matters": "Human reviews repeatedly found SDK migration bugs in auth modes, generated metadata, output serialization, parameter validation, representative action behavior, and API error paths.",
+                "suggested_fix": "Add focused tests for the missing areas: auth/test_connectivity, generated manifest/metadata, output model serialization, validation failures, representative migrated actions, and non-2xx/error handling.",
+            }
+        )
+    return findings
+
+
+def sdk_pytest_collected_zero_tests(review_input: dict[str, Any]) -> bool:
+    ci = review_input.get("ci") or {}
+    if not isinstance(ci, dict):
+        return False
+    pieces: list[str] = []
+    for run in ci.get("check_runs", []):
+        if not isinstance(run, dict):
+            continue
+        pieces.append(str(run.get("name") or ""))
+        output = run.get("output") if isinstance(run.get("output"), dict) else {}
+        pieces.append(str(output.get("summary") or ""))
+        pieces.append(str(output.get("text") or ""))
+    for log in ci.get("failed_check_logs", []):
+        if not isinstance(log, dict):
+            continue
+        pieces.append(str(log.get("name") or ""))
+        pieces.append(str(log.get("log_excerpt") or ""))
+    text = "\n".join(pieces).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "collected 0 items",
+            "collected 0 tests",
+            "no tests ran",
+            "exit code 5",
+            "pytest_exit_code=5",
+        )
+    )
+
+
+def sdk_migration_test_coverage_topics(
+    test_files: dict[str, str],
+    inventory: dict[str, Any],
+) -> dict[str, bool]:
+    text = "\n".join(test_files.values()).lower()
+    action_names = [
+        str(item.get("identifier") or item.get("function") or "").lower()
+        for item in inventory["python"].get("action_registrations", [])
+        if item.get("identifier") not in {None, "", "test_connectivity"}
+    ]
+    action_mentions = sum(1 for name in set(action_names) if name and name in text)
+    return {
+        "auth": any(term in text for term in ("auth", "oauth", "token", "client_secret", "personal_access_token", "test_connectivity")),
+        "metadata": any(term in text for term in ("manifest", "pyproject", "assetfield", "read_only", "summary_type", "app_version")),
+        "output_serialization": any(term in text for term in ("actionoutput", "model_validate", "model_dump", "output", "summary", "action_result.data")),
+        "validation": any(term in text for term in ("pytest.raises", "actionfailure", "invalid", "validation", "positive", "non-empty", "empty string")),
+        "representative_actions": action_mentions >= min(2, max(1, len(set(action_names)))),
+        "error_handling": any(term in text for term in ("status_code", "httpstatuserror", "raise_for_status", "non-2xx", "4xx", "5xx", "error response", "actionfailure")),
+    }
 
 
 def sdk_actions_by_identifier(python: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2481,6 +2928,187 @@ def check_sdk_manifest_result(review_input: dict[str, Any]) -> list[dict[str, An
             break
 
     return findings
+
+
+def check_sdk_generated_manifest_contract_drift(review_input: dict[str, Any]) -> list[dict[str, Any]]:
+    manifest_result = review_input.get("sdk_manifest")
+    if not isinstance(manifest_result, dict) or manifest_result.get("status") != "success":
+        return []
+    generated = manifest_result.get("manifest")
+    if not isinstance(generated, dict):
+        return []
+
+    legacy_app_jsons = legacy_root_app_jsons(review_input)
+    if not legacy_app_jsons:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    generated_actions = {
+        str(action.get("identifier") or ""): action
+        for action in generated.get("actions", [])
+        if isinstance(action, dict) and action.get("identifier")
+    }
+    legacy_actions = legacy_actions_by_identifier(legacy_app_jsons)
+
+    output_drops = generated_manifest_output_drops(legacy_actions, generated_actions)
+    if output_drops:
+        first_identifier, first_detail = output_drops[0]
+        findings.append(
+            {
+                "title": "Generated SDK manifest drops legacy output datapaths",
+                "category": "output_schema_mismatch",
+                "severity": "high",
+                "confidence": "high",
+                "file": "pyproject.toml",
+                "line": 1,
+                "code_reference": first_identifier,
+                "evidence": "; ".join(detail for _, detail in output_drops[:4]),
+                "why_it_matters": "The generated SDK manifest controls README/datapath discovery and playbook-visible output paths. Dropping legacy data or summary paths in a migration can silently break existing playbooks even if Python returns raw data.",
+                "suggested_fix": "Preserve the legacy datapaths in SDK ActionOutput/summary models and regenerate the manifest, or add an explicit migration note for every intentionally changed output path.",
+            }
+        )
+
+    param_drops = generated_manifest_parameter_drift(legacy_actions, generated_actions)
+    if param_drops:
+        first_identifier, first_param, first_detail = param_drops[0]
+        findings.append(
+            {
+                "title": "Generated SDK manifest changes legacy action parameter metadata",
+                "category": "soar_metadata",
+                "severity": "high",
+                "confidence": "high",
+                "file": "pyproject.toml",
+                "line": 1,
+                "code_reference": f"{first_identifier}.{first_param}",
+                "evidence": "; ".join(detail for _, _, detail in param_drops[:6]),
+                "why_it_matters": "Required flags, defaults, and contains/CEF metadata are part of the SOAR action contract. Changing them during an SDK migration can break playbooks, prompts, and typed indicator handling.",
+                "suggested_fix": "Align SDK Param metadata with the legacy manifest or explicitly document and release-note each intentional required/default/contains change.",
+            }
+        )
+
+    return findings
+
+
+def legacy_root_app_jsons(review_input: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    base_files = review_input.get("base_files") if isinstance(review_input.get("base_files"), dict) else {}
+    manifests = load_app_jsons(base_files or {})
+    full_files = review_input.get("full_files") if isinstance(review_input.get("full_files"), dict) else {}
+    removed_paths = {
+        str(item.get("filename"))
+        for item in review_input.get("changed_files", [])
+        if isinstance(item, dict) and item.get("status") == "removed" and "/" not in str(item.get("filename") or "") and str(item.get("filename") or "").endswith(".json")
+    }
+    removed_manifests = load_app_jsons({path: str(full_files.get(path) or "") for path in removed_paths})
+    manifests.update(removed_manifests)
+    return manifests
+
+
+def legacy_actions_by_identifier(app_jsons: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for app_json in app_jsons.values():
+        for action in app_json.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            identifier = str(action.get("identifier") or "").strip()
+            if identifier:
+                output[identifier] = action
+    return output
+
+
+def generated_manifest_output_drops(
+    legacy_actions: dict[str, dict[str, Any]],
+    generated_actions: dict[str, dict[str, Any]],
+) -> list[tuple[str, str]]:
+    drops: list[tuple[str, str]] = []
+    for identifier, legacy_action in legacy_actions.items():
+        generated_action = generated_actions.get(identifier)
+        if not generated_action:
+            continue
+        legacy_paths = action_output_paths(legacy_action)
+        generated_paths = action_output_paths(generated_action)
+        legacy_interesting = {
+            path
+            for path in legacy_paths
+            if path.startswith("action_result.data.") or path.startswith("action_result.summary.")
+        }
+        if not legacy_interesting:
+            continue
+        missing = sorted(path for path in legacy_interesting if path not in generated_paths)
+        if not missing:
+            continue
+        legacy_data_count = sum(1 for path in legacy_interesting if path.startswith("action_result.data."))
+        legacy_summary_count = sum(1 for path in legacy_interesting if path.startswith("action_result.summary."))
+        missing_data_count = sum(1 for path in missing if path.startswith("action_result.data."))
+        missing_summary_count = sum(1 for path in missing if path.startswith("action_result.summary."))
+        if missing_summary_count or missing_data_count >= 3 or missing_data_count >= max(1, int(legacy_data_count * 0.4)):
+            drops.append(
+                (
+                    identifier,
+                    (
+                        f"`{identifier}` generated output is missing {missing_data_count}/{legacy_data_count} "
+                        f"legacy data paths and {missing_summary_count}/{legacy_summary_count} summary paths; "
+                        f"examples: {missing[:6]}"
+                    ),
+                )
+            )
+    return drops
+
+
+def generated_manifest_parameter_drift(
+    legacy_actions: dict[str, dict[str, Any]],
+    generated_actions: dict[str, dict[str, Any]],
+) -> list[tuple[str, str, str]]:
+    drift: list[tuple[str, str, str]] = []
+    for identifier, legacy_action in legacy_actions.items():
+        generated_action = generated_actions.get(identifier)
+        if not generated_action:
+            continue
+        legacy_params = params_by_name(legacy_action)
+        generated_params = params_by_name(generated_action)
+        for name, legacy_param in legacy_params.items():
+            generated_param = generated_params.get(name)
+            if not generated_param:
+                continue
+            changes = []
+            for key in ("required", "default"):
+                legacy_value = normalized_param_value(legacy_param.get(key))
+                generated_value = normalized_param_value(generated_param.get(key))
+                if legacy_value != generated_value:
+                    changes.append(f"{key}: legacy={legacy_value!r}, generated={generated_value!r}")
+            legacy_contains = normalized_contains_value(legacy_param)
+            generated_contains = normalized_contains_value(generated_param)
+            if legacy_contains and legacy_contains != generated_contains:
+                changes.append(f"contains/cef_types: legacy={legacy_contains!r}, generated={generated_contains!r}")
+            if changes:
+                drift.append((identifier, name, f"`{identifier}.{name}` changed {', '.join(changes)}"))
+    return drift
+
+
+def params_by_name(action: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("name") or item.get("identifier") or "").strip(): item
+        for item in action_parameters(action)
+        if str(item.get("name") or item.get("identifier") or "").strip()
+    }
+
+
+def normalized_param_value(value: Any) -> Any:  # noqa: ANN401
+    if isinstance(value, str):
+        return value.strip().lower()
+    return value
+
+
+def normalized_contains_value(param: dict[str, Any]) -> tuple[str, ...]:
+    raw = param.get("contains")
+    if raw is None:
+        raw = param.get("cef_types")
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return (raw.strip().lower(),) if raw.strip() else ()
+    if isinstance(raw, list):
+        return tuple(sorted(str(item).strip().lower() for item in raw if str(item).strip()))
+    return (str(raw).strip().lower(),)
 
 
 def sdk_manifest_failure_is_project_blocker(manifest_result: dict[str, Any]) -> bool:
@@ -3783,6 +4411,190 @@ def check_sdk_numeric_validation_regressions(
             }
         ]
     return []
+
+
+def check_sdk_validation_cookbook_regressions(
+    review_input: dict[str, Any],
+    full_files: dict[str, str],
+) -> list[dict[str, Any]]:
+    if not build_sdk_review_inventory(review_input, full_files).get("is_sdk_migration"):
+        return []
+
+    findings: list[dict[str, Any]] = []
+    numeric = sdk_bounded_numeric_without_validation(full_files)
+    if numeric:
+        path, line, param_name = numeric
+        findings.append(
+            {
+                "title": "SDK action coerces bounded numeric parameter without range validation",
+                "category": "validation",
+                "severity": "medium",
+                "confidence": "high",
+                "file": path,
+                "line": line,
+                "code_reference": f"params.{param_name}",
+                "evidence": f"`params.{param_name}` is coerced with `int(...)` without a nearby range/positive-integer validation guard.",
+                "why_it_matters": "SDK type hints do not preserve legacy validation semantics by themselves; page sizes, limits, offsets, counts, and durations can be silently truncated or sent outside vendor/API bounds.",
+                "suggested_fix": "Validate integer-ness and the allowed range before coercion, then raise ActionFailure with the parameter name when the value is fractional, zero/negative, or outside the documented bounds.",
+            }
+        )
+
+    split_list = sdk_list_split_without_normalization(full_files)
+    if split_list:
+        path, line, param_name = split_list
+        findings.append(
+            {
+                "title": "SDK action splits a list parameter without removing blank values",
+                "category": "validation",
+                "severity": "medium",
+                "confidence": "high",
+                "file": path,
+                "line": line,
+                "code_reference": f"params.{param_name}",
+                "evidence": f"`params.{param_name}.split(',')` is used without nearby stripping/filtering of empty entries.",
+                "why_it_matters": "Allow-list and comma-separated parameters often arrive with whitespace or trailing commas; sending blank entries to an API can change filters, produce confusing errors, or bypass intended validation.",
+                "suggested_fix": "Normalize with `[item.strip() for item in value.split(',') if item.strip()]`, reject an empty normalized list when required, and add validation tests for whitespace/trailing-comma inputs.",
+            }
+        )
+
+    path_segment = sdk_path_segment_without_encoding(full_files)
+    if path_segment:
+        path, line, param_name = path_segment
+        findings.append(
+            {
+                "title": "SDK action interpolates a parameter into a URL path without encoding",
+                "category": "validation",
+                "severity": "medium",
+                "confidence": "high",
+                "file": path,
+                "line": line,
+                "code_reference": f"params.{param_name}",
+                "evidence": f"`params.{param_name}` is formatted directly into a URL path segment without visible `quote(...)` or equivalent encoding.",
+                "why_it_matters": "Identifiers such as folders, repository names, tenants, users, and vendor object IDs can contain `/`, spaces, `#`, or query characters; unencoded path interpolation can route the request to the wrong object or fail outside connector validation.",
+                "suggested_fix": "URL-encode path parameters with `urllib.parse.quote(value, safe='')` before formatting them into endpoints, or validate the parameter against the exact vendor path-segment grammar.",
+            }
+        )
+
+    return findings
+
+
+def sdk_bounded_numeric_without_validation(full_files: dict[str, str]) -> tuple[str, int, str] | None:
+    risky_names = re.compile(
+        r"(?:page|page_size|per_page|limit|offset|max|size|count|days|hours|minutes|timeout|duration|results?)",
+        re.I,
+    )
+    int_pattern = re.compile(r"int\s*\(\s*params\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)")
+    skip_prefixes = ("return_when", "wait_for", "issue_number")
+    for path, text in full_files.items():
+        if not path.endswith(".py") or is_test_path(path):
+            continue
+        for function_name, start_line, body in python_function_bodies(text):
+            del function_name
+            for match in int_pattern.finditer(body):
+                name = match.group("name")
+                if name.startswith(skip_prefixes) or not risky_names.search(name):
+                    continue
+                window = body[max(0, match.start() - 900) : min(len(body), match.end() + 900)]
+                if sdk_numeric_validation_present(window, name):
+                    continue
+                return path, start_line + body[: match.start()].count("\n"), name
+    return None
+
+
+def sdk_numeric_validation_present(window: str, name: str) -> bool:
+    lowered = window.lower()
+    normalized = name.lower()
+    validation_terms = (
+        f"{normalized} <",
+        f"{normalized}<",
+        f"{normalized} >",
+        f"{normalized}>",
+        f"{normalized} <=",
+        f"{normalized}<=",
+        f"{normalized} >=",
+        f"{normalized}>=",
+        f"params.{normalized} <",
+        f"params.{normalized}<",
+        f"params.{normalized} >",
+        f"params.{normalized}>",
+        ".is_integer()",
+        "positive integer",
+        "non-negative",
+        "out of range",
+        "must be",
+        "actionfailure",
+        "ge=",
+        "gt=",
+        "le=",
+        "lt=",
+    )
+    return any(term in lowered for term in validation_terms)
+
+
+def sdk_list_split_without_normalization(full_files: dict[str, str]) -> tuple[str, int, str] | None:
+    split_pattern = re.compile(r"params\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.split\s*\(\s*['\"],['\"]\s*\)")
+    for path, text in full_files.items():
+        if not path.endswith(".py") or is_test_path(path):
+            continue
+        for function_name, start_line, body in python_function_bodies(text):
+            del function_name
+            for match in split_pattern.finditer(body):
+                window = body[max(0, match.start() - 500) : min(len(body), match.end() + 900)]
+                if any(term in window for term in (".strip()", "if item", "if value", "filter(None", "not item.strip")):
+                    continue
+                return path, start_line + body[: match.start()].count("\n"), match.group("name")
+    return None
+
+
+def sdk_path_segment_without_encoding(full_files: dict[str, str]) -> tuple[str, int, str] | None:
+    path_param_pattern = re.compile(
+        r"f[\"'][^\"'\n]*[/][^\"'\n]*\{[^}]*params\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)[^}]*\}[^\"'\n]*[\"']"
+    )
+    path_name_terms = (
+        "id",
+        "name",
+        "path",
+        "folder",
+        "file",
+        "drive",
+        "repo",
+        "owner",
+        "user",
+        "tenant",
+        "domain",
+        "url",
+        "ip",
+        "group",
+    )
+    for path, text in full_files.items():
+        if not path.endswith(".py") or is_test_path(path):
+            continue
+        for function_name, start_line, body in python_function_bodies(text):
+            del function_name
+            for match in path_param_pattern.finditer(body):
+                name = match.group("name")
+                if not any(term in name.lower() for term in path_name_terms):
+                    continue
+                window = body[max(0, match.start() - 800) : min(len(body), match.end() + 800)]
+                if any(term in window for term in ("quote(", "quote_plus(", "urlencode(", "urllib.parse.quote")):
+                    continue
+                return path, start_line + body[: match.start()].count("\n"), name
+    return None
+
+
+def python_function_bodies(text: str) -> list[tuple[str, int, str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    lines = text.splitlines()
+    bodies: list[tuple[str, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        end = getattr(node, "end_lineno", node.lineno)
+        bodies.append((node.name, node.lineno, "\n".join(lines[node.lineno - 1 : end])))
+    return bodies
 
 
 def check_graph_target_user_id_normalization(full_files: dict[str, str]) -> list[dict[str, Any]]:
