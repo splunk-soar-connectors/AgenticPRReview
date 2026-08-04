@@ -121,6 +121,35 @@ class CollectorHelpersTest(unittest.TestCase):
         self.assertIn("F401", summary)
         self.assertNotIn("setup line", summary)
 
+    def test_summarize_ci_log_prioritizes_detect_secrets_failure_over_setup_noise(self):
+        text = "\n".join(
+            [
+                "2026-08-04T19:16:09.1474127Z [INFO] Initializing environment for https://github.com/pre-commit/pre-commit-hooks.",
+                "2026-08-04T19:16:09.6462018Z [INFO] Initializing environment for https://github.com/astral-sh/ruff-pre-commit.",
+                "2026-08-04T19:16:11.4801993Z [INFO] Initializing environment for https://github.com/hukkin/mdformat.",
+                "2026-08-04T19:16:12.1132660Z [INFO] Initializing environment for https://github.com/returntocorp/semgrep.",
+                "Detect secrets...........................................................Failed",
+                "- hook id: detect-secrets",
+                "- exit code: 1",
+                "",
+                "ERROR: Potential secrets about to be committed to git repo!",
+                "",
+                "Secret Type: Secret Keyword",
+                "Location:    .github/workflows/agentic-pr-review.yml:206",
+                "",
+                "build docs...............................................................Passed",
+            ]
+        )
+
+        summary = summarize_ci_log(text)
+
+        self.assertIn("Detect secrets", summary)
+        self.assertIn("detect-secrets", summary)
+        self.assertIn("Secret Keyword", summary)
+        self.assertIn(".github/workflows/agentic-pr-review.yml:206", summary)
+        self.assertNotIn("Initializing environment", summary)
+        self.assertNotIn("ruff-pre-commit", summary)
+
     def test_ci_log_wrapper_line_is_not_actionable(self):
         self.assertFalse(
             is_actionable_ci_line(

@@ -98,7 +98,7 @@ class CLITest(unittest.TestCase):
                 "publication_destination": "inline_blocking",
                 "file": None,
                 "line": None,
-                "code_reference": "GitHub Actions job `build`",
+                "code_reference": "GitHub Actions job build",
                 "evidence": "`build` concluded `failure`. Failed job: https://github.example/actions/runs/123/job/99",
                 "why_it_matters": "The build failure blocks merge.",
                 "suggested_fix": "Open the build job log, fix the first concrete packaging/build error shown there, and rerun build.",

@@ -564,19 +564,31 @@ def decode_actions_job_log(raw: bytes) -> str:
 
 
 def summarize_ci_log(text: str, *, max_lines: int = 80, max_chars: int = 7000) -> str:
-    lines = [strip_ansi(line).rstrip() for line in text.splitlines()]
+    lines = [strip_github_log_prefix(strip_ansi(line)).rstrip() for line in text.splitlines()]
     if not lines:
         return ""
 
+    failure_section = extract_ci_failure_section_indices(lines, max_lines=max_lines)
+    if failure_section:
+        excerpt = "\n".join(lines[index] for index in failure_section if lines[index].strip())
+        return truncate_text(excerpt, max_chars)
+
     selected: list[int] = []
     seen: set[int] = set()
-    for index, line in enumerate(lines):
-        if not is_actionable_ci_line(line):
+    priority_indices = [index for index, line in enumerate(lines) if is_failure_ci_line(line)]
+    candidate_indices = priority_indices or [
+        index for index, line in enumerate(lines) if is_actionable_ci_line(line)
+    ]
+    for index in candidate_indices:
+        line = lines[index]
+        if priority_indices and is_ci_boilerplate_line(line):
             continue
         left = max(0, index - 1)
-        right = min(len(lines), index + 3)
+        right = min(len(lines), index + (10 if priority_indices else 3))
         for candidate in range(left, right):
             if candidate in seen:
+                continue
+            if is_ci_boilerplate_line(lines[candidate]):
                 continue
             seen.add(candidate)
             selected.append(candidate)
@@ -593,6 +605,67 @@ def summarize_ci_log(text: str, *, max_lines: int = 80, max_chars: int = 7000) -
 
 def strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+
+def strip_github_log_prefix(text: str) -> str:
+    return re.sub(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+", "", text)
+
+
+def extract_ci_failure_section_indices(lines: list[str], *, max_lines: int) -> list[int]:
+    selected: list[int] = []
+    seen: set[int] = set()
+    for index, line in enumerate(lines):
+        if not is_ci_result_line(line, result="failed"):
+            continue
+        right = min(len(lines), index + 80)
+        for candidate in range(index, right):
+            candidate_line = lines[candidate]
+            if candidate > index and is_ci_result_line(candidate_line):
+                break
+            if candidate in seen or is_ci_boilerplate_line(candidate_line) or not candidate_line.strip():
+                continue
+            seen.add(candidate)
+            selected.append(candidate)
+            if len(selected) >= max_lines:
+                return selected
+    return selected
+
+
+def is_ci_result_line(line: str, *, result: str | None = None) -> bool:
+    pattern = r"\.{5,}\s*(passed|failed|skipped|cancelled)\b"
+    match = re.search(pattern, line.strip(), flags=re.IGNORECASE)
+    if not match:
+        return False
+    if result is None:
+        return True
+    return match.group(1).lower() == result.lower()
+
+
+def is_failure_ci_line(line: str) -> bool:
+    if is_ci_boilerplate_line(line):
+        return False
+    lowered = line.lower()
+    if re.search(r"\.{5,}\s*failed\b", lowered):
+        return True
+    if re.search(r"\b[FEW]\d{3}\b", line):
+        return True
+    return any(
+        phrase in lowered
+        for phrase in (
+            "- hook id:",
+            "- exit code:",
+            "error:",
+            "traceback",
+            "assertionerror",
+            "syntaxerror",
+            "importerror",
+            "modulenotfounderror",
+            "secret type:",
+            "location:",
+            "potential secrets",
+            "process completed with exit code",
+        )
+    )
 
 
 def is_actionable_ci_line(line: str) -> bool:
@@ -617,6 +690,11 @@ def is_ci_boilerplate_line(line: str) -> bool:
         "shell: /usr/bin/bash",
         "retention-days:",
         "if-no-files-found:",
+        "initializing environment for ",
+        "installing environment for ",
+        "once installed this environment will be reused",
+        "this may take a few minutes",
+        "run pre-commit run --all-files",
     )
     if any(phrase in lowered for phrase in boilerplate):
         return True

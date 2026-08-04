@@ -279,6 +279,114 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertIn("ruff", pipeline[0]["suggested_fix"].lower())
         self.assertTrue(pipeline[0]["merge_blocking"])
 
+    def test_target_precommit_detect_secrets_failure_gets_secret_specific_fix(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "pre-commit",
+                        "target_name": "pre-commit",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/99",
+                        "steps": [{"name": "Pre-commit", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "Detect secrets...........................................................Failed\n"
+                            "- hook id: detect-secrets\n"
+                            "- exit code: 1\n"
+                            "ERROR: Potential secrets about to be committed to git repo!\n"
+                            "Secret Type: Secret Keyword\n"
+                            "Location:    .github/workflows/agentic-pr-review.yml:206"
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("detect-secrets", pipeline[0]["evidence"])
+        self.assertIn(".github/workflows/agentic-pr-review.yml:206", pipeline[0]["evidence"])
+        self.assertIn("Secret Keyword", pipeline[0]["observable_failure"])
+        self.assertIn("secret-like value", pipeline[0]["suggested_fix"])
+        self.assertNotIn("ruff", pipeline[0]["suggested_fix"].lower())
+
+    def test_target_compile_failure_extracts_import_error(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "compile",
+                        "target_name": "compile",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/100",
+                        "steps": [{"name": "Compile Application", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "Compile Application\n"
+                            "Traceback (most recent call last):\n"
+                            "  File \"connector.py\", line 4, in <module>\n"
+                            "ModuleNotFoundError: No module named 'phantom'\n"
+                            "Error: Process completed with exit code 1."
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("ModuleNotFoundError", pipeline[0]["evidence"])
+        self.assertIn("missing import", pipeline[0]["suggested_fix"])
+        self.assertIn("compile", pipeline[0]["observable_failure"])
+
+    def test_target_build_failure_extracts_lockfile_error(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "build",
+                        "target_name": "build",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/101",
+                        "steps": [{"name": "Build SDK app", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "uv run soarapps package build . --output-file /tmp/app.tgz\n"
+                            "ERROR: uv.lock is out of date for pyproject.toml\n"
+                            "Error: Process completed with exit code 1."
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("uv.lock", pipeline[0]["evidence"])
+        self.assertIn("dependency or lockfile", pipeline[0]["suggested_fix"])
+
     def test_semantic_release_preview_failure_gets_release_specific_fix(self):
         review_input = {
             "pr": {"title": "test", "body": ""},

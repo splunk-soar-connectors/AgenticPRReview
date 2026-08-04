@@ -5658,8 +5658,9 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
             continue
         seen.add(target_name)
 
-        reason = target_pipeline_failure_reason(failure)
-        fix = target_pipeline_suggested_fix(target_name, reason, conclusion)
+        diagnosis = diagnose_target_pipeline_failure(target_name, failure, conclusion)
+        reason = str(diagnosis.get("reason") or "")
+        fix = target_pipeline_suggested_fix(target_name, reason, conclusion, diagnosis=diagnosis)
         url = str(failure.get("html_url") or failure.get("details_url") or failure.get("url") or "").strip() or None
         evidence_parts = [
             f"`{failure.get('name') or target_name}` concluded `{conclusion}`.",
@@ -5680,12 +5681,14 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
                 "publication_destination": "inline_blocking",
                 "file": None,
                 "line": None,
-                "code_reference": f"GitHub Actions job `{target_name}`",
+                "code_reference": f"GitHub Actions job {target_name}",
                 "evidence": " ".join(part for part in evidence_parts if part),
                 "why_it_matters": (
                     "This review job runs after the connector pipeline, so a failed required pipeline job blocks "
                     "a clean merge signal even if the code review also finds issues."
                 ),
+                "observable_failure": diagnosis.get("failure_scenario"),
+                "root_cause": diagnosis.get("root_cause"),
                 "suggested_fix": fix,
                 "url": url,
             }
@@ -5732,24 +5735,327 @@ def normalize_target_pipeline_job(job_name: str) -> str:
     return lowered
 
 
-def target_pipeline_failure_reason(job: dict[str, Any]) -> str:
-    failed_steps = [
-        str(step.get("name") or "").strip()
-        for step in job.get("steps") or []
-        if isinstance(step, dict) and str(step.get("conclusion") or "").lower() in {"failure", "timed_out", "cancelled"}
-    ]
-    excerpt = str(job.get("log_excerpt") or "")
-    snippet = summarize_precommit_body(excerpt) or summarize_ci_failure_excerpt(excerpt)
+def diagnose_target_pipeline_failure(job_name: str, job: dict[str, Any], conclusion: str) -> dict[str, Any]:
+    failed_steps = failed_pipeline_steps(job)
+    lines = normalized_pipeline_log_lines(str(job.get("log_excerpt") or ""))
+    tool = detect_pipeline_failure_tool(job_name, lines, failed_steps)
+    detail_lines = pipeline_failure_detail_lines(job_name, lines, tool)
+    root_cause = pipeline_failure_root_cause(job_name, tool, detail_lines)
+
     parts: list[str] = []
     if failed_steps:
-        parts.append(f"Failed step(s): {', '.join(step for step in failed_steps[:3] if step)}.")
-    if snippet:
-        parts.append(f"Log excerpt: {snippet}")
-    return " ".join(parts).strip()
+        parts.append(f"Failed step(s): {', '.join(failed_steps[:3])}.")
+    if root_cause:
+        parts.append(f"Root cause: {root_cause}.")
+    if detail_lines:
+        parts.append(f"Details: {' / '.join(detail_lines[:8])}")
+    elif lines:
+        parts.append(f"Details: {' / '.join(lines[:4])}")
+
+    return {
+        "failed_steps": failed_steps,
+        "tool": tool,
+        "details": detail_lines,
+        "root_cause": root_cause,
+        "reason": " ".join(parts).strip(),
+        "failure_scenario": pipeline_failure_scenario(job_name, tool, root_cause, detail_lines, conclusion),
+    }
 
 
-def target_pipeline_suggested_fix(job_name: str, reason: str, conclusion: str) -> str:
+def failed_pipeline_steps(job: dict[str, Any]) -> list[str]:
+    steps = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        conclusion = str(step.get("conclusion") or "").lower()
+        if conclusion not in {"failure", "timed_out", "cancelled", "action_required"}:
+            continue
+        name = str(step.get("name") or "").strip()
+        if name:
+            steps.append(name)
+    return steps
+
+
+def normalized_pipeline_log_lines(text: str) -> list[str]:
+    lines = []
+    for raw_line in text.splitlines():
+        line = strip_ci_timestamp(strip_ansi(raw_line)).strip()
+        if not line or is_ci_boilerplate_line(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+
+def strip_ci_timestamp(text: str) -> str:
+    return re.sub(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+", "", text)
+
+
+def detect_pipeline_failure_tool(job_name: str, lines: list[str], failed_steps: list[str]) -> str:
+    for line in lines:
+        match = re.search(r"-\s*hook id:\s*([^\s]+)", line, flags=re.IGNORECASE)
+        if match:
+            return normalize_failure_tool(match.group(1))
+    for line in lines:
+        match = re.match(r"(.+?)\.{5,}\s*(?:failed|cancelled)\b", line.strip(), flags=re.IGNORECASE)
+        if match:
+            return normalize_failure_tool(match.group(1))
+    for text in [*failed_steps, *lines[:12]]:
+        lowered = text.lower()
+        if "detect-secrets" in lowered or "detect secrets" in lowered:
+            return "detect-secrets"
+        if "ruff format" in lowered or "ruff-format" in lowered:
+            return "ruff-format"
+        if "ruff" in lowered or re.search(r"\b[FEW]\d{3}\b", text):
+            return "ruff"
+        if "semgrep" in lowered:
+            return "semgrep"
+        if "semantic-release" in lowered:
+            return "semantic-release"
+        if "soarapps" in lowered or "package build" in lowered:
+            return "soarapps"
+        if "pytest" in lowered:
+            return "pytest"
+        if "syntaxerror" in lowered or "py_compile" in lowered:
+            return "python-compile"
+    return job_name
+
+
+def normalize_failure_tool(raw_tool: str) -> str:
+    lowered = re.sub(r"\s+", " ", raw_tool.strip().lower())
+    lowered = lowered.strip(".:- ")
+    aliases = {
+        "detect secrets": "detect-secrets",
+        "detect-secrets": "detect-secrets",
+        "ruff (legacy alias)": "ruff",
+        "ruff": "ruff",
+        "ruff format": "ruff-format",
+        "ruff-format": "ruff-format",
+        "djlint formatting for django": "djlint",
+        "djlint linting for django": "djlint",
+        "soar app linter": "soar-app-linter",
+        "build docs": "build-docs",
+        "update release notes": "release-notes",
+        "run static tests": "static-tests",
+        "package app dependencies": "package-app-dependencies",
+        "generate notice file": "notice",
+        "check json": "check-json",
+        "check yaml": "check-yaml",
+        "fix end of files": "end-of-file-fixer",
+        "trim trailing whitespace": "trailing-whitespace",
+        "semantic release": "semantic-release",
+        "semantic-release": "semantic-release",
+    }
+    return aliases.get(lowered, lowered.replace(" ", "-"))
+
+
+def pipeline_failure_detail_lines(job_name: str, lines: list[str], tool: str) -> list[str]:
+    if not lines:
+        return []
+    detail_lines: list[str] = []
+    hook_index = first_tool_line_index(lines, tool)
+    if hook_index is not None:
+        section = precommit_hook_section(lines, hook_index)
+    else:
+        section = lines
+
+    for line in section:
+        if is_pipeline_detail_line(job_name, line, tool):
+            detail_lines.append(line)
+
+    if not detail_lines and section:
+        detail_lines = [line for line in section if not is_passing_ci_result_line(line)]
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for line in detail_lines:
+        compact = line.strip()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        output.append(compact[:500])
+        if len(output) >= 10:
+            break
+    return output
+
+
+def first_tool_line_index(lines: list[str], tool: str) -> int | None:
+    if not tool:
+        return None
+    display = tool.replace("-", " ")
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if f"hook id: {tool}" in lowered or f"hook id:{tool}" in lowered:
+            return max(0, index - 1)
+        if re.match(rf"{re.escape(display)}\.{{5,}}\s*failed\b", lowered, flags=re.IGNORECASE):
+            return index
+        if re.match(rf"{re.escape(tool)}\.{{5,}}\s*failed\b", lowered, flags=re.IGNORECASE):
+            return index
+    return None
+
+
+def precommit_hook_section(lines: list[str], start: int) -> list[str]:
+    section = []
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if index > start and re.search(r"\.{5,}\s*(passed|failed|skipped|cancelled)\b", line, flags=re.IGNORECASE):
+            break
+        section.append(line)
+        if len(section) >= 80:
+            break
+    return section
+
+
+def is_pipeline_detail_line(job_name: str, line: str, tool: str) -> bool:
+    lowered = line.lower()
+    if is_passing_ci_result_line(line):
+        return False
+    if re.search(r"\.{5,}\s*(failed|cancelled)\b", lowered):
+        return True
+    if any(term in lowered for term in ("hook id:", "exit code:", "error:", "fatal:", "traceback", "assertionerror")):
+        return True
+    if any(term in lowered for term in ("syntaxerror", "importerror", "modulenotfounderror", "no module named")):
+        return True
+    if any(term in lowered for term in ("secret type:", "location:", "potential secrets", "would reformat", "files were modified")):
+        return True
+    if re.search(r"\b[FEW]\d{3}\b", line):
+        return True
+    if re.search(r"\b[\w./-]+\.(?:py|json|ya?ml|toml|md|html|jinja):\d+(?::\d+)?", line):
+        return True
+    if tool in {"semantic-release", "semantic-release-preview"} and any(
+        term in lowered for term in ("semantic-release", "release_notes", "unreleased.md", "conventional", "branch", "tag")
+    ):
+        return True
+    if job_name in {"compile", "build"} and any(
+        term in lowered
+        for term in ("soarapps", "manifest", "package build", ".tgz", "dependency", "uv.lock", "requirements", "wheel")
+    ):
+        return True
+    if tool in {"soar-app-linter", "static-tests"} and any(
+        term in lowered
+        for term in (
+            "min platform version",
+            "min phantom version",
+            "action name",
+            "additional logging",
+            "verbosity",
+            "license",
+            "product name on files",
+            "playbook missing",
+            "integration test results are missing",
+            "app-tests",
+            "apps-test-playbooks",
+        )
+    ):
+        return True
+    return False
+
+
+def is_passing_ci_result_line(line: str) -> bool:
+    return re.search(r"\.{5,}\s*(passed|skipped)\b", line.strip(), flags=re.IGNORECASE) is not None
+
+
+def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str]) -> str:
+    detail_text = "\n".join(detail_lines)
+    lowered = detail_text.lower()
+    if tool == "detect-secrets":
+        secret_type = first_regex_group(detail_text, r"Secret Type:\s*(.+)")
+        location = first_regex_group(detail_text, r"Location:\s*(.+)")
+        if secret_type and location:
+            return f"`detect-secrets` reported `{secret_type.strip()}` at `{location.strip()}`"
+        if location:
+            return f"`detect-secrets` reported a potential secret at `{location.strip()}`"
+        return "`detect-secrets` reported a potential secret in the PR diff"
+    if tool == "ruff":
+        ruff_line = first_line_matching(detail_lines, r"\b[FEW]\d{3}\b")
+        if ruff_line:
+            return f"`ruff` reported `{ruff_line}`"
+        return "`ruff` reported lint errors"
+    if tool == "ruff-format":
+        return "`ruff format` reported files that need formatting"
+    if tool in {"check-json", "check-yaml"}:
+        syntax_line = first_line_matching(detail_lines, r"\b[\w./-]+\.(?:json|ya?ml):\d+|error:")
+        if syntax_line:
+            return f"`{tool}` reported `{syntax_line}`"
+        return f"`{tool}` reported invalid JSON/YAML"
+    if tool == "semgrep":
+        semgrep_line = first_line_matching(detail_lines, r"semgrep|error:|[\w./-]+\.(?:py|json|ya?ml|toml):\d+")
+        if semgrep_line:
+            return f"`semgrep` reported `{semgrep_line}`"
+        return "`semgrep` reported a static-analysis failure"
+    if tool in {"djlint", "mdformat", "build-docs", "release-notes", "package-app-dependencies", "notice"}:
+        line = first_line_matching(detail_lines, r"error:|failed|[\w./-]+\.(?:md|html|json|txt|py):\d+")
+        if line:
+            return f"`{tool}` reported `{line}`"
+        return f"`{tool}` reported generated-file or formatting drift"
+    if tool in {"soar-app-linter", "static-tests"}:
+        line = first_line_matching(detail_lines, r"assertionerror|error:|min platform|action name|additional logging|verbosity|license|playbook")
+        if line:
+            return f"`{tool}` reported `{line}`"
+        return f"`{tool}` reported a connector metadata/static-test failure"
+    if job_name == "compile":
+        line = first_line_matching(detail_lines, r"syntaxerror|modulenotfounderror|importerror|no module named|error:|manifest|soarapps")
+        if line:
+            return f"`compile` failed on `{line}`"
+    if job_name == "build":
+        line = first_line_matching(detail_lines, r"error:|package build|soarapps|dependency|uv.lock|requirements|wheel")
+        if line:
+            return f"`build` failed on `{line}`"
+    if job_name == "semantic-release-preview" or "semantic-release" in lowered:
+        line = first_line_matching(detail_lines, r"semantic-release|release_notes|unreleased.md|conventional|error:")
+        if line:
+            return f"`semantic-release-preview` failed on `{line}`"
+    return ""
+
+
+def first_regex_group(text: str, pattern: str) -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def first_line_matching(lines: list[str], pattern: str) -> str:
+    for line in lines:
+        if re.search(pattern, line, flags=re.IGNORECASE):
+            return line.strip()
+    return ""
+
+
+def pipeline_failure_scenario(
+    job_name: str,
+    tool: str,
+    root_cause: str,
+    detail_lines: list[str],
+    conclusion: str,
+) -> str:
+    if conclusion == "timed_out":
+        return f"The `{job_name}` job exceeded its allowed runtime before completing."
+    if conclusion == "cancelled":
+        return f"The `{job_name}` job was cancelled before producing a passing result."
+    if root_cause:
+        return f"The `{job_name}` job cannot pass because {root_cause}."
+    if detail_lines:
+        return f"The `{job_name}` job failed at `{tool or job_name}` with `{detail_lines[0]}`."
+    return f"The `{job_name}` job ended with `{conclusion}`."
+
+
+def target_pipeline_failure_reason(job: dict[str, Any]) -> str:
+    job_name = normalize_target_pipeline_job(str(job.get("target_name") or job.get("name") or ""))
+    conclusion = str(job.get("conclusion") or "").lower()
+    return str(diagnose_target_pipeline_failure(job_name, job, conclusion).get("reason") or "")
+
+
+def target_pipeline_suggested_fix(
+    job_name: str,
+    reason: str,
+    conclusion: str,
+    *,
+    diagnosis: dict[str, Any] | None = None,
+) -> str:
     lowered = reason.lower()
+    tool = str((diagnosis or {}).get("tool") or "")
     if conclusion == "timed_out":
         return (
             f"Open the `{job_name}` job log linked above, find the last command that was still running, "
@@ -5761,6 +6067,8 @@ def target_pipeline_suggested_fix(job_name: str, reason: str, conclusion: str) -
             "the linked job for the cancellation source before merging."
         )
     if job_name == "pre-commit":
+        if tool:
+            return precommit_tool_suggested_fix(tool, reason)
         return precommit_suggested_fix(reason)
     if job_name == "compile":
         if any(term in lowered for term in ("syntaxerror", "py_compile", "compileerror", "could not compile")):
@@ -5771,10 +6079,10 @@ def target_pipeline_suggested_fix(job_name: str, reason: str, conclusion: str) -
             return "Fix the SDK app metadata or import-time error reported by the compile/manifest step, then rerun compile."
         return "Open the compile job log, fix the first concrete Python/package/metadata error shown there, and rerun compile."
     if job_name == "build":
-        if any(term in lowered for term in ("soarapps package build", "package build", ".tgz", "tar")):
-            return "Fix the packaging error reported by the build command, regenerate the app package, and rerun build."
         if any(term in lowered for term in ("dependency", "dependencies", "wheel", "uv.lock", "requirements")):
             return "Fix the dependency or lockfile issue named by the build log, then rerun the build job."
+        if any(term in lowered for term in ("soarapps package build", "package build", ".tgz", "tar")):
+            return "Fix the packaging error reported by the build command, regenerate the app package, and rerun build."
         return "Open the build job log, fix the first concrete packaging/build error shown there, and rerun build."
     if job_name == "semantic-release-preview":
         if any(term in lowered for term in ("release note", "release_notes", "unreleased.md")):
@@ -5785,6 +6093,36 @@ def target_pipeline_suggested_fix(job_name: str, reason: str, conclusion: str) -
             return "Fix the Node/npm setup or semantic-release dependency error shown in the job log, then rerun the preview."
         return "Open the semantic-release-preview log, fix the first release metadata or semantic-release configuration error, and rerun the job."
     return "Open the failed job log linked above, fix the first concrete error shown there, and rerun the workflow."
+
+
+def precommit_tool_suggested_fix(tool: str, evidence: str) -> str:
+    lowered_tool = tool.lower()
+    lowered = evidence.lower()
+    if lowered_tool == "detect-secrets" or "secret keyword" in lowered or "potential secrets" in lowered:
+        return "Remove the secret-like value from the reported file/line, or add an inline allowlist/baseline update only after confirming the hit is a false positive."
+    if lowered_tool == "ruff-format":
+        return "Run `pre-commit run ruff-format --all-files` or `ruff format` locally, commit the formatting changes, and rerun pre-commit."
+    if lowered_tool == "ruff" or re.search(r"\b[FEW]\d{3}\b", evidence):
+        return "Apply the reported ruff lint fix at the named file/line, then rerun pre-commit."
+    if lowered_tool == "semgrep":
+        return "Apply the semgrep-reported code change at the named location, or suppress it only with a clear false-positive justification in the PR."
+    if lowered_tool in {"check-json", "check-yaml"}:
+        return "Fix the JSON/YAML syntax or formatting at the reported file/line, then rerun pre-commit."
+    if lowered_tool == "djlint":
+        return "Fix the reported template formatting/lint issue or run the djLint hook locally, then commit the updated template."
+    if lowered_tool == "mdformat":
+        return "Run the mdformat hook locally, commit the Markdown formatting changes it produces, and rerun pre-commit."
+    if lowered_tool == "build-docs":
+        return "Run the docs-generation hook locally, commit the regenerated documentation files, and rerun pre-commit."
+    if lowered_tool == "release-notes":
+        return "Fix release_notes/unreleased.md or the generated release-note content reported by the hook, then rerun pre-commit."
+    if lowered_tool in {"package-app-dependencies", "notice"}:
+        return "Regenerate the packaged dependency or NOTICE output with the named hook, commit the generated files, and rerun pre-commit."
+    if lowered_tool in {"soar-app-linter", "static-tests"}:
+        return "Fix the specific SOAR app linter/static-test item named in the log, regenerate generated metadata/docs if needed, and rerun pre-commit."
+    if lowered_tool in {"end-of-file-fixer", "trailing-whitespace"}:
+        return "Run the pre-commit hook locally and commit the automatic whitespace/end-of-file fix."
+    return precommit_suggested_fix(evidence)
 
 
 def check_precommit_failures(review_input: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5861,10 +6199,10 @@ def precommit_suggested_fix(evidence: str) -> str:
     lowered = evidence.lower()
     if "syntaxerror" in lowered or "py_compile" in lowered or "could not compile" in lowered:
         return "Fix the Python syntax at the reported file/line, then rerun the compile or pre-commit hook that reported it."
+    if "detect-secrets" in lowered or "secret keyword" in lowered or "potential secrets" in lowered:
+        return "Remove the secret-like value from the diff, or update the secrets baseline only after confirming the hit is a false positive."
     if "ruff" in lowered or re.search(r"\b[FEW]\d{3}\b", evidence):
         return "Apply the reported ruff lint or formatting fix at the named file/line, then rerun pre-commit."
-    if "detect-secrets" in lowered:
-        return "Remove the secret-like value from the diff, or update the secrets baseline only after confirming the hit is a false positive."
     if "semgrep" in lowered:
         return "Apply the semgrep-reported code change, or suppress it only with a clear false-positive justification in the PR."
     if "build-docs" in lowered or "mdformat" in lowered:
@@ -6044,6 +6382,9 @@ def is_precommit_signal(text: str) -> bool:
 
 
 def summarize_precommit_body(body: str) -> str:
+    secret_summary = summarize_detect_secrets_body(body)
+    if secret_summary:
+        return secret_summary
     matches = []
     for line in body.splitlines():
         if is_ci_boilerplate_line(line):
@@ -6055,6 +6396,29 @@ def summarize_precommit_body(body: str) -> str:
     if matches:
         return " / ".join(matches[:4])
     return body.strip()[:500]
+
+
+def summarize_detect_secrets_body(body: str) -> str:
+    lowered_body = body.lower()
+    if "detect-secrets" not in lowered_body and "potential secrets" not in lowered_body:
+        return ""
+    matches = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if not stripped or is_ci_boilerplate_line(stripped):
+            continue
+        if (
+            "detect secrets" in lowered
+            or "detect-secrets" in lowered
+            or "potential secrets" in lowered
+            or "secret type:" in lowered
+            or "location:" in lowered
+            or stripped.startswith("- hook id:")
+            or stripped.startswith("- exit code:")
+        ):
+            matches.append(stripped)
+    return " / ".join(matches[:6])
 
 
 def is_precommit_failure_detail(line: str) -> bool:
@@ -6097,6 +6461,11 @@ def is_ci_boilerplate_line(line: str) -> bool:
         "shell: /usr/bin/bash",
         "retention-days:",
         "if-no-files-found:",
+        "initializing environment for ",
+        "installing environment for ",
+        "once installed this environment will be reused",
+        "this may take a few minutes",
+        "run pre-commit run --all-files",
     )
     if any(phrase in lowered for phrase in boilerplate):
         return True

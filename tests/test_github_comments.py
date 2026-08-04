@@ -1316,10 +1316,14 @@ class GitHubCommentsTest(unittest.TestCase):
                     "publication_destination": "inline_blocking",
                     "file": None,
                     "line": None,
-                    "code_reference": "GitHub Actions job `compile`",
+                    "code_reference": "GitHub Actions job compile",
                     "evidence": (
                         "`compile` concluded `failure`. Failed step(s): Compile Application. "
-                        "Log excerpt: SyntaxError: invalid syntax in connector.py"
+                        "Root cause: `compile` failed on `SyntaxError: invalid syntax in connector.py`."
+                    ),
+                    "observable_failure": (
+                        "The `compile` job cannot pass because `compile` failed on "
+                        "`SyntaxError: invalid syntax in connector.py`."
                     ),
                     "why_it_matters": "A failed compile job blocks a clean merge signal.",
                     "suggested_fix": "Fix the Python syntax at the reported file/line and rerun the compile job.",
@@ -1334,6 +1338,8 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["github_comment_type"], "conversation")
         self.assertEqual(comment["finding_type"], "text")
         self.assertIn("Pipeline: [failed job](https://github.example/actions/runs/123/job/99)", comment["body"])
+        self.assertIn("Failure scenario:", comment["body"])
+        self.assertIn("SyntaxError", comment["body"])
         self.assertIn("How to fix:", comment["body"])
         self.assertIn("rerun the compile job", comment["body"])
 
