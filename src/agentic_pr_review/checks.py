@@ -95,6 +95,13 @@ RISKY_CHANGE_WORDS = (
     "validate",
 )
 
+TARGET_PIPELINE_JOB_NAMES = {
+    "pre-commit",
+    "compile",
+    "build",
+    "semantic-release-preview",
+}
+
 
 def run_deterministic_checks(review_input: dict[str, Any]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
@@ -172,6 +179,7 @@ def run_deterministic_checks(review_input: dict[str, Any]) -> list[dict[str, Any
     findings.extend(check_python_syntax_errors(full_files))
     findings.extend(check_conflict_markers(full_files))
     findings.extend(check_known_static_name_errors(full_files))
+    findings.extend(check_target_pipeline_failures(review_input))
     findings.extend(check_precommit_failures(review_input))
     findings.extend(check_merge_conflicts(review_input))
     findings.extend(check_ci_failures(review_input))
@@ -5622,6 +5630,161 @@ def check_known_static_name_errors(full_files: dict[str, str]) -> list[dict[str,
                 }
             )
     return findings
+
+
+def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[str, Any]]:
+    ci = review_input.get("ci") or {}
+    if not isinstance(ci, dict):
+        return []
+
+    failures = ci.get("target_job_failures") or []
+    if not isinstance(failures, list):
+        failures = []
+    if not failures:
+        failures = target_pipeline_failures_from_check_runs(ci)
+
+    findings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        target_name = normalize_target_pipeline_job(str(failure.get("target_name") or failure.get("name") or ""))
+        if target_name not in TARGET_PIPELINE_JOB_NAMES:
+            continue
+        conclusion = str(failure.get("conclusion") or "").lower()
+        if conclusion not in {"failure", "timed_out", "cancelled", "action_required"}:
+            continue
+        if target_name in seen:
+            continue
+        seen.add(target_name)
+
+        reason = target_pipeline_failure_reason(failure)
+        fix = target_pipeline_suggested_fix(target_name, reason, conclusion)
+        url = str(failure.get("html_url") or failure.get("details_url") or failure.get("url") or "").strip() or None
+        evidence_parts = [
+            f"`{failure.get('name') or target_name}` concluded `{conclusion}`.",
+        ]
+        if reason:
+            evidence_parts.append(reason)
+        if url:
+            evidence_parts.append(f"Failed job: {url}")
+        findings.append(
+            {
+                "title": f"{target_name} pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "finding_category": "introduced_bug",
+                "causality": "exposed_by_pr",
+                "severity": "high",
+                "confidence": "high",
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": None,
+                "line": None,
+                "code_reference": f"GitHub Actions job `{target_name}`",
+                "evidence": " ".join(part for part in evidence_parts if part),
+                "why_it_matters": (
+                    "This review job runs after the connector pipeline, so a failed required pipeline job blocks "
+                    "a clean merge signal even if the code review also finds issues."
+                ),
+                "suggested_fix": fix,
+                "url": url,
+            }
+        )
+    return findings
+
+
+def target_pipeline_failures_from_check_runs(ci: dict[str, Any]) -> list[dict[str, Any]]:
+    log_by_name: dict[str, dict[str, Any]] = {}
+    for log in ci.get("failed_check_logs", []):
+        if not isinstance(log, dict):
+            continue
+        target_name = normalize_target_pipeline_job(str(log.get("name") or ""))
+        if target_name in TARGET_PIPELINE_JOB_NAMES:
+            log_by_name[target_name] = log
+
+    failures: list[dict[str, Any]] = []
+    for run in ci.get("check_runs", []):
+        if not isinstance(run, dict):
+            continue
+        target_name = normalize_target_pipeline_job(str(run.get("name") or ""))
+        if target_name not in TARGET_PIPELINE_JOB_NAMES:
+            continue
+        conclusion = str(run.get("conclusion") or "").lower()
+        if conclusion not in {"failure", "timed_out", "cancelled", "action_required"}:
+            continue
+        failure = dict(run)
+        failure["target_name"] = target_name
+        if target_name in log_by_name:
+            failure["log_excerpt"] = log_by_name[target_name].get("log_excerpt")
+            failure["html_url"] = failure.get("html_url") or log_by_name[target_name].get("details_url")
+        failures.append(failure)
+    return failures
+
+
+def normalize_target_pipeline_job(job_name: str) -> str:
+    lowered = re.sub(r"\s+", " ", job_name.strip().lower())
+    lowered = lowered.split(" (", 1)[0].strip()
+    if lowered in TARGET_PIPELINE_JOB_NAMES:
+        return lowered
+    for target in TARGET_PIPELINE_JOB_NAMES:
+        if lowered.startswith(f"{target} ") or lowered.startswith(f"{target} /"):
+            return target
+    return lowered
+
+
+def target_pipeline_failure_reason(job: dict[str, Any]) -> str:
+    failed_steps = [
+        str(step.get("name") or "").strip()
+        for step in job.get("steps") or []
+        if isinstance(step, dict) and str(step.get("conclusion") or "").lower() in {"failure", "timed_out", "cancelled"}
+    ]
+    excerpt = str(job.get("log_excerpt") or "")
+    snippet = summarize_precommit_body(excerpt) or summarize_ci_failure_excerpt(excerpt)
+    parts: list[str] = []
+    if failed_steps:
+        parts.append(f"Failed step(s): {', '.join(step for step in failed_steps[:3] if step)}.")
+    if snippet:
+        parts.append(f"Log excerpt: {snippet}")
+    return " ".join(parts).strip()
+
+
+def target_pipeline_suggested_fix(job_name: str, reason: str, conclusion: str) -> str:
+    lowered = reason.lower()
+    if conclusion == "timed_out":
+        return (
+            f"Open the `{job_name}` job log linked above, find the last command that was still running, "
+            "and either fix the hanging operation or add a bounded timeout/retry around that command."
+        )
+    if conclusion == "cancelled":
+        return (
+            f"Rerun `{job_name}` if it was cancelled by a newer push. If it cancels repeatedly, inspect "
+            "the linked job for the cancellation source before merging."
+        )
+    if job_name == "pre-commit":
+        return precommit_suggested_fix(reason)
+    if job_name == "compile":
+        if any(term in lowered for term in ("syntaxerror", "py_compile", "compileerror", "could not compile")):
+            return "Fix the Python syntax at the reported file/line and rerun the compile job."
+        if any(term in lowered for term in ("importerror", "modulenotfounderror", "no module named")):
+            return "Fix the missing import or packaging dependency named in the compile log, then rerun the compile job."
+        if "soarapps" in lowered or "manifest" in lowered:
+            return "Fix the SDK app metadata or import-time error reported by the compile/manifest step, then rerun compile."
+        return "Open the compile job log, fix the first concrete Python/package/metadata error shown there, and rerun compile."
+    if job_name == "build":
+        if any(term in lowered for term in ("soarapps package build", "package build", ".tgz", "tar")):
+            return "Fix the packaging error reported by the build command, regenerate the app package, and rerun build."
+        if any(term in lowered for term in ("dependency", "dependencies", "wheel", "uv.lock", "requirements")):
+            return "Fix the dependency or lockfile issue named by the build log, then rerun the build job."
+        return "Open the build job log, fix the first concrete packaging/build error shown there, and rerun build."
+    if job_name == "semantic-release-preview":
+        if any(term in lowered for term in ("release note", "release_notes", "unreleased.md")):
+            return "Fix the release_notes/unreleased.md entry or generated release-note content, then rerun semantic-release-preview."
+        if any(term in lowered for term in ("conventional commit", "semantic-release", "tag format", "branch")):
+            return "Fix the release metadata, branch/tag configuration, or commit message issue named in the semantic-release log."
+        if any(term in lowered for term in ("npm", "node", "module not found", "enoent")):
+            return "Fix the Node/npm setup or semantic-release dependency error shown in the job log, then rerun the preview."
+        return "Open the semantic-release-preview log, fix the first release metadata or semantic-release configuration error, and rerun the job."
+    return "Open the failed job log linked above, fix the first concrete error shown there, and rerun the workflow."
 
 
 def check_precommit_failures(review_input: dict[str, Any]) -> list[dict[str, Any]]:

@@ -214,6 +214,33 @@ class GitHubClient:
     def get_actions_job_logs(self, repo: str, job_id: str | int) -> bytes:
         return self.get_redirected_raw_without_auth(f"/repos/{repo}/actions/jobs/{job_id}/logs")
 
+    def list_workflow_run_jobs(
+        self,
+        repo: str,
+        run_id: str | int,
+        *,
+        attempt: str | int | None = None,
+        limit_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        if attempt:
+            path = f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+        else:
+            path = f"/repos/{repo}/actions/runs/{run_id}/jobs"
+        jobs: list[dict[str, Any]] = []
+        page = 1
+        while page <= limit_pages:
+            data = self.get(path, params={"per_page": 100, "page": page})
+            if not isinstance(data, dict):
+                raise GitHubError(f"Expected object from workflow jobs endpoint {path}")
+            chunk = data.get("jobs") or []
+            if not isinstance(chunk, list):
+                raise GitHubError(f"Expected jobs list from workflow jobs endpoint {path}")
+            jobs.extend(job for job in chunk if isinstance(job, dict))
+            if len(chunk) < 100:
+                break
+            page += 1
+        return jobs
+
     def get_repository_zipball(self, repo: str, ref: str) -> bytes:
         return self.get_redirected_raw_without_auth(f"/repos/{repo}/zipball/{quote(ref, safe='')}")
 

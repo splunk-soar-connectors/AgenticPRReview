@@ -1,11 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 from agentic_pr_review.collector import (
+    PRCollector,
     extract_actions_job_id,
     is_actionable_ci_line,
     is_relevant_full_file,
+    previous_pipeline_failures_from_env,
     snippets_for_terms,
     summarize_ci_log,
+    target_pipeline_job_name,
 )
 
 
@@ -23,6 +27,81 @@ class CollectorHelpersTest(unittest.TestCase):
         url = "https://github.com/example-connectors/slack/actions/runs/123456/job/987654"
 
         self.assertEqual(extract_actions_job_id(url), "987654")
+
+    def test_target_pipeline_job_name_matches_known_jobs(self):
+        self.assertEqual(target_pipeline_job_name("pre-commit"), "pre-commit")
+        self.assertEqual(target_pipeline_job_name("compile / Compile Application"), "compile")
+        self.assertEqual(target_pipeline_job_name("build (sdkfied)"), "build")
+        self.assertEqual(target_pipeline_job_name("semantic-release-preview"), "semantic-release-preview")
+        self.assertIsNone(target_pipeline_job_name("sanity-test"))
+
+    def test_previous_pipeline_results_env_creates_target_failures(self):
+        env = {
+            "PREVIOUS_PIPELINE_RESULTS_JSON": (
+                '{"jobs":{'
+                '"pre-commit":{"result":"success","url":"https://github.example/run"},'
+                '"compile":{"result":"failure","url":"https://github.example/run"},'
+                '"sanity-test":{"result":"failure","url":"https://github.example/run"},'
+                '"semantic-release-preview":{"result":"cancelled","url":"https://github.example/run"}'
+                "}}"
+            )
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            failures = previous_pipeline_failures_from_env()
+
+        self.assertEqual([failure["target_name"] for failure in failures], ["compile", "semantic-release-preview"])
+        self.assertEqual(failures[0]["html_url"], "https://github.example/run")
+        self.assertEqual(failures[0]["source"], "workflow_needs")
+
+    def test_workflow_run_jobs_collects_target_failure_log(self):
+        class FakeClient:
+            def list_workflow_run_jobs(self, repo, run_id, *, attempt=None):
+                self.args = (repo, run_id, attempt)
+                return [
+                    {
+                        "id": 99,
+                        "run_id": int(run_id),
+                        "run_attempt": int(attempt),
+                        "name": "pre-commit",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/99",
+                        "steps": [
+                            {"name": "Setup", "conclusion": "success"},
+                            {"name": "Pre-commit", "conclusion": "failure"},
+                        ],
+                    },
+                    {
+                        "id": 100,
+                        "name": "sanity-test",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/100",
+                    },
+                ]
+
+            def get_actions_job_logs(self, repo, job_id):
+                self.log_args = (repo, job_id)
+                return (
+                    b"normal setup\n"
+                    b"ruff.....................................................................Failed\n"
+                    b"hook id: ruff\n"
+                    b"connector.py:1:1: F401 `os` imported but unused\n"
+                )
+
+        client = FakeClient()
+        collector = PRCollector(client, config=object())
+
+        with patch.dict("os.environ", {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}, clear=True):
+            result = collector._safe_workflow_run_jobs("owner/repo")
+
+        self.assertEqual(client.args, ("owner/repo", "123", "2"))
+        self.assertEqual(client.log_args, ("owner/repo", 99))
+        self.assertEqual(len(result["target_job_failures"]), 1)
+        failure = result["target_job_failures"][0]
+        self.assertEqual(failure["target_name"], "pre-commit")
+        self.assertIn("F401", failure["log_excerpt"])
 
     def test_summarize_ci_log_keeps_actionable_failure_lines(self):
         text = "\n".join(

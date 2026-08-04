@@ -13,7 +13,7 @@ from .secret_redactor import redact_text
 
 CODE_SUFFIXES = {".py", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".txt"}
 TEXT_SUFFIXES = {".md", ".rst"}
-TEXT_CATEGORIES = {"docs_pr_accuracy", "precommit", "merge_conflict", "ci_synthesis"}
+TEXT_CATEGORIES = {"docs_pr_accuracy", "precommit", "merge_conflict", "ci_synthesis", "ci_pipeline_failure"}
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 MARKER_PREFIX = "<!-- agentic-pr-review:"
 INLINE_PUBLICATION_DESTINATIONS = {"inline_blocking", "inline_non_blocking"}
@@ -345,7 +345,7 @@ def changed_relation_for_finding(finding: dict[str, Any], review_input: dict[str
 
 def infer_causality(finding: dict[str, Any], *, changed_relation: str, text: str) -> str:
     category = str(finding.get("category") or "")
-    if category in {"precommit", "merge_conflict"}:
+    if category in {"precommit", "merge_conflict", "ci_pipeline_failure"}:
         return "exposed_by_pr"
     if changed_relation in {"added_file", "removed_file", "added_changed_line", "inferable_changed_anchor"}:
         return "introduced_by_pr"
@@ -366,7 +366,7 @@ def infer_publication_finding_category(finding: dict[str, Any], *, causality: st
         return "introduced_bug"
     if category == "unsafe_logging" or any(term in text for term in ("leaked token", "exposed token", "credential", "authorization header", "verify=false")):
         return "security_issue"
-    if category in {"precommit", "merge_conflict"}:
+    if category in {"precommit", "merge_conflict", "ci_pipeline_failure"}:
         return "introduced_bug"
     if any(term in text for term in ("app_version", "version bump", "release note", "release_notes", "unreleased.md")):
         return "release_management_suggestion"
@@ -396,7 +396,7 @@ def infer_merge_blocking(
     category = str(finding.get("category") or "")
     if isinstance(finding.get("merge_blocking"), bool):
         return bool(finding["merge_blocking"])
-    if category in {"precommit", "merge_conflict"}:
+    if category in {"precommit", "merge_conflict", "ci_pipeline_failure"}:
         return True
     if finding_category == "security_issue" and severity in {"critical", "high"}:
         return True
@@ -476,6 +476,8 @@ def has_concrete_failure_scenario(finding: dict[str, Any], *, text: str) -> bool
     if category == "merge_conflict" and has_specific_merge_blocker_details(text):
         return True
     if category == "precommit" and has_actionable_precommit_details(text):
+        return True
+    if category == "ci_pipeline_failure" and has_actionable_pipeline_failure_details(text):
         return True
     if all(str(finding.get(key) or "").strip() for key in ("execution_path", "trigger", "observable_failure")):
         return True
@@ -1156,6 +1158,8 @@ def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
         return True
     if category == "ci_synthesis":
         return True
+    if category == "ci_pipeline_failure" and not has_actionable_pipeline_failure_details(text):
+        return True
     if category == "merge_conflict" and is_unhelpful_mergeability_finding(finding):
         return True
     if is_readme_only_finding(finding):
@@ -1192,7 +1196,7 @@ def is_outside_changed_pr_scope(finding: dict[str, Any], review_input: dict[str,
     """
 
     category = str(finding.get("category") or "")
-    if category in {"precommit", "merge_conflict"}:
+    if category in {"precommit", "merge_conflict", "ci_pipeline_failure"}:
         return False
 
     path = str(finding.get("file") or "").strip()
@@ -1307,6 +1311,33 @@ def has_actionable_precommit_details(text: str) -> bool:
     if any(keyword in lowered for keyword in PRECOMMIT_DETAIL_KEYWORDS):
         return True
     return re.search(r"\b[FEW]\d{3}\b", text) is not None
+
+
+def has_actionable_pipeline_failure_details(text: str) -> bool:
+    if is_ci_boilerplate_text(text):
+        return False
+    lowered = text.lower()
+    return any(
+        term in lowered
+        for term in (
+            "concluded `failure`",
+            "concluded `timed_out`",
+            "concluded `cancelled`",
+            "concluded `action_required`",
+            "failed step",
+            "log excerpt",
+            "failed job:",
+            "hook id:",
+            "error:",
+            "traceback",
+            "syntaxerror",
+            "modulenotfounderror",
+            "semantic-release",
+            "soarapps",
+            "package build",
+            "ruff",
+        )
+    ) or re.search(r"\b[FEW]\d{3}\b", text) is not None
 
 
 def is_ci_boilerplate_text(text: str) -> bool:
@@ -1510,7 +1541,13 @@ def should_infer_code_anchor(
     line: int | None,
     diff_index: dict[str, dict[str, Any]],
 ) -> bool:
-    if str(finding.get("category") or "") in {"missing_tests", "ci_synthesis", "precommit", "merge_conflict"}:
+    if str(finding.get("category") or "") in {
+        "missing_tests",
+        "ci_synthesis",
+        "ci_pipeline_failure",
+        "precommit",
+        "merge_conflict",
+    }:
         return False
     if (not path or path not in diff_index) and str(finding.get("category") or "") == "docs_pr_accuracy" and line is None:
         return bool(target_keywords_for_finding(finding, all_finding_text(finding), diff_index))
@@ -1706,6 +1743,9 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     lines = [f"Issue: {issue_text}"]
     if location and target["github_comment_type"] == "conversation":
         lines.append(f"Location: `{location}`")
+    pipeline_url = str(finding.get("url") or "").strip()
+    if pipeline_url and target["github_comment_type"] == "conversation":
+        lines.append(f"Pipeline: [failed job]({pipeline_url})")
     if code_reference:
         lines.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
@@ -1960,6 +2000,7 @@ def publish_comment_plan(
     *,
     allow_duplicates: bool = False,
     max_comments: int | None = None,
+    apply_label: bool = True,
 ) -> dict[str, Any]:
     repo = str(plan.get("repo") or "")
     pr_number = int(plan.get("pr_number") or 0)
@@ -2033,7 +2074,10 @@ def publish_comment_plan(
                 )
 
     posted_count = sum(1 for item in results if str(item.get("status")).startswith("posted"))
-    label_result = apply_reviewed_label(client, repo, pr_number, posted_count=posted_count)
+    if apply_label:
+        label_result = apply_reviewed_label(client, repo, pr_number, posted_count=posted_count)
+    else:
+        label_result = {"name": "ai-reviewed", "status": "skipped_disabled"}
     return {
         "schema_version": "0.1",
         "repo": repo,

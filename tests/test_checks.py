@@ -247,6 +247,67 @@ class DeterministicChecksTest(unittest.TestCase):
 
         self.assertTrue(any(finding["category"] == "precommit" for finding in findings))
 
+    def test_target_pipeline_failure_is_flagged_with_job_link_and_fix(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "pre-commit",
+                        "target_name": "pre-commit",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/99",
+                        "steps": [{"name": "Pre-commit", "conclusion": "failure"}],
+                        "log_excerpt": "hook id: ruff\nconnector.py:1:1: F401 `os` imported but unused",
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertEqual(pipeline[0]["title"], "pre-commit pipeline job failed")
+        self.assertEqual(pipeline[0]["url"], "https://github.example/actions/runs/123/job/99")
+        self.assertIn("connector.py:1:1", pipeline[0]["evidence"])
+        self.assertIn("ruff", pipeline[0]["suggested_fix"].lower())
+        self.assertTrue(pipeline[0]["merge_blocking"])
+
+    def test_semantic_release_preview_failure_gets_release_specific_fix(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "semantic-release-preview",
+                        "target_name": "semantic-release-preview",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/101",
+                        "steps": [{"name": "Run Semantic Release as a dry run", "conclusion": "failure"}],
+                        "log_excerpt": "semantic-release failed: release_notes/unreleased.md is missing",
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("semantic-release-preview", pipeline[0]["title"])
+        self.assertIn("release_notes/unreleased.md", pipeline[0]["suggested_fix"])
+
     def test_static_test_failure_comment_is_flagged_with_specific_details(self):
         review_input = {
             "pr": {"title": "test", "body": ""},

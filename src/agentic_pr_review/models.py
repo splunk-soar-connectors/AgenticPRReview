@@ -21,6 +21,7 @@ ALLOWED_CATEGORIES = {
     "precommit",
     "merge_conflict",
     "ci_synthesis",
+    "ci_pipeline_failure",
     "general",
 }
 ALLOWED_FINDING_CATEGORIES = {
@@ -299,7 +300,7 @@ def is_actionable_review_finding(finding: dict[str, Any]) -> bool:
 
     file_path = str(finding.get("file") or "").strip()
     if not file_path or file_path.lower() in {"none", "null", "conversation"}:
-        return False
+        return is_actionable_fileless_finding(finding)
 
     if any(not str(finding.get(field) or "").strip() for field in REQUIRED_TEXT_FIELDS):
         return False
@@ -318,6 +319,25 @@ def is_actionable_review_finding(finding: dict[str, Any]) -> bool:
     if suggested_fix.startswith(("verify ", "confirm ", "consider ", "inspect ")):
         return False
 
+    return True
+
+
+def is_actionable_fileless_finding(finding: dict[str, Any]) -> bool:
+    category = str(finding.get("category") or "")
+    if category != "ci_pipeline_failure":
+        return False
+    if str(finding.get("confidence") or "").lower() != "high":
+        return False
+    if any(not str(finding.get(field) or "").strip() for field in REQUIRED_TEXT_FIELDS):
+        return False
+    if not str(finding.get("url") or "").strip():
+        return False
+    text = " ".join(
+        str(finding.get(field) or "")
+        for field in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference")
+    ).lower()
+    if any(phrase in text for phrase in SPECULATIVE_PHRASES):
+        return False
     return True
 
 

@@ -1296,6 +1296,47 @@ class GitHubCommentsTest(unittest.TestCase):
 
         self.assertEqual(plan["comments"], [])
 
+    def test_target_pipeline_failure_posts_conversation_comment_with_job_link(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "ci-1",
+                    "title": "compile pipeline job failed",
+                    "category": "ci_pipeline_failure",
+                    "finding_category": "introduced_bug",
+                    "causality": "exposed_by_pr",
+                    "severity": "high",
+                    "confidence": "high",
+                    "merge_blocking": True,
+                    "publication_destination": "inline_blocking",
+                    "file": None,
+                    "line": None,
+                    "code_reference": "GitHub Actions job `compile`",
+                    "evidence": (
+                        "`compile` concluded `failure`. Failed step(s): Compile Application. "
+                        "Log excerpt: SyntaxError: invalid syntax in connector.py"
+                    ),
+                    "why_it_matters": "A failed compile job blocks a clean merge signal.",
+                    "suggested_fix": "Fix the Python syntax at the reported file/line and rerun the compile job.",
+                    "url": "https://github.example/actions/runs/123/job/99",
+                }
+            ]
+        }
+
+        plan = real_build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "conversation")
+        self.assertEqual(comment["finding_type"], "text")
+        self.assertIn("Pipeline: [failed job](https://github.example/actions/runs/123/job/99)", comment["body"])
+        self.assertIn("How to fix:", comment["body"])
+        self.assertIn("rerun the compile job", comment["body"])
+
     def test_ci_wrapper_precommit_finding_is_not_posted(self):
         review_input = {
             "repo": "owner/repo",

@@ -209,6 +209,15 @@ def run_review(args: argparse.Namespace) -> int:
             f"Deterministic checks completed in {format_duration(time.monotonic() - stage_started)} "
             f"with {len(deterministic_findings)} finding(s)."
         )
+        publish_target_pipeline_failure_comments(
+            client,
+            review_input,
+            deterministic_findings,
+            run_dir=run_dir,
+            publish_comments=args.publish_comments,
+            allow_duplicates=args.allow_duplicate_comments,
+            progress=progress,
+        )
 
         if args.skip_model:
             progress("Model review skipped by --skip-model.")
@@ -282,6 +291,72 @@ def run_review(args: argparse.Namespace) -> int:
     if args.publish_comments:
         print(f"publish result: {run_dir / 'publish_result.json'}")
     return 0
+
+
+def publish_target_pipeline_failure_comments(
+    client: Any,
+    review_input: dict[str, Any],
+    deterministic_findings: list[dict[str, Any]],
+    *,
+    run_dir: Path,
+    publish_comments: bool,
+    allow_duplicates: bool,
+    progress: ProgressReporter,
+) -> dict[str, Any] | None:
+    pipeline_findings = [
+        finding
+        for finding in deterministic_findings
+        if isinstance(finding, dict) and str(finding.get("category") or "") == "ci_pipeline_failure"
+    ]
+    if not pipeline_findings:
+        return None
+
+    progress(f"Target pipeline failure notification planned for {len(pipeline_findings)} failed job(s).")
+    review_output = deterministic_only_output(pipeline_findings)
+    comment_plan = build_comment_plan(review_output, review_input, max_comments=None)
+    write_json(run_dir / "ci_pipeline_comment_plan.json", comment_plan)
+    planned_count = len(comment_plan.get("comments") or [])
+    if not publish_comments or planned_count == 0:
+        progress(f"Target pipeline failure notification prepared with {planned_count} publishable comment(s).")
+        return {"planned": planned_count, "published": False}
+
+    progress(f"Publishing {planned_count} target pipeline failure comment(s) before model review.")
+    publish_result = publish_comment_plan(
+        client,
+        comment_plan,
+        review_input,
+        allow_duplicates=allow_duplicates,
+        max_comments=None,
+        apply_label=False,
+    )
+    write_json(run_dir / "ci_pipeline_publish_result.json", publish_result)
+    mark_successfully_published_markers_as_existing(review_input, comment_plan, publish_result)
+    progress(
+        f"Target pipeline failure publication completed: "
+        f"{publish_result.get('posted', 0)} posted, {publish_result.get('skipped', 0)} skipped, "
+        f"{publish_result.get('errors', 0)} error(s)."
+    )
+    return publish_result
+
+
+def mark_successfully_published_markers_as_existing(
+    review_input: dict[str, Any],
+    comment_plan: dict[str, Any],
+    publish_result: dict[str, Any],
+) -> None:
+    successful_ids = {
+        str(item.get("id") or "")
+        for item in publish_result.get("results", []) or []
+        if str(item.get("status") or "").startswith(("posted", "skipped_duplicate"))
+    }
+    if not successful_ids:
+        return
+    comments = review_input.setdefault("comments", {})
+    issue_comments = comments.setdefault("issue_comments", [])
+    for comment in comment_plan.get("comments", []) or []:
+        marker = str(comment.get("marker") or "")
+        if marker and str(comment.get("id") or "") in successful_ids:
+            issue_comments.append({"body": marker})
 
 
 def build_model_reviewer(

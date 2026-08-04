@@ -43,6 +43,11 @@ on:
         required: false
         type: string
         default: "0"
+      previous_pipeline_results_json:
+        description: JSON map of caller workflow job results for CI failure reporting.
+        required: false
+        type: string
+        default: "{}"
       publish_comments:
         description: Publish GitHub comments and apply the ai-reviewed label.
         required: false
@@ -70,6 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
+      actions: read
+      checks: read
       contents: read
       pull-requests: read
       issues: read
@@ -172,6 +179,7 @@ jobs:
           REVIEW_REPO: ${{ inputs.repo }}
           REVIEW_PR_NUMBER: ${{ inputs.pr_number }}
           REVIEW_OUTPUT_DIR: ${{ github.workspace }}/AgenticPRReview/runs
+          PREVIOUS_PIPELINE_RESULTS_JSON: ${{ inputs.previous_pipeline_results_json }}
         run: |
           args=(
             review "${REVIEW_REPO}" "${REVIEW_PR_NUMBER}"

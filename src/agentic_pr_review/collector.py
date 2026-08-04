@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 from pathlib import PurePosixPath
 import re
 from typing import Any
@@ -35,6 +37,12 @@ ALWAYS_FETCH_FULL_FILES = {
 }
 
 FAILED_CHECK_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
+TARGET_PIPELINE_JOB_NAMES = {
+    "pre-commit",
+    "compile",
+    "build",
+    "semantic-release-preview",
+}
 CI_LOG_KEYWORDS = (
     "failed -",
     "failed:",
@@ -51,12 +59,18 @@ CI_LOG_KEYWORDS = (
     "semgrep",
     "detect-secrets",
     "build-docs",
+    "build failed",
     "release-notes",
+    "semantic-release",
     "check-json",
     "check-yaml",
     "mdformat",
+    "compile failed",
     "pytest",
     "coverage",
+    "npm err!",
+    "package build",
+    "soarapps",
     "app_package_name",
     "valid_app_name_and_guid",
     "appid_to_name",
@@ -129,6 +143,10 @@ class PRCollector:
         review_comments = self.client.list_review_comments(repo, pr_number)
         reviews = self.client.list_reviews(repo, pr_number)
         checks = self._safe_checks(repo, head_sha)
+        workflow_jobs = self._safe_workflow_run_jobs(repo)
+        if workflow_jobs.get("workflow_job_errors"):
+            checks["errors"].extend(str(error) for error in workflow_jobs["workflow_job_errors"])
+        checks.update(workflow_jobs)
 
         root_json_files = self._root_json_files(repo, head_sha)
         full_file_paths = self._select_full_files(files, root_json_files)
@@ -193,6 +211,7 @@ class PRCollector:
                 "base_full_file_missing_paths": sorted(base_full_file_paths - set(base_files))[:50],
                 "base_full_file_fetch_errors": base_full_file_errors[:50],
                 "ci_error_count": len(checks.get("errors", [])) if isinstance(checks, dict) else 0,
+                "target_pipeline_failure_count": len(checks.get("target_job_failures", [])) if isinstance(checks, dict) else 0,
             },
         }
 
@@ -278,6 +297,55 @@ class PRCollector:
             if len(logs) >= max_logs:
                 break
         return logs, errors
+
+    def _safe_workflow_run_jobs(self, repo: str) -> dict[str, Any]:
+        workflow_needs_results = previous_pipeline_results_from_env()
+        output: dict[str, Any] = {
+            "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
+            "workflow_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
+            "workflow_needs_results": workflow_needs_results,
+            "workflow_jobs": [],
+            "target_job_failures": previous_pipeline_failures_from_env(),
+            "workflow_job_errors": [],
+        }
+        run_id = str(output.get("workflow_run_id") or "").strip()
+        if not run_id:
+            return output
+        attempt = str(output.get("workflow_run_attempt") or "").strip() or None
+        try:
+            jobs = self.client.list_workflow_run_jobs(repo, run_id, attempt=attempt)
+        except GitHubError as exc:
+            output["workflow_job_errors"].append(f"Could not list workflow jobs for run {run_id}: {exc}")
+            return output
+
+        compact_jobs = [compact_workflow_job(job) for job in jobs]
+        output["workflow_jobs"] = compact_jobs
+        for job in compact_jobs:
+            target_name = target_pipeline_job_name(str(job.get("name") or ""))
+            if not target_name:
+                continue
+            conclusion = str(job.get("conclusion") or "").lower()
+            if conclusion not in FAILED_CHECK_CONCLUSIONS:
+                continue
+            failed = dict(job)
+            failed["target_name"] = target_name
+            output["target_job_failures"] = [
+                existing
+                for existing in output["target_job_failures"]
+                if not isinstance(existing, dict) or existing.get("target_name") != target_name
+            ]
+            job_id = failed.get("id")
+            if job_id:
+                try:
+                    raw_log = self.client.get_actions_job_logs(repo, job_id)
+                except GitHubError as exc:
+                    output["workflow_job_errors"].append(
+                        f"Could not fetch GitHub Actions log for {failed.get('name') or job_id}: {exc}"
+                    )
+                else:
+                    failed["log_excerpt"] = summarize_ci_log(decode_actions_job_log(raw_log))
+            output["target_job_failures"].append(failed)
+        return output
 
     def _root_json_files(self, repo: str, head_sha: str) -> list[str]:
         try:
@@ -413,6 +481,75 @@ def extract_actions_job_id(details_url: str) -> str | None:
     return match.group("job_id")
 
 
+def target_pipeline_job_name(job_name: str) -> str | None:
+    normalized = normalize_job_name(job_name)
+    if normalized in TARGET_PIPELINE_JOB_NAMES:
+        return normalized
+    for target in TARGET_PIPELINE_JOB_NAMES:
+        if normalized.startswith(f"{target} ") or normalized.startswith(f"{target} /"):
+            return target
+    return None
+
+
+def normalize_job_name(job_name: str) -> str:
+    normalized = re.sub(r"\s+", " ", job_name.strip().lower())
+    normalized = normalized.split(" (", 1)[0].strip()
+    return normalized
+
+
+def previous_pipeline_failures_from_env() -> list[dict[str, Any]]:
+    results = previous_pipeline_results_from_env()
+    failures: list[dict[str, Any]] = []
+    default_url = workflow_run_url_from_env()
+    for raw_name, raw_value in results.items():
+        target_name = target_pipeline_job_name(str(raw_name))
+        if not target_name:
+            continue
+        if isinstance(raw_value, dict):
+            conclusion = str(raw_value.get("result") or raw_value.get("conclusion") or "").lower()
+            url = str(raw_value.get("url") or raw_value.get("html_url") or default_url or "").strip()
+        else:
+            conclusion = str(raw_value or "").lower()
+            url = default_url
+        if conclusion not in FAILED_CHECK_CONCLUSIONS:
+            continue
+        failures.append(
+            {
+                "name": target_name,
+                "target_name": target_name,
+                "status": "completed",
+                "conclusion": conclusion,
+                "html_url": url or None,
+                "steps": [],
+                "source": "workflow_needs",
+            }
+        )
+    return failures
+
+
+def previous_pipeline_results_from_env() -> dict[str, Any]:
+    raw = os.getenv("PREVIOUS_PIPELINE_RESULTS_JSON")
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    jobs = parsed.get("jobs", parsed)
+    return jobs if isinstance(jobs, dict) else {}
+
+
+def workflow_run_url_from_env() -> str | None:
+    server = os.getenv("GITHUB_SERVER_URL") or "https://github.com"
+    repo = os.getenv("GITHUB_REPOSITORY")
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if not repo or not run_id:
+        return None
+    return f"{server.rstrip('/')}/{repo}/actions/runs/{run_id}"
+
+
 def decode_actions_job_log(raw: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -486,6 +623,35 @@ def is_ci_boilerplate_line(line: str) -> bool:
     if re.search(r"\bpytest\s+suite/apps/", lowered):
         return True
     return False
+
+
+def compact_workflow_job(job: dict[str, Any]) -> dict[str, Any]:
+    steps = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        steps.append(
+            {
+                "name": step.get("name"),
+                "status": step.get("status"),
+                "conclusion": step.get("conclusion"),
+                "number": step.get("number"),
+                "started_at": step.get("started_at"),
+                "completed_at": step.get("completed_at"),
+            }
+        )
+    return {
+        "id": job.get("id"),
+        "run_id": job.get("run_id"),
+        "run_attempt": job.get("run_attempt"),
+        "name": job.get("name"),
+        "status": job.get("status"),
+        "conclusion": job.get("conclusion"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "html_url": job.get("html_url"),
+        "steps": steps,
+    }
 
 
 def snippets_for_terms(text: str, terms: list[str], *, window: int = 700, max_snippets: int = 12) -> list[dict[str, Any]]:
