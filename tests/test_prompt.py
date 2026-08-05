@@ -113,6 +113,33 @@ class PromptPackingTest(unittest.TestCase):
         self.assertNotIn("duplicated focused context", prompt)
         self.assertNotIn("duplicated base context", prompt)
 
+    def test_comment_anchor_files_are_not_sent_to_model(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "title": "test"},
+            "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "patch": "+secret: value\n",
+                }
+            ],
+            "full_files": {},
+            "base_files": {},
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+            "ci": {"check_runs": []},
+        }
+
+        compacted = compact_review_input_for_model(
+            review_input,
+            limits={"patch": 500, "file": 500, "comment": 200, "review": 200},
+        )
+        prompt = build_user_prompt(review_input, [], max_chars=50_000)
+
+        self.assertNotIn("comment_anchor_files", compacted)
+        self.assertNotIn("comment_anchor_files", prompt)
+        self.assertNotIn("secret: value", prompt)
+
     def test_collection_diagnostics_include_sdk_review_inventory(self):
         review_input = {
             "pr": {"title": "sdk migration", "body": ""},

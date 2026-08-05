@@ -27,6 +27,56 @@ from .secret_redactor import redact_obj, redact_text
 
 
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
+TARGET_PIPELINE_JOB_ALIASES = {
+    "pre-commit": (
+        "pre-commit",
+        "precommit",
+        "pre commit",
+        "hook id:",
+        "detect-secrets",
+        "detect secrets",
+        "secret keyword",
+        "potential secrets",
+        "ruff",
+        "semgrep",
+        "djlint",
+        "mdformat",
+    ),
+    "compile": (
+        "compile",
+        "compile application",
+        "soar instance",
+        "phantom instance",
+        "phantom_instance",
+        "connecttimeout",
+        "connect timeout",
+        "connection timed out",
+        "timed out connecting",
+        "installing app on",
+        "app installation failed",
+    ),
+    "build": (
+        "build",
+        "build application",
+        "build sdk app",
+        "package build",
+        "app-tar",
+        "tarball",
+        "upload app tar",
+    ),
+    "semantic-release-preview": (
+        "semantic-release-preview",
+        "semantic-release",
+        "semantic release",
+        "release preview",
+        "release notes",
+        "release_version.txt",
+        "release_notes/unreleased.md",
+        "unreleased.md",
+    ),
+}
+PIPELINE_DUPLICATE_CATEGORIES = {"ci_pipeline_failure", "ci_synthesis", "precommit"}
+PIPELINE_PUBLICATION_SUCCESS_STATUSES = ("posted", "skipped_duplicate")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,6 +259,21 @@ def run_review(args: argparse.Namespace) -> int:
             f"Deterministic checks completed in {format_duration(time.monotonic() - stage_started)} "
             f"with {len(deterministic_findings)} finding(s)."
         )
+        reviewer: GatewayClaudeReviewer | None = None
+        if not args.skip_model:
+            def get_reviewer() -> GatewayClaudeReviewer:
+                nonlocal reviewer
+                if reviewer is None:
+                    reviewer = build_model_reviewer(config, max_tokens=args.max_model_tokens, progress=progress)
+                return reviewer
+
+            deterministic_findings = refine_low_confidence_pipeline_findings(
+                deterministic_findings,
+                reviewer_factory=get_reviewer,
+                progress=progress,
+            )
+        else:
+            deterministic_findings = conservatively_downgrade_low_confidence_pipeline_findings(deterministic_findings)
         publish_target_pipeline_failure_comments(
             client,
             review_input,
@@ -225,7 +290,7 @@ def run_review(args: argparse.Namespace) -> int:
         else:
             stage_started = time.monotonic()
             progress(f"Model review started with provider {config.model_provider}.")
-            reviewer = build_model_reviewer(config, max_tokens=args.max_model_tokens, progress=progress)
+            reviewer = reviewer or build_model_reviewer(config, max_tokens=args.max_model_tokens, progress=progress)
             if args.shallow:
                 review_output = reviewer.review(review_input, deterministic_findings)
             else:
@@ -241,6 +306,11 @@ def run_review(args: argparse.Namespace) -> int:
         stage_started = time.monotonic()
         progress("Filtering findings and building the GitHub comment plan.")
         review_output = filter_review_output_for_pr_context(review_output, review_input)
+        review_output = suppress_redundant_published_pipeline_findings(
+            review_output,
+            review_input,
+            progress=progress,
+        )
         comment = render_comment(review_output, review_input, publishing_requested=args.publish_comments)
         max_comments = args.max_published_comments if args.max_published_comments > 0 else None
         comment_plan = build_comment_plan(review_output, review_input, max_comments=max_comments)
@@ -331,12 +401,320 @@ def publish_target_pipeline_failure_comments(
     )
     write_json(run_dir / "ci_pipeline_publish_result.json", publish_result)
     mark_successfully_published_markers_as_existing(review_input, comment_plan, publish_result)
+    record_successfully_published_target_pipeline_jobs(review_input, comment_plan, publish_result)
     progress(
         f"Target pipeline failure publication completed: "
         f"{publish_result.get('posted', 0)} posted, {publish_result.get('skipped', 0)} skipped, "
         f"{publish_result.get('errors', 0)} error(s)."
     )
     return publish_result
+
+
+def refine_low_confidence_pipeline_findings(
+    deterministic_findings: list[dict[str, Any]],
+    *,
+    reviewer_factory: Any,
+    progress: ProgressReporter,
+) -> list[dict[str, Any]]:
+    needs_refinement = [
+        finding
+        for finding in deterministic_findings
+        if isinstance(finding, dict)
+        and str(finding.get("category") or "") == "ci_pipeline_failure"
+        and finding.get("ci_diagnosis_needs_model") is True
+    ]
+    if not needs_refinement:
+        return deterministic_findings
+
+    progress(
+        f"CI failure diagnosis fallback needed for {len(needs_refinement)} low-confidence pipeline finding(s)."
+    )
+    try:
+        reviewer = reviewer_factory()
+    except Exception as exc:  # noqa: BLE001 - model fallback should not break deterministic review
+        progress(f"CI failure diagnosis fallback unavailable: {redact_text(str(exc))}.")
+        return [
+            conservatively_downgrade_pipeline_finding(finding)
+            if isinstance(finding, dict)
+            and str(finding.get("category") or "") == "ci_pipeline_failure"
+            and finding.get("ci_diagnosis_needs_model") is True
+            else finding
+            for finding in deterministic_findings
+        ]
+
+    refined: list[dict[str, Any]] = []
+    for finding in deterministic_findings:
+        if (
+            not isinstance(finding, dict)
+            or str(finding.get("category") or "") != "ci_pipeline_failure"
+            or finding.get("ci_diagnosis_needs_model") is not True
+        ):
+            refined.append(finding)
+            continue
+
+        try:
+            diagnosis = reviewer.diagnose_ci_failure(
+                job_name=target_job_name_from_finding(finding),
+                failed_steps=[str(item) for item in finding.get("pipeline_failed_steps") or []],
+                conclusion=target_job_conclusion_from_evidence(str(finding.get("evidence") or "")),
+                deterministic_root_cause=str(finding.get("root_cause") or ""),
+                deterministic_fix=str(finding.get("suggested_fix") or ""),
+                log_excerpt=str(finding.get("pipeline_log_excerpt") or finding.get("evidence") or ""),
+            )
+        except GatewayReviewError as exc:
+            progress(f"CI failure diagnosis fallback failed: {redact_text(str(exc))}.")
+            refined.append(conservatively_downgrade_pipeline_finding(finding))
+            continue
+
+        if diagnosis.get("diagnosis_status") != "confirmed":
+            progress(
+                f"CI failure diagnosis fallback could not confirm {target_job_name_from_finding(finding)} root cause."
+            )
+            refined.append(conservatively_downgrade_pipeline_finding(finding))
+            continue
+
+        updated = dict(finding)
+        updated["root_cause"] = diagnosis["root_cause"]
+        updated["observable_failure"] = diagnosis["failure_scenario"] or (
+            f"The `{target_job_name_from_finding(finding)}` job cannot pass because {diagnosis['root_cause']}."
+        )
+        updated["suggested_fix"] = diagnosis["suggested_fix"]
+        updated["ci_diagnosis_confidence"] = diagnosis["confidence"]
+        updated["ci_diagnosis_confidence_score"] = diagnosis["confidence_score"]
+        updated["ci_diagnosis_needs_model"] = False
+        updated["confidence"] = diagnosis["confidence"]
+        updated["confidence_score"] = diagnosis["confidence_score"]
+        updated["evidence"] = pipeline_evidence_with_model_diagnosis(updated, diagnosis)
+        progress(
+            f"CI failure diagnosis fallback confirmed {target_job_name_from_finding(finding)} "
+            f"with {diagnosis['confidence']} confidence."
+        )
+        refined.append(updated)
+
+    return refined
+
+
+def suppress_redundant_published_pipeline_findings(
+    review_output: dict[str, Any],
+    review_input: dict[str, Any],
+    *,
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    published_jobs = published_target_pipeline_jobs(review_input)
+    if not published_jobs:
+        return review_output
+
+    original_findings = [finding for finding in review_output.get("findings", []) or [] if isinstance(finding, dict)]
+    findings = []
+    suppressed = []
+    for finding in original_findings:
+        duplicate_job = redundant_published_pipeline_job_for_finding(finding, published_jobs)
+        if duplicate_job:
+            suppressed.append(
+                {
+                    "id": finding.get("id"),
+                    "title": finding.get("title"),
+                    "category": finding.get("category"),
+                    "code_reference": finding.get("code_reference"),
+                    "duplicate_of_pipeline_job": duplicate_job,
+                }
+            )
+            continue
+        findings.append(finding)
+
+    if not suppressed:
+        return review_output
+
+    output = dict(review_output)
+    output["findings"] = findings
+    verification = dict(output.get("behavioral_verification") or {})
+    verification["suppressed_duplicate_pipeline_comment_count"] = len(suppressed)
+    verification["suppressed_duplicate_pipeline_comments"] = suppressed[:50]
+    output["behavioral_verification"] = verification
+
+    suppressed_jobs = sorted(set(item["duplicate_of_pipeline_job"] for item in suppressed))
+    jobs_text = ", ".join(f"`{job}`" for job in suppressed_jobs)
+    note = (
+        f"Suppressed {len(suppressed)} duplicate final finding(s) already covered by "
+        f"early target pipeline comment(s): {jobs_text}."
+    )
+    existing_notes = str(output.get("model_notes") or "").strip()
+    output["model_notes"] = f"{existing_notes}\n{note}".strip() if existing_notes else note
+    if progress:
+        progress(note)
+    return output
+
+
+def redundant_published_pipeline_job_for_finding(finding: dict[str, Any], published_jobs: set[str]) -> str:
+    category = str(finding.get("category") or "").lower()
+    text = pipeline_duplicate_match_text(finding)
+    own_job = normalize_pipeline_job_name(target_job_name_from_finding(finding))
+
+    if category == "ci_pipeline_failure" and own_job in published_jobs:
+        return own_job
+    if category == "precommit" and "pre-commit" in published_jobs:
+        return "pre-commit"
+    if category == "ci_synthesis" and published_jobs:
+        return sorted(published_jobs)[0]
+
+    if not looks_like_pipeline_finding(category, text):
+        return ""
+
+    for job in sorted(published_jobs):
+        if job == own_job or finding_mentions_pipeline_job(text, job):
+            return job
+    return ""
+
+
+def looks_like_pipeline_finding(category: str, text: str) -> bool:
+    if category in PIPELINE_DUPLICATE_CATEGORIES:
+        return True
+    pipeline_terms = (
+        "github actions job",
+        "pipeline",
+        "failed job",
+        "failed check",
+        "pre-commit",
+        "precommit",
+        "hook id:",
+        "detect-secrets",
+        "semantic-release",
+        "connecttimeout",
+        "app installation failed",
+    )
+    return any(term in text for term in pipeline_terms)
+
+
+def finding_mentions_pipeline_job(text: str, job: str) -> bool:
+    aliases = TARGET_PIPELINE_JOB_ALIASES.get(job, (job,))
+    return any(alias in text for alias in aliases)
+
+
+def pipeline_duplicate_match_text(finding: dict[str, Any]) -> str:
+    fields = (
+        "title",
+        "category",
+        "finding_category",
+        "review_area",
+        "code_reference",
+        "evidence",
+        "observable_failure",
+        "root_cause",
+        "why_it_matters",
+        "suggested_fix",
+        "url",
+    )
+    return " ".join(str(finding.get(field) or "") for field in fields).lower()
+
+
+def published_target_pipeline_jobs(review_input: dict[str, Any]) -> set[str]:
+    ci = review_input.get("ci") if isinstance(review_input, dict) else {}
+    if not isinstance(ci, dict):
+        return set()
+    published_jobs = ci.get("published_target_pipeline_jobs", []) or []
+    return {normalized for normalized in (normalize_pipeline_job_name(job) for job in published_jobs) if normalized}
+
+
+def record_successfully_published_target_pipeline_jobs(
+    review_input: dict[str, Any],
+    comment_plan: dict[str, Any],
+    publish_result: dict[str, Any],
+) -> None:
+    successful_ids = {
+        str(item.get("id") or "")
+        for item in publish_result.get("results", []) or []
+        if str(item.get("status") or "").startswith(PIPELINE_PUBLICATION_SUCCESS_STATUSES)
+    }
+    if not successful_ids:
+        return
+
+    jobs = published_target_pipeline_jobs(review_input)
+    for comment in comment_plan.get("comments", []) or []:
+        if str(comment.get("id") or "") not in successful_ids:
+            continue
+        job = normalize_pipeline_job_name(target_job_name_from_finding(comment))
+        if job:
+            jobs.add(job)
+
+    if jobs:
+        ci = review_input.get("ci")
+        if not isinstance(ci, dict):
+            ci = {}
+            review_input["ci"] = ci
+        ci["published_target_pipeline_jobs"] = sorted(jobs)
+
+
+def normalize_pipeline_job_name(name: Any) -> str:
+    normalized = " ".join(str(name or "").strip().lower().replace("_", "-").split())
+    if normalized in {"precommit", "pre commit"}:
+        return "pre-commit"
+    if normalized in TARGET_PIPELINE_JOB_ALIASES:
+        return normalized
+    for job, aliases in TARGET_PIPELINE_JOB_ALIASES.items():
+        if normalized in aliases:
+            return job
+    return normalized
+
+
+def conservatively_downgrade_low_confidence_pipeline_findings(
+    deterministic_findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        conservatively_downgrade_pipeline_finding(finding)
+        if isinstance(finding, dict)
+        and str(finding.get("category") or "") == "ci_pipeline_failure"
+        and finding.get("ci_diagnosis_needs_model") is True
+        else finding
+        for finding in deterministic_findings
+    ]
+
+
+def target_job_name_from_finding(finding: dict[str, Any]) -> str:
+    code_reference = str(finding.get("code_reference") or "")
+    if code_reference.startswith("GitHub Actions job "):
+        return code_reference.removeprefix("GitHub Actions job ").strip()
+    title = str(finding.get("title") or "")
+    if title.endswith(" pipeline job failed"):
+        return title.removesuffix(" pipeline job failed").strip()
+    return "pipeline"
+
+
+def target_job_conclusion_from_evidence(evidence: str) -> str:
+    for conclusion in ("failure", "timed_out", "cancelled", "action_required"):
+        if f"concluded `{conclusion}`" in evidence:
+            return conclusion
+    return "failure"
+
+
+def pipeline_evidence_with_model_diagnosis(finding: dict[str, Any], diagnosis: dict[str, Any]) -> str:
+    parts = [str(finding.get("evidence") or "").strip()]
+    evidence_lines = [str(line).strip() for line in diagnosis.get("evidence_lines") or [] if str(line).strip()]
+    if diagnosis.get("root_cause"):
+        parts.append(f"Verified root cause: {diagnosis['root_cause']}.")
+    if evidence_lines:
+        parts.append(f"Supporting log line(s): {' / '.join(evidence_lines[:5])}")
+    return " ".join(part for part in parts if part)
+
+
+def conservatively_downgrade_pipeline_finding(finding: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(finding, dict):
+        return finding
+    updated = dict(finding)
+    job_name = target_job_name_from_finding(updated)
+    updated["confidence"] = "medium"
+    updated["confidence_score"] = min(float(updated.get("confidence_score") or 0.55), 0.55)
+    updated["ci_diagnosis_confidence"] = "medium"
+    updated["ci_diagnosis_confidence_score"] = updated["confidence_score"]
+    updated["ci_diagnosis_needs_model"] = False
+    updated["root_cause"] = (
+        f"`{job_name}` failed, but the compact log excerpt did not prove a more specific root cause."
+    )
+    updated["observable_failure"] = f"The `{job_name}` job ended without a passing result."
+    updated["suggested_fix"] = (
+        f"Open the linked `{job_name}` job log and fix the first terminal failure summary, retry summary, "
+        "or tool-specific error line shown there before rerunning the workflow."
+    )
+    return updated
 
 
 def mark_successfully_published_markers_as_existing(
@@ -385,6 +763,9 @@ def write_artifacts(
 ) -> None:
     write_json(run_dir / "review_input.json", review_input)
     write_json(run_dir / "review_output.json", review_output)
+    routing_summary = (review_output.get("deep_review") or {}).get("model_routing_summary")
+    if isinstance(routing_summary, dict):
+        write_json(run_dir / "model_routing_summary.json", routing_summary)
     sdk_manifest = review_input.get("sdk_manifest") if isinstance(review_input, dict) else None
     if isinstance(sdk_manifest, dict):
         write_json(run_dir / "sdk_manifest_result.json", sdk_manifest)

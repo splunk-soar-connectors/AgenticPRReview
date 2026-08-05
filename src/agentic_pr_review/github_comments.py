@@ -8,6 +8,11 @@ from typing import Any
 
 from .github_client import GitHubClient, GitHubError
 from .models import is_actionable_review_finding, should_promote_deterministic_finding
+from .review_exclusions import (
+    finding_mentions_review_excluded_path,
+    is_review_excluded_path,
+    review_exclusion_reason,
+)
 from .secret_redactor import redact_text
 
 
@@ -150,6 +155,10 @@ def build_comment_plan(
     if max_comments is not None and max_comments > 0:
         findings = findings[:max_comments]
     diff_index = build_diff_index(review_input.get("changed_files", []))
+    pipeline_diff_index = build_diff_index(
+        pipeline_comment_anchor_files(review_input),
+        include_review_excluded_paths=True,
+    )
 
     comments = []
     for finding in findings:
@@ -157,7 +166,7 @@ def build_comment_plan(
             continue
         if should_skip_finding_for_pr_context(finding, review_input):
             continue
-        comment = build_comment_for_finding(finding, review_input, diff_index)
+        comment = build_comment_for_finding(finding, review_input, diff_index, pipeline_diff_index=pipeline_diff_index)
         if comment:
             comments.append(comment)
 
@@ -974,6 +983,14 @@ def finding_context_filter_reason(finding: dict[str, Any], review_input: dict[st
             "evidence_source": "publication_calibration",
             "confidence_after": "low",
         }
+    if is_finding_against_review_excluded_path(finding):
+        path = str(finding.get("file") or "").strip()
+        return {
+            "reason": "review_excluded_path",
+            "detail": review_exclusion_reason(path) or "finding references a path excluded from review",
+            "evidence_source": "review_exclusions",
+            "confidence_after": "low",
+        }
     if is_stale_removed_sdk_manifest_finding(finding, review_input):
         return {
             "reason": "stale_removed_sdk_manifest",
@@ -1200,6 +1217,8 @@ def is_outside_changed_pr_scope(finding: dict[str, Any], review_input: dict[str,
         return False
 
     path = str(finding.get("file") or "").strip()
+    if is_review_excluded_path(path):
+        return True
     if not path:
         return True
 
@@ -1236,6 +1255,12 @@ def can_infer_changed_anchor(finding: dict[str, Any], review_input: dict[str, An
     diff_index = build_diff_index(review_input.get("changed_files", []))
     path, line = infer_code_anchor(finding, diff_index, preferred_path=None)
     return bool(path and line)
+
+
+def is_finding_against_review_excluded_path(finding: dict[str, Any]) -> bool:
+    if str(finding.get("category") or "") == "ci_pipeline_failure":
+        return False
+    return finding_mentions_review_excluded_path(finding)
 
 
 def is_stale_removed_sdk_manifest_finding(finding: dict[str, Any], review_input: dict[str, Any]) -> bool:
@@ -1403,6 +1428,8 @@ def build_comment_for_finding(
     finding: dict[str, Any],
     review_input: dict[str, Any],
     diff_index: dict[str, dict[str, Any]],
+    *,
+    pipeline_diff_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     title = str(finding.get("title") or "").strip()
     if not title:
@@ -1410,12 +1437,18 @@ def build_comment_for_finding(
 
     path = str(finding.get("file") or "").strip() or None
     line = normalize_line(finding.get("line"))
-    if should_infer_code_anchor(finding, path, line, diff_index):
-        inferred_path, inferred_line = infer_code_anchor(finding, diff_index, preferred_path=path)
+    if str(finding.get("category") or "") == "ci_pipeline_failure":
+        target_diff_index = pipeline_diff_index
+    else:
+        target_diff_index = diff_index
+    if target_diff_index is None:
+        target_diff_index = diff_index
+    if should_infer_code_anchor(finding, path, line, target_diff_index):
+        inferred_path, inferred_line = infer_code_anchor(finding, target_diff_index, preferred_path=path)
         path = inferred_path or path
         line = inferred_line or line
     finding_type = classify_finding(finding, path=path)
-    target = choose_target(path, line, diff_index)
+    target = choose_target(path, line, target_diff_index)
     finding_id = stable_finding_id(finding)
     marker = f"{MARKER_PREFIX}{finding_id} -->"
     body = render_short_comment(finding, finding_type, target)
@@ -1447,13 +1480,19 @@ def build_comment_for_finding(
     }
 
 
-def build_diff_index(changed_files: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def build_diff_index(
+    changed_files: list[dict[str, Any]],
+    *,
+    include_review_excluded_paths: bool = False,
+) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
     for item in changed_files:
         if not isinstance(item, dict):
             continue
         path = item.get("filename")
         if not path:
+            continue
+        if is_review_excluded_path(path) and not include_review_excluded_paths:
             continue
         right_entries = parse_right_side_diff_entries(str(item.get("patch") or ""))
         right_lines = {entry["line"] for entry in right_entries}
@@ -1464,6 +1503,15 @@ def build_diff_index(changed_files: list[dict[str, Any]]) -> dict[str, dict[str,
             "status": item.get("status"),
         }
     return output
+
+
+def pipeline_comment_anchor_files(review_input: dict[str, Any]) -> list[dict[str, Any]]:
+    files = []
+    for key in ("changed_files", "comment_anchor_files"):
+        for item in review_input.get(key, []) or []:
+            if isinstance(item, dict):
+                files.append(item)
+    return files
 
 
 def parse_right_side_diff_lines(patch: str) -> set[int]:
@@ -1574,7 +1622,7 @@ def infer_code_anchor(
 
     best: tuple[int, str, int] | None = None
     for path, info in diff_index.items():
-        if not is_code_path(path):
+        if is_review_excluded_path(path) or not is_code_path(path):
             continue
         for entry in info.get("right_entries", []):
             line_text = str(entry.get("text") or "").lower()
@@ -1589,7 +1637,7 @@ def infer_code_anchor(
 
     if best is None:
         for path, info in diff_index.items():
-            if is_code_path(path) and info.get("first_right_line"):
+            if not is_review_excluded_path(path) and is_code_path(path) and info.get("first_right_line"):
                 return path, int(info["first_right_line"])
         return None, None
     return best[1], best[2]

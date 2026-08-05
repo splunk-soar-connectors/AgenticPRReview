@@ -37,6 +37,9 @@ class AdaptiveETA:
     def add_requests(self, count: int) -> None:
         self.total_requests += max(0, int(count))
 
+    def skip_requests(self, count: int) -> None:
+        self.total_requests = max(len(self.completed_request_seconds), self.total_requests - max(0, int(count)))
+
     @property
     def estimated_request_seconds(self) -> float:
         if not self.completed_request_seconds:

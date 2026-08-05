@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agentic_pr_review.collector import (
@@ -150,6 +151,25 @@ class CollectorHelpersTest(unittest.TestCase):
         self.assertNotIn("Initializing environment", summary)
         self.assertNotIn("ruff-pre-commit", summary)
 
+    def test_summarize_ci_log_keeps_terminal_soar_install_timeout(self):
+        text = "\n".join(
+            [
+                "Building SDKfied app using soarapps CLI",
+                "✓ Package successfully built and saved to: Microsoft 365.tgz",
+                *[f"│ {line} │ │ │ traceback frame noise │" for line in range(100, 140)],
+                "Installing app on current phantom instance (10.1.66.159)",
+                "ConnectTimeout",
+                "SDKfied app installation failed on 10.1.66.159 after 3 attempts",
+                "Error: Process completed with exit code 1.",
+            ]
+        )
+
+        summary = summarize_ci_log(text, max_lines=12)
+
+        self.assertIn("Installing app on current phantom instance (10.1.66.159)", summary)
+        self.assertIn("ConnectTimeout", summary)
+        self.assertIn("SDKfied app installation failed on 10.1.66.159 after 3 attempts", summary)
+
     def test_ci_log_wrapper_line_is_not_actionable(self):
         self.assertFalse(
             is_actionable_ci_line(
@@ -161,6 +181,92 @@ class CollectorHelpersTest(unittest.TestCase):
         self.assertTrue(is_relevant_full_file("templates/get_report.html"))
         self.assertTrue(is_relevant_full_file("default/data/ui/dashboards/ioc_view.xml"))
         self.assertTrue(is_relevant_full_file("templates/result.jinja"))
+
+    def test_collect_excludes_agentic_pr_review_workflow_from_review_context(self):
+        class FakeClient:
+            auth_mode = "fake"
+
+            def __init__(self):
+                self.fetch_paths = []
+
+            def get_pr(self, repo, pr_number):
+                return {
+                    "head": {"sha": "head-sha", "ref": "feature"},
+                    "base": {"sha": "base-sha", "ref": "main"},
+                    "title": "Test PR",
+                    "body": "",
+                    "state": "open",
+                }
+
+            def list_pr_files(self, repo, pr_number):
+                return [
+                    {
+                        "filename": ".github/workflows/agentic-pr-review.yml",
+                        "status": "added",
+                        "patch": "+name: bot\n",
+                        "additions": 1,
+                        "deletions": 0,
+                        "changes": 1,
+                        "raw_url": "https://example.invalid/workflow",
+                    },
+                    {
+                        "filename": "connector.py",
+                        "status": "modified",
+                        "patch": "+def action():\n+    return 1\n",
+                        "additions": 2,
+                        "deletions": 0,
+                        "changes": 2,
+                    },
+                ]
+
+            def list_issue_comments(self, repo, pr_number):
+                return []
+
+            def list_review_comments(self, repo, pr_number):
+                return []
+
+            def list_reviews(self, repo, pr_number):
+                return []
+
+            def get_check_runs(self, repo, head_sha):
+                return {"check_runs": []}
+
+            def get_combined_status(self, repo, head_sha):
+                return {"state": "success", "total_count": 0, "statuses": []}
+
+            def list_root_contents(self, repo, sha):
+                return []
+
+            def fetch_text_file(self, repo, path, sha, max_bytes=None):
+                self.fetch_paths.append(path)
+                if path == "connector.py":
+                    return "def action():\n    return 1\n"
+                return ""
+
+        client = FakeClient()
+        config = SimpleNamespace(max_patch_chars=10_000, max_file_chars=10_000)
+        collector = PRCollector(client, config=config)
+
+        with patch.dict("os.environ", {}, clear=True):
+            review_input = collector.collect("owner/repo", 1)
+
+        changed_paths = {item["filename"] for item in review_input["changed_files"]}
+        self.assertEqual(changed_paths, {"connector.py"})
+        self.assertEqual(
+            [item["filename"] for item in review_input["comment_anchor_files"]],
+            [".github/workflows/agentic-pr-review.yml"],
+        )
+        self.assertNotIn(".github/workflows/agentic-pr-review.yml", review_input["full_files"])
+        self.assertNotIn(".github/workflows/agentic-pr-review.yml", client.fetch_paths)
+        self.assertEqual(
+            review_input["collector_notes"]["excluded_review_files"],
+            [
+                {
+                    "path": ".github/workflows/agentic-pr-review.yml",
+                    "reason": "bot invocation workflow is excluded from review",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

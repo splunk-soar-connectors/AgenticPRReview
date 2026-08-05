@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agentic_pr_review.cli import build_parser, publish_target_pipeline_failure_comments, write_artifacts
+from agentic_pr_review.cli import (
+    build_parser,
+    publish_target_pipeline_failure_comments,
+    refine_low_confidence_pipeline_findings,
+    suppress_redundant_published_pipeline_findings,
+    write_artifacts,
+)
 from agentic_pr_review.secret_redactor import REDACTED_SECRET
 
 
@@ -64,6 +70,30 @@ class CLITest(unittest.TestCase):
         self.assertNotIn("canary-artifact-secret", rendered)
         self.assertEqual(output["summary"], REDACTED_SECRET)
 
+    def test_write_artifacts_writes_model_routing_summary(self):
+        review_input = {"repo": "owner/repo", "pr": {"number": 1}}
+        review_output = {
+            "summary": "ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "deep_review": {
+                "model_routing_summary": {
+                    "original_chunk_count": 3,
+                    "planned_model_chunk_count": 2,
+                    "cached_chunk_count": 1,
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_artifacts(run_dir, review_input, review_output, "comment")
+            routing = json.loads((run_dir / "model_routing_summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(routing["original_chunk_count"], 3)
+        self.assertEqual(routing["cached_chunk_count"], 1)
+
     def test_target_pipeline_failures_publish_before_model_without_label(self):
         class FakeClient:
             def __init__(self):
@@ -120,8 +150,196 @@ class CLITest(unittest.TestCase):
         self.assertEqual(result["posted"], 1)
         self.assertEqual(result["label"]["status"], "skipped_disabled")
         self.assertEqual(len(review_input["comments"]["issue_comments"]), 1)
+        self.assertEqual(review_input["ci"]["published_target_pipeline_jobs"], ["build"])
         self.assertIn("agentic-pr-review:", review_input["comments"]["issue_comments"][0]["body"])
         self.assertTrue(any("before model review" in message for message in progress_messages))
+
+    def test_published_precommit_pipeline_comment_suppresses_final_duplicates(self):
+        review_input = {
+            "ci": {"published_target_pipeline_jobs": ["pre-commit"]},
+        }
+        review_output = {
+            "summary": "Review found issues.",
+            "overall_status": "blocked_by_ci",
+            "safe_to_publish": True,
+            "findings": [
+                {
+                    "id": "precommit-duplicate",
+                    "title": "Pre-commit or connector hook failures need to be resolved",
+                    "category": "precommit",
+                    "confidence": "high",
+                    "evidence": "Detect secrets failed: Secret Keyword in .github/workflows/agentic-pr-review.yml:206",
+                    "suggested_fix": "Remove the secret-like value from the diff.",
+                },
+                {
+                    "id": "model-duplicate",
+                    "title": "Potential secret detected in workflow",
+                    "category": "introduced_bug",
+                    "confidence": "high",
+                    "evidence": "The detect-secrets hook flagged Secret Keyword in the workflow.",
+                    "suggested_fix": "Remove the secret-like value or allowlist a verified false positive.",
+                },
+                {
+                    "id": "real-code-finding",
+                    "title": "Request timeout is missing",
+                    "category": "introduced_bug",
+                    "confidence": "high",
+                    "evidence": "The changed request call has no timeout argument.",
+                    "suggested_fix": "Pass a bounded timeout to the request.",
+                },
+            ],
+        }
+        progress_messages = []
+
+        filtered = suppress_redundant_published_pipeline_findings(
+            review_output,
+            review_input,
+            progress=progress_messages.append,
+        )
+
+        self.assertEqual([finding["id"] for finding in filtered["findings"]], ["real-code-finding"])
+        self.assertEqual(filtered["overall_status"], "blocked_by_ci")
+        self.assertEqual(filtered["behavioral_verification"]["suppressed_duplicate_pipeline_comment_count"], 2)
+        self.assertTrue(any("early target pipeline comment" in message for message in progress_messages))
+
+    def test_published_compile_pipeline_comment_suppresses_ci_synthesis_duplicate(self):
+        review_input = {
+            "ci": {"published_target_pipeline_jobs": ["compile"]},
+        }
+        review_output = {
+            "summary": "Review found issues.",
+            "overall_status": "blocked_by_ci",
+            "safe_to_publish": True,
+            "findings": [
+                {
+                    "id": "compile-wrapper",
+                    "title": "Compile job blocks merge",
+                    "category": "ci_synthesis",
+                    "confidence": "high",
+                    "evidence": "The compile job failed with ConnectTimeout while installing the app.",
+                    "suggested_fix": "Verify SOAR instance network access and rerun compile.",
+                },
+                {
+                    "id": "metadata",
+                    "title": "Output metadata is missing",
+                    "category": "introduced_bug",
+                    "confidence": "high",
+                    "evidence": "The new action returns data without matching metadata.",
+                    "suggested_fix": "Add the missing output datapath.",
+                },
+            ],
+        }
+
+        filtered = suppress_redundant_published_pipeline_findings(
+            review_output,
+            review_input,
+            progress=None,
+        )
+
+        self.assertEqual([finding["id"] for finding in filtered["findings"]], ["metadata"])
+        self.assertIn("compile", filtered["model_notes"])
+
+    def test_high_confidence_pipeline_failure_does_not_call_model_fallback(self):
+        deterministic_findings = [
+            {
+                "title": "compile pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "confidence": "high",
+                "ci_diagnosis_needs_model": False,
+                "root_cause": "`compile` reported `SyntaxError: invalid syntax`",
+            }
+        ]
+
+        def fail_factory():
+            raise AssertionError("model fallback should not be called")
+
+        refined = refine_low_confidence_pipeline_findings(
+            deterministic_findings,
+            reviewer_factory=fail_factory,
+            progress=lambda _message: None,
+        )
+
+        self.assertEqual(refined, deterministic_findings)
+
+    def test_low_confidence_pipeline_failure_uses_model_fallback(self):
+        class FakeReviewer:
+            def diagnose_ci_failure(self, **kwargs):
+                self.kwargs = kwargs
+                return {
+                    "diagnosis_status": "confirmed",
+                    "root_cause": "`compile` failed because the SOAR instance was unreachable",
+                    "failure_scenario": "The compile job timed out connecting to https://10.1.66.159/.",
+                    "suggested_fix": "Verify the SOAR instance IP and runner network access, then rerun compile.",
+                    "evidence_lines": [
+                        "ConnectTimeout",
+                        "SDKfied app installation failed on 10.1.66.159 after 3 attempts",
+                    ],
+                    "confidence": "high",
+                    "confidence_score": 0.94,
+                }
+
+        reviewer = FakeReviewer()
+        deterministic_findings = [
+            {
+                "title": "compile pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "code_reference": "GitHub Actions job compile",
+                "confidence": "low",
+                "confidence_score": 0.4,
+                "ci_diagnosis_needs_model": True,
+                "evidence": "`compile` concluded `failure`. Root cause: `compile` failed on traceback noise.",
+                "root_cause": "`compile` failed on traceback noise",
+                "suggested_fix": "Open the compile job log, fix the first concrete Python/package/metadata error.",
+                "pipeline_failed_steps": ["Compile Application"],
+                "pipeline_log_excerpt": (
+                    "ConnectTimeout\n"
+                    "SDKfied app installation failed on 10.1.66.159 after 3 attempts"
+                ),
+            }
+        ]
+
+        refined = refine_low_confidence_pipeline_findings(
+            deterministic_findings,
+            reviewer_factory=lambda: reviewer,
+            progress=lambda _message: None,
+        )
+
+        self.assertFalse(refined[0]["ci_diagnosis_needs_model"])
+        self.assertEqual(refined[0]["confidence"], "high")
+        self.assertIn("SOAR instance was unreachable", refined[0]["root_cause"])
+        self.assertIn("SDKfied app installation failed", refined[0]["evidence"])
+        self.assertIn("runner network access", refined[0]["suggested_fix"])
+
+    def test_failed_model_fallback_downgrades_only_ambiguous_pipeline_findings(self):
+        deterministic_findings = [
+            {
+                "title": "compile pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "code_reference": "GitHub Actions job compile",
+                "confidence": "low",
+                "confidence_score": 0.4,
+                "ci_diagnosis_needs_model": True,
+                "evidence": "`compile` concluded `failure`.",
+                "root_cause": "`compile` failed on traceback noise",
+                "suggested_fix": "Open the compile job log.",
+            },
+            {
+                "title": "Pre-commit found a secret",
+                "category": "precommit",
+                "confidence": "high",
+                "evidence": "detect-secrets failed",
+            },
+        ]
+
+        refined = refine_low_confidence_pipeline_findings(
+            deterministic_findings,
+            reviewer_factory=lambda: (_ for _ in ()).throw(RuntimeError("missing model env")),
+            progress=lambda _message: None,
+        )
+
+        self.assertIn("did not prove a more specific root cause", refined[0]["root_cause"])
+        self.assertEqual(refined[0]["confidence"], "medium")
+        self.assertEqual(refined[1], deterministic_findings[1])
 
 
 if __name__ == "__main__":

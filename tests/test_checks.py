@@ -283,6 +283,13 @@ class DeterministicChecksTest(unittest.TestCase):
         review_input = {
             "pr": {"title": "test", "body": ""},
             "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": "@@ -205,0 +206,1 @@\n+secret: value\n",
+                }
+            ],
             "full_files": {},
             "comments": {},
             "ci": {
@@ -317,6 +324,8 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertIn("Secret Keyword", pipeline[0]["observable_failure"])
         self.assertIn("secret-like value", pipeline[0]["suggested_fix"])
         self.assertNotIn("ruff", pipeline[0]["suggested_fix"].lower())
+        self.assertEqual(pipeline[0]["file"], ".github/workflows/agentic-pr-review.yml")
+        self.assertEqual(pipeline[0]["line"], 206)
 
     def test_target_compile_failure_extracts_import_error(self):
         review_input = {
@@ -353,6 +362,55 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertIn("ModuleNotFoundError", pipeline[0]["evidence"])
         self.assertIn("missing import", pipeline[0]["suggested_fix"])
         self.assertIn("compile", pipeline[0]["observable_failure"])
+
+    def test_target_compile_failure_extracts_soar_install_timeout(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "compile",
+                        "target_name": "compile",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/100",
+                        "steps": [{"name": "Compile Application", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "✓ Package successfully built and saved to: Microsoft 365.tgz\n"
+                            "SDKfied app build completed successfully\n"
+                            "Checking version compatibility for current phantom instance (10.1.66.159)\n"
+                            "WARNING:root:Version compatibility check failed, defaulting to compatible: "
+                            "HTTPSConnectionPool(host='10.1.66.159', port=443): Max retries exceeded "
+                            "with url: /rest/version (Caused by ConnectTimeoutError(...))\n"
+                            "Installing app on current phantom instance (10.1.66.159)\n"
+                            "Traceback (most recent call last):\n"
+                            "│ 110 │ │ │ OSError: ConnectError, │\n"
+                            "ConnectTimeout\n"
+                            "SDKfied app installation failed on 10.1.66.159 after 3 attempts\n"
+                            "Error: Process completed with exit code 1."
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("could not connect to the SOAR/Phantom instance", pipeline[0]["root_cause"])
+        self.assertIn("10.1.66.159", pipeline[0]["root_cause"])
+        self.assertIn("after 3 attempts", pipeline[0]["root_cause"])
+        self.assertIn("PHANTOM_INSTANCE", pipeline[0]["suggested_fix"])
+        self.assertIn("port 443", pipeline[0]["suggested_fix"])
+        self.assertNotIn("OSError: ConnectError", pipeline[0]["root_cause"])
+        self.assertNotIn("Python/package/metadata", pipeline[0]["suggested_fix"])
+        self.assertIsNone(pipeline[0]["file"])
+        self.assertIsNone(pipeline[0]["line"])
 
     def test_target_build_failure_extracts_lockfile_error(self):
         review_input = {

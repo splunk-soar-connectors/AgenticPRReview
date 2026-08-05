@@ -514,10 +514,14 @@ def compact_review_input_for_model(review_input: dict, *, limits: dict[str, int]
             compacted = dict(review_input)
             compacted["full_files"] = {}
             compacted["base_files"] = {}
+            compacted.pop("comment_anchor_files", None)
             return compacted
-        return review_input
+        compacted = dict(review_input)
+        compacted.pop("comment_anchor_files", None)
+        return compacted
 
     compacted = dict(review_input)
+    compacted.pop("comment_anchor_files", None)
     compacted["changed_files"] = [
         compact_changed_file(item, patch_limit=limits["patch"])
         for item in review_input.get("changed_files", [])

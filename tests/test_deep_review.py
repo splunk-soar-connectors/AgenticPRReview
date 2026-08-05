@@ -10,6 +10,7 @@ from agentic_pr_review.deep_review import (
     dedupe_and_merge_review_chunks,
     generate_unified_diff,
     infer_local_python_import_paths,
+    order_circuit_review_chunks,
     plan_circuit_review_chunks,
     split_chunk_for_adaptive_retry,
 )
@@ -795,6 +796,12 @@ class DeepReviewHelpersTest(unittest.TestCase):
                 "diff": "@@ -1 +1 @@\n-# Copyright 2025\n+# Copyright 2025-2026",
             },
             {
+                "id": "uv.lock:1",
+                "path": "uv.lock",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-old-lock-entry\n+new-lock-entry",
+            },
+            {
                 "id": "connector.py:1",
                 "path": "connector.py",
                 "status": "modified",
@@ -805,8 +812,41 @@ class DeepReviewHelpersTest(unittest.TestCase):
         planned, skipped = plan_circuit_review_chunks(chunks, [])
 
         self.assertEqual([item["path"] for item in planned], ["connector.py"])
-        self.assertEqual({item["path"] for item in skipped}, {"README.md", "LICENSE", "__init__.py"})
+        self.assertEqual({item["path"] for item in skipped}, {"README.md", "LICENSE", "__init__.py", "uv.lock"})
         self.assertEqual(planned[0]["model_review_priority"], "high")
+
+    def test_circuit_planner_orders_high_priority_chunks_first(self):
+        chunks = [
+            {
+                "id": "tests/test_connector.py:1",
+                "path": "tests/test_connector.py",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-assert old\n+assert new",
+            },
+            {
+                "id": "connector.py:1",
+                "path": "connector.py",
+                "status": "modified",
+                "diff": "@@ -1 +1 @@\n-old = token\n+new = token",
+            },
+        ]
+
+        planned, skipped = plan_circuit_review_chunks(chunks, [])
+
+        self.assertEqual(skipped, [])
+        self.assertEqual([item["path"] for item in planned], ["connector.py", "tests/test_connector.py"])
+        self.assertEqual([item["model_review_priority"] for item in planned], ["high", "medium"])
+
+    def test_order_circuit_review_chunks_preserves_order_within_priority(self):
+        chunks = [
+            {"path": "one.py", "model_review_priority": "medium"},
+            {"path": "two.py", "model_review_priority": "medium"},
+            {"path": "three.py", "model_review_priority": "high"},
+        ]
+
+        ordered = order_circuit_review_chunks(chunks)
+
+        self.assertEqual([item["path"] for item in ordered], ["three.py", "one.py", "two.py"])
 
     def test_circuit_planner_keeps_manual_docs_with_deterministic_finding(self):
         chunks = [

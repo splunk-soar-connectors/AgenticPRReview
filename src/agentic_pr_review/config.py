@@ -55,6 +55,7 @@ class RuntimeConfig:
     max_patch_chars: int = DEFAULT_MAX_PATCH_CHARS
     max_file_chars: int = DEFAULT_MAX_FILE_CHARS
     max_model_input_chars: int = DEFAULT_MAX_MODEL_INPUT_CHARS
+    model_cache_dir: str | None = None
 
     @classmethod
     def from_env(
@@ -108,6 +109,7 @@ class RuntimeConfig:
             max_patch_chars=max_patch_chars,
             max_file_chars=max_file_chars,
             max_model_input_chars=max_model_input_chars,
+            model_cache_dir=os.getenv("AGENTIC_PR_REVIEW_MODEL_CACHE_DIR") or None,
         )
 
     def require_model(self) -> None:

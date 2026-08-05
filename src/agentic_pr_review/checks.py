@@ -5659,6 +5659,7 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
         seen.add(target_name)
 
         diagnosis = diagnose_target_pipeline_failure(target_name, failure, conclusion)
+        source_location = pipeline_failure_source_location(diagnosis.get("details") or [], review_input)
         reason = str(diagnosis.get("reason") or "")
         fix = target_pipeline_suggested_fix(target_name, reason, conclusion, diagnosis=diagnosis)
         url = str(failure.get("html_url") or failure.get("details_url") or failure.get("url") or "").strip() or None
@@ -5676,11 +5677,12 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
                 "finding_category": "introduced_bug",
                 "causality": "exposed_by_pr",
                 "severity": "high",
-                "confidence": "high",
+                "confidence": diagnosis.get("confidence", "medium"),
+                "confidence_score": diagnosis.get("confidence_score", 0.7),
                 "merge_blocking": True,
                 "publication_destination": "inline_blocking",
-                "file": None,
-                "line": None,
+                "file": source_location.get("path") if source_location else None,
+                "line": source_location.get("line") if source_location else None,
                 "code_reference": f"GitHub Actions job {target_name}",
                 "evidence": " ".join(part for part in evidence_parts if part),
                 "why_it_matters": (
@@ -5691,9 +5693,95 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
                 "root_cause": diagnosis.get("root_cause"),
                 "suggested_fix": fix,
                 "url": url,
+                "ci_diagnosis_confidence": diagnosis.get("confidence", "medium"),
+                "ci_diagnosis_confidence_score": diagnosis.get("confidence_score", 0.7),
+                "ci_diagnosis_needs_model": diagnosis.get("needs_model_diagnosis", False),
+                "pipeline_failed_steps": diagnosis.get("failed_steps") or [],
+                "pipeline_failure_tool": diagnosis.get("tool"),
+                "pipeline_source_location": source_location or None,
+                "pipeline_log_excerpt": str(failure.get("log_excerpt") or "")[:12000],
             }
         )
     return findings
+
+
+def pipeline_failure_source_location(detail_lines: list[str], review_input: dict[str, Any]) -> dict[str, Any] | None:
+    anchors = pipeline_source_location_anchors(review_input)
+    if not anchors:
+        return None
+
+    for line in detail_lines:
+        for path, line_number in source_locations_in_text(line):
+            info = anchors.get(path)
+            if not info:
+                continue
+            if line_number in info.get("right_lines", set()):
+                return {
+                    "path": path,
+                    "line": line_number,
+                    "source": line,
+                    "target_reason": "CI log reported this changed file line",
+                }
+    return None
+
+
+def pipeline_source_location_anchors(review_input: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    anchors: dict[str, dict[str, Any]] = {}
+    for key in ("changed_files", "comment_anchor_files"):
+        for item in review_input.get(key, []) or []:
+            if not isinstance(item, dict):
+                continue
+            path = normalize_source_location_path(str(item.get("filename") or ""))
+            if not path:
+                continue
+            if str(item.get("status") or "") == "removed":
+                continue
+            right_lines = right_side_diff_lines(str(item.get("patch") or ""))
+            if right_lines:
+                anchors[path] = {"right_lines": right_lines}
+    return anchors
+
+
+def source_locations_in_text(text: str) -> list[tuple[str, int]]:
+    locations = []
+    pattern = re.compile(
+        r"(?P<path>(?:\.?/)?[\w./-]+\.(?:py|json|ya?ml|toml|md|html|jinja|j2|txt))"
+        r":(?P<line>\d+)(?::\d+)?"
+    )
+    for match in pattern.finditer(text):
+        path = normalize_source_location_path(match.group("path"))
+        line = int(match.group("line"))
+        locations.append((path, line))
+    return locations
+
+
+def normalize_source_location_path(path: str) -> str:
+    return path.strip().replace("\\", "/").removeprefix("./")
+
+
+def right_side_diff_lines(patch: str) -> set[int]:
+    lines: set[int] = set()
+    right_line: int | None = None
+    left_line: int | None = None
+    hunk_pattern = re.compile(r"^@@ -(?P<left>\d+)(?:,\d+)? \+(?P<right>\d+)(?:,\d+)? @@")
+    for raw_line in patch.splitlines():
+        hunk_match = hunk_pattern.match(raw_line)
+        if hunk_match:
+            left_line = int(hunk_match.group("left"))
+            right_line = int(hunk_match.group("right"))
+            continue
+        if right_line is None or left_line is None:
+            continue
+        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            lines.add(right_line)
+            right_line += 1
+        elif raw_line.startswith("-") and not raw_line.startswith("---"):
+            left_line += 1
+        elif raw_line.startswith(" "):
+            lines.add(right_line)
+            left_line += 1
+            right_line += 1
+    return lines
 
 
 def target_pipeline_failures_from_check_runs(ci: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5741,6 +5829,13 @@ def diagnose_target_pipeline_failure(job_name: str, job: dict[str, Any], conclus
     tool = detect_pipeline_failure_tool(job_name, lines, failed_steps)
     detail_lines = pipeline_failure_detail_lines(job_name, lines, tool)
     root_cause = pipeline_failure_root_cause(job_name, tool, detail_lines)
+    confidence, confidence_score = pipeline_failure_diagnosis_confidence(
+        job_name,
+        tool,
+        root_cause,
+        detail_lines,
+        conclusion,
+    )
 
     parts: list[str] = []
     if failed_steps:
@@ -5757,9 +5852,72 @@ def diagnose_target_pipeline_failure(job_name: str, job: dict[str, Any], conclus
         "tool": tool,
         "details": detail_lines,
         "root_cause": root_cause,
+        "confidence": confidence,
+        "confidence_score": confidence_score,
+        "needs_model_diagnosis": confidence != "high",
         "reason": " ".join(parts).strip(),
         "failure_scenario": pipeline_failure_scenario(job_name, tool, root_cause, detail_lines, conclusion),
     }
+
+
+def pipeline_failure_diagnosis_confidence(
+    job_name: str,
+    tool: str,
+    root_cause: str,
+    detail_lines: list[str],
+    conclusion: str,
+) -> tuple[str, float]:
+    if conclusion in {"timed_out", "cancelled", "action_required"}:
+        return "high", 0.95
+    if not root_cause:
+        return "low", 0.35
+
+    root_lower = root_cause.lower()
+    detail_text = "\n".join(detail_lines).lower()
+    if any(
+        term in root_lower
+        for term in (
+            "could not connect to the soar/phantom instance",
+            "potential secret",
+            "secret keyword",
+            "syntaxerror",
+            "modulenotfounderror",
+            "importerror",
+            "no module named",
+            "uv.lock",
+            "release_notes/unreleased.md",
+            "invalid json/yaml",
+        )
+    ):
+        return "high", 0.95
+    if tool in {"detect-secrets", "ruff-format", "check-json", "check-yaml"}:
+        return "high", 0.93
+    if tool == "ruff" and re.search(r"\b[FEW]\d{3}\b", detail_text):
+        return "high", 0.92
+    if tool in {"semgrep", "semantic-release", "soar-app-linter", "static-tests"} and any(
+        term in detail_text
+        for term in (
+            "error:",
+            "assertionerror",
+            "release_notes",
+            "semantic-release",
+            "min platform",
+            "action name",
+            "license",
+            "playbook",
+        )
+    ):
+        return "high", 0.88
+    if job_name in {"compile", "build"} and any(
+        term in root_lower
+        for term in ("failed on `error:", "failed on `manifest", "failed on `soarapps", "failed on `package build")
+    ):
+        return "medium", 0.68
+    if any(term in root_lower for term in ("traceback", "process completed with exit code", "oserror", "connecterror")):
+        return "low", 0.4
+    if len(detail_lines) <= 1:
+        return "medium", 0.65
+    return "medium", 0.72
 
 
 def failed_pipeline_steps(job: dict[str, Any]) -> list[str]:
@@ -5779,11 +5937,48 @@ def failed_pipeline_steps(job: dict[str, Any]) -> list[str]:
 def normalized_pipeline_log_lines(text: str) -> list[str]:
     lines = []
     for raw_line in text.splitlines():
-        line = strip_ci_timestamp(strip_ansi(raw_line)).strip()
-        if not line or is_ci_boilerplate_line(line):
+        line = normalize_pipeline_log_line(strip_ci_timestamp(strip_ansi(raw_line)).strip())
+        if not line or is_ci_boilerplate_line(line) or is_traceback_frame_noise_line(line):
             continue
         lines.append(line)
     return lines
+
+
+def normalize_pipeline_log_line(line: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith(("╭", "╰")):
+        return ""
+    if stripped.startswith("│") and stripped.endswith("│"):
+        inner = stripped.strip("│ ").strip()
+        if inner and "│" not in inner:
+            return inner
+    return stripped
+
+
+def is_traceback_frame_noise_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if re.match(r"^[│┃]\s*\d+\s*[│┃]", stripped):
+        return True
+    if stripped.startswith(("╭", "╰")):
+        return True
+    if stripped.startswith(("│", "┃")) and any(
+        term in stripped.lower()
+        for term in (
+            " locals ",
+            " request =",
+            " self =",
+            " timeout =",
+            " traceback =",
+            " context =",
+            " object at ",
+            "<request",
+            "<class",
+        )
+    ):
+        return True
+    return False
 
 
 def strip_ansi(text: str) -> str:
@@ -5862,6 +6057,9 @@ def pipeline_failure_detail_lines(job_name: str, lines: list[str], tool: str) ->
     else:
         section = lines
 
+    for line in priority_pipeline_detail_lines(job_name, section, tool):
+        detail_lines.append(line)
+
     for line in section:
         if is_pipeline_detail_line(job_name, line, tool):
             detail_lines.append(line)
@@ -5879,6 +6077,32 @@ def pipeline_failure_detail_lines(job_name: str, lines: list[str], tool: str) ->
         output.append(compact[:500])
         if len(output) >= 10:
             break
+    return output
+
+
+def priority_pipeline_detail_lines(job_name: str, lines: list[str], tool: str) -> list[str]:
+    if job_name not in {"compile", "build"} and tool not in {"soarapps", "compile", "build"}:
+        return []
+    output: list[str] = []
+    for line in lines:
+        lowered = line.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "installing app on",
+                "sdkfied app installation failed",
+                "app installation failed",
+                "version compatibility check failed",
+                "max retries exceeded",
+                "connecttimeout",
+                "connecttimeouterror",
+                "connection to ",
+                "timed out",
+                "connection refused",
+                "network is unreachable",
+            )
+        ):
+            output.append(line)
     return output
 
 
@@ -5910,6 +6134,8 @@ def precommit_hook_section(lines: list[str], start: int) -> list[str]:
 
 
 def is_pipeline_detail_line(job_name: str, line: str, tool: str) -> bool:
+    if is_traceback_frame_noise_line(line):
+        return False
     lowered = line.lower()
     if is_passing_ci_result_line(line):
         return False
@@ -5917,21 +6143,47 @@ def is_pipeline_detail_line(job_name: str, line: str, tool: str) -> bool:
         return True
     if any(term in lowered for term in ("hook id:", "exit code:", "error:", "fatal:", "traceback", "assertionerror")):
         return True
-    if any(term in lowered for term in ("syntaxerror", "importerror", "modulenotfounderror", "no module named")):
+    if any(
+        term in lowered
+        for term in ("syntaxerror", "importerror", "modulenotfounderror", "no module named")
+    ):
         return True
-    if any(term in lowered for term in ("secret type:", "location:", "potential secrets", "would reformat", "files were modified")):
+    if any(
+        term in lowered
+        for term in ("secret type:", "location:", "potential secrets", "would reformat", "files were modified")
+    ):
         return True
     if re.search(r"\b[FEW]\d{3}\b", line):
         return True
     if re.search(r"\b[\w./-]+\.(?:py|json|ya?ml|toml|md|html|jinja):\d+(?::\d+)?", line):
         return True
     if tool in {"semantic-release", "semantic-release-preview"} and any(
-        term in lowered for term in ("semantic-release", "release_notes", "unreleased.md", "conventional", "branch", "tag")
+        term in lowered
+        for term in ("semantic-release", "release_notes", "unreleased.md", "conventional", "branch", "tag")
     ):
         return True
     if job_name in {"compile", "build"} and any(
         term in lowered
         for term in ("soarapps", "manifest", "package build", ".tgz", "dependency", "uv.lock", "requirements", "wheel")
+    ):
+        return True
+    if job_name in {"compile", "build"} and any(
+        term in lowered
+        for term in (
+            "phantom instance",
+            "soar instance",
+            "installing app on",
+            "sdkfied app installation failed",
+            "app installation failed",
+            "version compatibility check failed",
+            "max retries exceeded",
+            "connecttimeout",
+            "connecttimeouterror",
+            "connection to ",
+            "timed out",
+            "connection refused",
+            "network is unreachable",
+        )
     ):
         return True
     if tool in {"soar-app-linter", "static-tests"} and any(
@@ -5992,15 +6244,27 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
             return f"`{tool}` reported `{line}`"
         return f"`{tool}` reported generated-file or formatting drift"
     if tool in {"soar-app-linter", "static-tests"}:
-        line = first_line_matching(detail_lines, r"assertionerror|error:|min platform|action name|additional logging|verbosity|license|playbook")
+        line = first_line_matching(
+            detail_lines,
+            r"assertionerror|error:|min platform|action name|additional logging|verbosity|license|playbook",
+        )
         if line:
             return f"`{tool}` reported `{line}`"
         return f"`{tool}` reported a connector metadata/static-test failure"
     if job_name == "compile":
-        line = first_line_matching(detail_lines, r"syntaxerror|modulenotfounderror|importerror|no module named|error:|manifest|soarapps")
+        network_root_cause = pipeline_install_network_root_cause("compile", detail_text)
+        if network_root_cause:
+            return network_root_cause
+        line = first_line_matching(
+            detail_lines,
+            r"syntaxerror|modulenotfounderror|importerror|no module named|error:|manifest|soarapps",
+        )
         if line:
             return f"`compile` failed on `{line}`"
     if job_name == "build":
+        network_root_cause = pipeline_install_network_root_cause("build", detail_text)
+        if network_root_cause:
+            return network_root_cause
         line = first_line_matching(detail_lines, r"error:|package build|soarapps|dependency|uv.lock|requirements|wheel")
         if line:
             return f"`build` failed on `{line}`"
@@ -6009,6 +6273,52 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         if line:
             return f"`semantic-release-preview` failed on `{line}`"
     return ""
+
+
+def pipeline_install_network_root_cause(job_name: str, detail_text: str) -> str:
+    lowered = detail_text.lower()
+    if not any(
+        phrase in lowered
+        for phrase in (
+            "connecttimeout",
+            "connecttimeouterror",
+            "max retries exceeded",
+            "connection to ",
+            "timed out",
+            "connection refused",
+            "network is unreachable",
+        )
+    ):
+        return ""
+    if not any(
+        phrase in lowered
+        for phrase in (
+            "installing app",
+            "app installation failed",
+            "phantom instance",
+            "soar instance",
+            "version compatibility check failed",
+            "/rest/version",
+        )
+    ):
+        return ""
+
+    host = first_regex_group(
+        detail_text,
+        r"(?:host=|host='|phantom instance \(|SOAR instance \(|Installing app on [^(]*\()([A-Za-z0-9_.:-]+)",
+    )
+    if not host:
+        host = first_regex_group(detail_text, r"https?://([A-Za-z0-9_.:-]+)")
+    if not host:
+        host = first_regex_group(detail_text, r"Connection to ([A-Za-z0-9_.:-]+) timed out")
+    attempts = first_regex_group(detail_text, r"after\s+(\d+)\s+attempts")
+
+    target = f" at `{host}`" if host else ""
+    attempt_text = f" after {attempts} attempts" if attempts else ""
+    return (
+        f"`{job_name}` built the app package but could not connect to the SOAR/Phantom instance{target} "
+        f"during app installation{attempt_text}"
+    )
 
 
 def first_regex_group(text: str, pattern: str) -> str:
@@ -6071,14 +6381,33 @@ def target_pipeline_suggested_fix(
             return precommit_tool_suggested_fix(tool, reason)
         return precommit_suggested_fix(reason)
     if job_name == "compile":
+        if is_pipeline_network_reason(lowered):
+            return (
+                "Check that the configured SOAR/Phantom instance IP is reachable from the CI runner on port 443, "
+                "verify the PHANTOM_INSTANCE_* workflow variable points at a live instance, then rerun the compile job."
+            )
         if any(term in lowered for term in ("syntaxerror", "py_compile", "compileerror", "could not compile")):
             return "Fix the Python syntax at the reported file/line and rerun the compile job."
         if any(term in lowered for term in ("importerror", "modulenotfounderror", "no module named")):
-            return "Fix the missing import or packaging dependency named in the compile log, then rerun the compile job."
+            return (
+                "Fix the missing import or packaging dependency named in the compile log, "
+                "then rerun the compile job."
+            )
         if "soarapps" in lowered or "manifest" in lowered:
-            return "Fix the SDK app metadata or import-time error reported by the compile/manifest step, then rerun compile."
-        return "Open the compile job log, fix the first concrete Python/package/metadata error shown there, and rerun compile."
+            return (
+                "Fix the SDK app metadata or import-time error reported by the compile/manifest step, "
+                "then rerun compile."
+            )
+        return (
+            "Open the compile job log, fix the first concrete Python/package/metadata error shown there, "
+            "and rerun compile."
+        )
     if job_name == "build":
+        if is_pipeline_network_reason(lowered):
+            return (
+                "Check that the configured SOAR/Phantom instance IP is reachable from the CI runner on port 443, "
+                "verify the PHANTOM_INSTANCE_* workflow variable points at a live instance, then rerun the build job."
+            )
         if any(term in lowered for term in ("dependency", "dependencies", "wheel", "uv.lock", "requirements")):
             return "Fix the dependency or lockfile issue named by the build log, then rerun the build job."
         if any(term in lowered for term in ("soarapps package build", "package build", ".tgz", "tar")):
@@ -6086,13 +6415,38 @@ def target_pipeline_suggested_fix(
         return "Open the build job log, fix the first concrete packaging/build error shown there, and rerun build."
     if job_name == "semantic-release-preview":
         if any(term in lowered for term in ("release note", "release_notes", "unreleased.md")):
-            return "Fix the release_notes/unreleased.md entry or generated release-note content, then rerun semantic-release-preview."
+            return (
+                "Fix the release_notes/unreleased.md entry or generated release-note content, "
+                "then rerun semantic-release-preview."
+            )
         if any(term in lowered for term in ("conventional commit", "semantic-release", "tag format", "branch")):
-            return "Fix the release metadata, branch/tag configuration, or commit message issue named in the semantic-release log."
+            return (
+                "Fix the release metadata, branch/tag configuration, or commit message issue named "
+                "in the semantic-release log."
+            )
         if any(term in lowered for term in ("npm", "node", "module not found", "enoent")):
             return "Fix the Node/npm setup or semantic-release dependency error shown in the job log, then rerun the preview."
-        return "Open the semantic-release-preview log, fix the first release metadata or semantic-release configuration error, and rerun the job."
+        return (
+            "Open the semantic-release-preview log, fix the first release metadata or semantic-release "
+            "configuration error, and rerun the job."
+        )
     return "Open the failed job log linked above, fix the first concrete error shown there, and rerun the workflow."
+
+
+def is_pipeline_network_reason(text: str) -> bool:
+    return any(
+        term in text
+        for term in (
+            "could not connect to the soar/phantom instance",
+            "connecttimeout",
+            "connecttimeouterror",
+            "max retries exceeded",
+            "connection to ",
+            "timed out",
+            "connection refused",
+            "network is unreachable",
+        )
+    )
 
 
 def precommit_tool_suggested_fix(tool: str, evidence: str) -> str:

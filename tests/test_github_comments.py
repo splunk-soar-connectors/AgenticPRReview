@@ -333,6 +333,130 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(len(filtered["findings"]), 1)
         self.assertEqual(len(plan["comments"]), 1)
 
+    def test_agentic_pr_review_workflow_finding_is_filtered(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": "@@ -1,1 +1,2 @@\n name: bot\n+permissions: {}\n",
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "needs_review",
+            "findings": [
+                {
+                    "id": "workflow-finding",
+                    "title": "Workflow permission is too broad",
+                    "category": "security_issue",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": ".github/workflows/agentic-pr-review.yml",
+                    "line": 2,
+                    "evidence": "The workflow changes a permission setting.",
+                    "why_it_matters": "The bot workflow is excluded from review.",
+                    "suggested_fix": "Do not publish a review comment on this file.",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual(filtered["behavioral_verification"]["suppressed_findings"][0]["reason"], "review_excluded_path")
+        self.assertEqual(plan["comments"], [])
+
+    def test_pipeline_failure_can_comment_inline_on_excluded_workflow_anchor(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": "@@ -205,0 +206,1 @@\n+secret: value\n",
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "blocked_by_ci",
+            "findings": [
+                {
+                    "id": "pipeline-finding",
+                    "title": "pre-commit pipeline job failed",
+                    "category": "ci_pipeline_failure",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": ".github/workflows/agentic-pr-review.yml",
+                    "line": 206,
+                    "code_reference": "GitHub Actions job pre-commit",
+                    "evidence": (
+                        "`pre-commit` concluded `failure`. Detect secrets failed: "
+                        ".github/workflows/agentic-pr-review.yml:206"
+                    ),
+                    "why_it_matters": "The failed required job blocks the PR.",
+                    "suggested_fix": "Remove the secret-like value or allowlist a verified false positive.",
+                    "url": "https://github.example/owner/repo/actions/runs/1/job/2",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(len(filtered["findings"]), 1)
+        self.assertEqual(len(plan["comments"]), 1)
+        self.assertEqual(plan["comments"][0]["github_comment_type"], "line")
+        self.assertEqual(plan["comments"][0]["path"], ".github/workflows/agentic-pr-review.yml")
+        self.assertEqual(plan["comments"][0]["line"], 206)
+
+    def test_pipeline_timeout_without_file_line_stays_conversation_comment(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "src/app.py",
+                    "status": "modified",
+                    "patch": "@@ -10,0 +11,1 @@\n+return result\n",
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "blocked_by_ci",
+            "findings": [
+                {
+                    "id": "pipeline-timeout",
+                    "title": "compile pipeline job failed",
+                    "category": "ci_pipeline_failure",
+                    "severity": "high",
+                    "confidence": "high",
+                    "file": None,
+                    "line": None,
+                    "code_reference": "GitHub Actions job compile",
+                    "evidence": (
+                        "`compile` concluded `failure`. Root cause: `compile` built the app package "
+                        "but could not connect to the SOAR/Phantom instance at `10.1.66.159`."
+                    ),
+                    "why_it_matters": "The failed required job blocks the PR.",
+                    "suggested_fix": "Check that the configured SOAR/Phantom instance IP is reachable on port 443.",
+                    "url": "https://github.example/owner/repo/actions/runs/1/job/2",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(len(plan["comments"]), 1)
+        self.assertEqual(plan["comments"][0]["github_comment_type"], "conversation")
+        self.assertIsNone(plan["comments"][0]["path"])
+
     def test_low_signal_docstring_line_reanchors_to_named_changed_code(self):
         review_input = {
             "repo": "owner/repo",

@@ -13,6 +13,7 @@ from .config import RuntimeConfig
 from .github_client import GitHubClient, GitHubError
 from .historical_context import filter_historical_context_for_path
 from .json_utils import truncate_text
+from .review_exclusions import REVIEW_EXCLUDED_PATHS, is_review_excluded_path, review_exclusion_reason
 
 
 DEEP_CONTEXT_FILES = {
@@ -48,9 +49,7 @@ ADAPTIVE_SEMANTIC_HARD_DIFF_CHARS = 12_000
 PYTHON_RELATED_CONTEXT_FILE_LIMIT = 20
 CONTEXT_AWARE_REVIEW_STRATEGY = "changed_hunks_enclosing_scope_semantic_context"
 
-AI_REVIEW_EXCLUDED_PATHS = {
-    ".github/workflows/agentic-pr-review.yml",
-}
+AI_REVIEW_EXCLUDED_PATHS = REVIEW_EXCLUDED_PATHS
 
 IGNORED_EXTERNAL_PYTHON_MODULES = {
     "abc",
@@ -95,6 +94,7 @@ LOW_SIGNAL_MODEL_FILENAMES = {
     "license",
     "notice",
     "readme.md",
+    "uv.lock",
 }
 
 RISKY_MODEL_TERMS = {
@@ -229,6 +229,14 @@ class DeepPRCollector(PRCollector):
             path = str(file_info.get("filename") or "")
             status = str(file_info.get("status") or "")
             previous_path = str(file_info.get("previous_filename") or path)
+            if is_ai_review_excluded_path(path):
+                model_excluded_paths.append(
+                    {
+                        "path": path,
+                        "reason": review_exclusion_reason(path),
+                    }
+                )
+                continue
             if not path or not is_probably_text(path):
                 if path:
                     skipped_binary.append(path)
@@ -261,14 +269,6 @@ class DeepPRCollector(PRCollector):
                 head_text=head_text or "",
                 base_text=base_text or "",
             )
-            if is_ai_review_excluded_path(path):
-                model_excluded_paths.append(
-                    {
-                        "path": path,
-                        "reason": "bot invocation workflow is excluded from AI review packets",
-                    }
-                )
-                continue
             chunks.extend(file_chunks)
 
         related_paths = sorted(collect_related_python_context_paths(head_files) - set(head_files))
@@ -389,7 +389,7 @@ def generate_unified_diff(base_text: str, head_text: str, *, base_path: str, hea
 
 
 def is_ai_review_excluded_path(path: str) -> bool:
-    return path in AI_REVIEW_EXCLUDED_PATHS
+    return is_review_excluded_path(path)
 
 
 def dedupe_and_merge_review_chunks(
@@ -1977,7 +1977,21 @@ def plan_circuit_review_chunks(
             )
             continue
         planned.append(annotated)
-    return planned, skipped
+    return order_circuit_review_chunks(planned), skipped
+
+
+def order_circuit_review_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    return [
+        chunk
+        for _index, chunk in sorted(
+            enumerate(chunks),
+            key=lambda item: (
+                priority_rank.get(str(item[1].get("model_review_priority") or "medium"), 1),
+                item[0],
+            ),
+        )
+    ]
 
 
 def classify_chunk_for_circuit(

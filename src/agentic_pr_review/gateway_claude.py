@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -24,6 +25,7 @@ from .deep_review import (
     CONTEXT_AWARE_REVIEW_STRATEGY,
     dedupe_findings,
     filter_findings_for_chunk,
+    order_circuit_review_chunks,
     plan_circuit_review_chunks,
     REVIEW_POLICY_VERSION,
     split_chunk_for_adaptive_retry,
@@ -47,6 +49,15 @@ PROACTIVE_SUBCHUNK_DIFF_CHARS = 6_000
 PROACTIVE_SUBCHUNK_CONTEXT_CHARS = 6_000
 PROACTIVE_SUBCHUNK_DETERMINISTIC_FINDINGS = 8
 PROACTIVE_SUBCHUNK_ESTIMATED_SECONDS = 90
+PACKET_CACHE_VOLATILE_KEYS = {
+    "chunk_id",
+    "parent_chunk_id",
+    "chunk_index",
+    "chunk_total",
+    "merged_chunk_ids",
+    "source_chunk_ids",
+    "estimated_prompt_chars",
+}
 
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -176,6 +187,12 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "required": ["summary", "overall_status", "safe_to_publish", "findings", "model_notes"],
 }
 
+CI_DIAGNOSIS_SYSTEM_PROMPT = (
+    "You diagnose GitHub Actions CI job failures from redacted log excerpts. "
+    "Return JSON only. Do not guess. Use only evidence present in the supplied log lines. "
+    "Prefer terminal failure summaries and concrete tool errors over traceback frame internals."
+)
+
 
 class GatewayReviewError(RuntimeError):
     pass
@@ -218,12 +235,21 @@ class GatewayClaudeReviewer:
         self._model_metrics: dict[str, Any] = {
             "model_http_attempts": 0,
             "successful_model_calls": 0,
+            "packet_cache_hits": 0,
+            "packet_cache_misses": 0,
+            "packet_cache_writes": 0,
+            "packet_cache_errors": 0,
             "transient_retries": 0,
             "non_json_responses": 0,
             "json_repair_model_calls": 0,
             "strict_json_retry_calls": 0,
             "new_chat_retries": 0,
         }
+        self._packet_cache = (
+            DeepReviewPacketCache(Path(config.model_cache_dir), progress=self.progress)
+            if config.model_cache_dir
+            else None
+        )
 
     def review(self, review_input: dict[str, Any], deterministic_findings: list[dict[str, Any]]) -> dict[str, Any]:
         if self.eta is None:
@@ -235,6 +261,47 @@ class GatewayClaudeReviewer:
             max_chars=self.config.max_model_input_chars,
         )
         return self._invoke_review(user_prompt, deterministic_findings)
+
+    def diagnose_ci_failure(
+        self,
+        *,
+        job_name: str,
+        failed_steps: list[str],
+        conclusion: str,
+        deterministic_root_cause: str,
+        deterministic_fix: str,
+        log_excerpt: str,
+    ) -> dict[str, Any]:
+        prompt = build_ci_diagnosis_prompt(
+            job_name=job_name,
+            failed_steps=failed_steps,
+            conclusion=conclusion,
+            deterministic_root_cause=deterministic_root_cause,
+            deterministic_fix=deterministic_fix,
+            log_excerpt=log_excerpt,
+        )
+        body = self._ci_diagnosis_model_body(prompt)
+        self.progress(f"Low-confidence {job_name} pipeline diagnosis detected; asking gateway for log diagnosis.")
+        try:
+            response_payload = self._post_model_json(body)
+            self._increment_model_metric("successful_model_calls")
+            text = extract_chat_completion_text(response_payload)
+            try:
+                raw_output = extract_json_object(text)
+            except Exception:
+                self._increment_model_metric("non_json_responses")
+                self._increment_model_metric("strict_json_retry_calls")
+                retry_payload = self._post_model_json(self._ci_diagnosis_model_body(build_ci_diagnosis_retry_prompt(prompt)))
+                self._increment_model_metric("successful_model_calls")
+                raw_output = extract_json_object(extract_chat_completion_text(retry_payload))
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise GatewayTransientModelError(
+                f"Gateway CI diagnosis failed: {redact_text(format_http_error(exc))}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - keep CI fallback best-effort
+            raise GatewayModelFormatError(f"Gateway CI diagnosis returned unusable output: {redact_text(str(exc))}") from exc
+
+        return normalize_ci_diagnosis(raw_output, log_excerpt=log_excerpt)
 
     def review_deep(
         self,
@@ -254,6 +321,7 @@ class GatewayClaudeReviewer:
 
         original_chunk_count = len(chunks)
         chunks, skipped_model_chunks = plan_circuit_review_chunks(chunks, deterministic_findings)
+        chunks = order_circuit_review_chunks(chunks)
         deep_review_meta = review_input.setdefault("deep_review", {})
         deep_review_meta["model_packet_strategy"] = CONTEXT_AWARE_REVIEW_STRATEGY
         deep_review_meta["model_skipped_chunk_count"] = len(skipped_model_chunks)
@@ -282,6 +350,8 @@ class GatewayClaudeReviewer:
                 f"Circuit packet planner skipped {len(skipped_model_chunks)} low-signal chunk(s); "
                 f"{len(chunks)} chunk(s) remain for model review."
             )
+        if self._packet_cache is not None:
+            self.progress(f"Deep-review packet cache enabled at {self._packet_cache.path}.")
         if not chunks:
             self.progress("No high-signal deep-review chunks remain; completing with deterministic checks only.")
             output = deterministic_only_output(deterministic_findings)
@@ -319,9 +389,10 @@ class GatewayClaudeReviewer:
         remaining_chunks = [chunk for chunk in chunks if str(chunk.get("id") or "") not in restored_outputs]
         self.eta = AdaptiveETA(total_requests=len(remaining_chunks) + 1)
         selected_concurrency = normalize_deep_concurrency(deep_concurrency, total_chunks, chunks)
+        restored_packet_count = sum(1 for chunk in chunks if str(chunk.get("id") or "") in restored_outputs)
         self.progress(
             f"Deep model review started: {total_chunks} chunk(s) plus synthesis "
-            f"({len(restored_outputs)} restored, {len(remaining_chunks)} pending); "
+            f"({restored_packet_count} restored, {len(remaining_chunks)} pending); "
             f"concurrency {selected_concurrency}; "
             f"estimated whole-review time remaining: {self._eta_text()}."
         )
@@ -389,8 +460,17 @@ class GatewayClaudeReviewer:
             "chunk_count": original_chunk_count,
             "reviewed_chunk_count": len(chunk_outputs),
             "model_skipped_chunk_count": len(skipped_model_chunks),
+            "model_cached_chunk_count": sum(1 for output in chunk_outputs if output.get("cache_hit")),
+            "model_uncached_chunk_count": sum(1 for output in chunk_outputs if not output.get("cache_hit")),
             "max_chunks": max_chunks,
             "model_packet_strategy": CONTEXT_AWARE_REVIEW_STRATEGY,
+            "model_packet_cache_enabled": self._packet_cache is not None,
+            "model_routing_summary": build_model_routing_summary(
+                original_chunk_count=original_chunk_count,
+                planned_chunks=chunks,
+                skipped_chunks=skipped_model_chunks,
+                chunk_outputs=chunk_outputs,
+            ),
             "model_metrics": self._model_metrics_snapshot(),
         }
         final_output["chunk_review_outputs"] = chunk_outputs
@@ -489,6 +569,29 @@ class GatewayClaudeReviewer:
             chunk_deterministic,
             max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS if chunk.get("adaptive_retry") else CHUNK_MODEL_INPUT_CHARS,
         )
+        cache_key = self._packet_cache_key(
+            chunk=chunk,
+            chunk_input=chunk_input,
+            deterministic_findings=chunk_deterministic,
+            prompt_max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS if chunk.get("adaptive_retry") else CHUNK_MODEL_INPUT_CHARS,
+        )
+        cached_output = self._load_packet_cache(cache_key, path=path)
+        if cached_output is not None:
+            output = dict(cached_output)
+            output["chunk_id"] = chunk.get("id")
+            output["chunk_path"] = chunk.get("path")
+            output["chunk_index"] = chunk.get("chunk_index")
+            output["chunk_total"] = chunk.get("chunk_total")
+            output["cache_hit"] = True
+            output["cache_key"] = cache_key
+            chunk_elapsed = format_duration(time.monotonic() - chunk_started)
+            finding_count = len(output.get("findings") or [])
+            self._skip_eta_requests(1)
+            self.progress(
+                f"Deep-review chunk {position}/{total_chunks} restored from packet cache in {chunk_elapsed} "
+                f"with {finding_count} finding(s); estimated whole-review time remaining: {self._eta_text()}."
+            )
+            return output
         estimated_request_seconds = self._estimated_request_seconds_for_prompt(len(chunk_prompt))
         can_split_for_adaptive_retry = can_adaptively_split_chunk(
             chunk,
@@ -518,6 +621,10 @@ class GatewayClaudeReviewer:
             output["chunk_path"] = chunk.get("path")
             output["chunk_index"] = chunk.get("chunk_index")
             output["chunk_total"] = chunk.get("chunk_total")
+            output["cache_hit"] = False
+            output["cache_key"] = cache_key
+            if output.pop("_packet_cacheable", True):
+                self._save_packet_cache(cache_key, output)
             chunk_elapsed = format_duration(time.monotonic() - chunk_started)
             finding_count = len(output.get("findings") or [])
             self.progress(
@@ -525,6 +632,7 @@ class GatewayClaudeReviewer:
                 f"with {finding_count} finding(s); estimated whole-review time remaining: {self._eta_text()}."
             )
             return output
+        cacheable_output = True
         try:
             output = self._invoke_review(
                 chunk_prompt,
@@ -549,6 +657,7 @@ class GatewayClaudeReviewer:
                     "meaningful adaptive subchunks; retaining deterministic findings for this packet."
                 )
                 output = fallback_chunk_transient_output(chunk, chunk_deterministic, exc)
+                cacheable_output = False
         except GatewayModelFormatError as exc:
             if can_adaptively_split_chunk(chunk, max_chars=18_000):
                 output = self._review_chunk_as_adaptive_subchunks(
@@ -567,11 +676,16 @@ class GatewayClaudeReviewer:
                     "recovery and could not be split; retaining deterministic findings for this packet."
                 )
                 output = fallback_chunk_format_output(chunk, chunk_deterministic, exc)
+                cacheable_output = False
         output = dict(output)
         output["chunk_id"] = chunk.get("id")
         output["chunk_path"] = chunk.get("path")
         output["chunk_index"] = chunk.get("chunk_index")
         output["chunk_total"] = chunk.get("chunk_total")
+        output["cache_hit"] = False
+        output["cache_key"] = cache_key
+        if cacheable_output and output.pop("_packet_cacheable", True):
+            self._save_packet_cache(cache_key, output)
         chunk_elapsed = format_duration(time.monotonic() - chunk_started)
         finding_count = len(output.get("findings") or [])
         self.progress(
@@ -644,25 +758,45 @@ class GatewayClaudeReviewer:
                 sub_deterministic,
                 max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS,
             )
-            try:
-                sub_output = self._invoke_review(sub_prompt, sub_deterministic, request_max_attempts=1)
-            except GatewayTransientModelError as exc:
-                self.progress(
-                    f"Adaptive subchunk {sub_position}/{len(subchunks)} for {path} still hit a transient "
-                    "gateway failure; retaining deterministic findings for this slice."
-                )
-                sub_output = fallback_chunk_transient_output(subchunk, sub_deterministic, exc)
+            sub_cache_key = self._packet_cache_key(
+                chunk=subchunk,
+                chunk_input=sub_input,
+                deterministic_findings=sub_deterministic,
+                prompt_max_chars=ADAPTIVE_SUBCHUNK_MODEL_INPUT_CHARS,
+            )
+            cached_sub_output = self._load_packet_cache(sub_cache_key, path=path)
+            if cached_sub_output is not None:
+                sub_output = dict(cached_sub_output)
+                self._skip_eta_requests(1)
+                sub_cacheable = True
+            else:
+                sub_cacheable = True
+                try:
+                    sub_output = self._invoke_review(sub_prompt, sub_deterministic, request_max_attempts=1)
+                except GatewayTransientModelError as exc:
+                    self.progress(
+                        f"Adaptive subchunk {sub_position}/{len(subchunks)} for {path} still hit a transient "
+                        "gateway failure; retaining deterministic findings for this slice."
+                    )
+                    sub_output = fallback_chunk_transient_output(subchunk, sub_deterministic, exc)
+                    sub_cacheable = False
             sub_output = dict(sub_output)
             sub_output["chunk_id"] = subchunk.get("id")
             sub_output["parent_chunk_id"] = subchunk.get("parent_chunk_id")
             sub_output["chunk_path"] = subchunk.get("path")
             sub_output["chunk_index"] = subchunk.get("chunk_index")
             sub_output["chunk_total"] = subchunk.get("chunk_total")
+            sub_output["cache_hit"] = cached_sub_output is not None
+            sub_output["cache_key"] = sub_cache_key
+            sub_output["_packet_cacheable"] = sub_cacheable
             sub_outputs.append(sub_output)
+            if cached_sub_output is None and sub_cacheable:
+                self._save_packet_cache(sub_cache_key, sub_output)
             if on_subchunk_output is not None:
                 on_subchunk_output(sub_output)
+            cache_note = " restored from packet cache" if cached_sub_output is not None else " completed"
             self.progress(
-                f"Adaptive subchunk {sub_position}/{len(subchunks)} completed for {path} "
+                f"Adaptive subchunk {sub_position}/{len(subchunks)}{cache_note} for {path} "
                 f"with {len(sub_output.get('findings') or [])} finding(s)."
             )
         return merge_adaptive_subchunk_outputs(
@@ -782,6 +916,23 @@ class GatewayClaudeReviewer:
         response_format = self._response_format()
         if response_format is not None:
             body["response_format"] = response_format
+        return body
+
+    def _ci_diagnosis_model_body(self, user_prompt: str) -> dict[str, Any]:
+        safe_user_prompt = redact_text(user_prompt)
+        body = {
+            "messages": [
+                {"role": "system", "content": CI_DIAGNOSIS_SYSTEM_PROMPT},
+                {"role": "user", "content": safe_user_prompt},
+            ],
+            "max_tokens": min(1600, max(600, self.max_tokens)),
+            "temperature": 0,
+            "stop": ["<|im_end|>"],
+            "user": json.dumps({"appkey": self.config.gateway_app_key}, separators=(",", ":")),
+            "response_format": {"type": "json_object"},
+        }
+        if should_include_model_in_body(str(self.config.gateway_base_url or "")):
+            body["model"] = self.config.gateway_model
         return body
 
     def _response_format(self) -> dict[str, Any] | None:
@@ -1001,6 +1152,16 @@ class GatewayClaudeReviewer:
             if self.eta is not None:
                 self.eta.add_requests(count)
 
+    def _skip_eta_requests(self, count: int) -> None:
+        eta_lock = getattr(self, "_eta_lock", None)
+        if eta_lock is None:
+            if self.eta is not None:
+                self.eta.skip_requests(count)
+            return
+        with eta_lock:
+            if self.eta is not None:
+                self.eta.skip_requests(count)
+
     def _estimated_request_seconds_for_prompt(self, prompt_chars: int) -> float | None:
         eta_lock = getattr(self, "_eta_lock", None)
         if eta_lock is None:
@@ -1022,6 +1183,52 @@ class GatewayClaudeReviewer:
     def _increment_model_metric(self, key: str, count: int = 1) -> None:
         with self._metrics_lock:
             self._model_metrics[key] = int(self._model_metrics.get(key) or 0) + count
+
+    def _packet_cache_key(
+        self,
+        *,
+        chunk: dict[str, Any],
+        chunk_input: dict[str, Any],
+        deterministic_findings: list[dict[str, Any]],
+        prompt_max_chars: int,
+    ) -> str | None:
+        if self._packet_cache is None:
+            return None
+        return self._packet_cache.key_for(
+            chunk=chunk,
+            chunk_input=chunk_input,
+            deterministic_findings=deterministic_findings,
+            model=str(self.config.gateway_model or ""),
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            prompt_max_chars=prompt_max_chars,
+        )
+
+    def _load_packet_cache(self, cache_key: str | None, *, path: str) -> dict[str, Any] | None:
+        if self._packet_cache is None or not cache_key:
+            return None
+        try:
+            output = self._packet_cache.load(cache_key)
+        except (OSError, ValueError) as exc:
+            self._increment_model_metric("packet_cache_errors")
+            self.progress(f"Deep-review packet cache read failed for {path}: {redact_text(str(exc))}.")
+            return None
+        if output is None:
+            self._increment_model_metric("packet_cache_misses")
+            return None
+        self._increment_model_metric("packet_cache_hits")
+        return output
+
+    def _save_packet_cache(self, cache_key: str | None, output: dict[str, Any]) -> None:
+        if self._packet_cache is None or not cache_key:
+            return
+        try:
+            self._packet_cache.save(cache_key, output)
+        except OSError as exc:
+            self._increment_model_metric("packet_cache_errors")
+            self.progress(f"Deep-review packet cache write failed: {redact_text(str(exc))}.")
+            return
+        self._increment_model_metric("packet_cache_writes")
 
     def _model_metrics_snapshot(self) -> dict[str, Any]:
         with self._metrics_lock:
@@ -1064,13 +1271,27 @@ class DeepReviewCheckpoint:
             self.progress("Deep review checkpoint exists but does not match this PR/head/model; ignoring stale checkpoint.")
             return {}
         outputs: dict[str, dict[str, Any]] = {}
-        for item in payload.get("chunk_outputs") or []:
-            if not isinstance(item, dict):
-                continue
-            chunk_id = str(item.get("chunk_id") or "")
-            if chunk_id:
+        planned_output_count = 0
+        subchunk_output_count = 0
+        for key in ("chunk_outputs", "subchunk_outputs"):
+            for item in payload.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                chunk_id = str(item.get("chunk_id") or "")
+                if not chunk_id:
+                    continue
                 outputs[chunk_id] = item
-        self.progress(f"Deep review checkpoint restored from {self.path} with {len(outputs)} completed packet(s).")
+                if key == "chunk_outputs":
+                    planned_output_count += 1
+                else:
+                    subchunk_output_count += 1
+        suffix = ""
+        if subchunk_output_count:
+            suffix = f" and {subchunk_output_count} adaptive subchunk(s)"
+        self.progress(
+            f"Deep review checkpoint restored from {self.path} "
+            f"with {planned_output_count} completed packet(s){suffix}."
+        )
         return outputs
 
     def save(
@@ -1082,28 +1303,252 @@ class DeepReviewCheckpoint:
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         now = int(time.time())
+        planned_ids = [str(chunk.get("id") or "") for chunk in chunks]
+        planned_id_set = set(planned_ids)
+        planned_outputs = [
+            output_by_chunk_id[chunk_id]
+            for chunk_id in planned_ids
+            if chunk_id and chunk_id in output_by_chunk_id
+        ]
+        subchunk_outputs = [
+            output
+            for chunk_id, output in output_by_chunk_id.items()
+            if chunk_id and chunk_id not in planned_id_set
+        ]
         payload = {
             "schema_version": "0.1",
             "checkpoint_id": self.checkpoint_id,
             "status": status,
             "updated_at_epoch": now,
             "total_chunk_count": len(chunks),
-            "completed_chunk_count": len(output_by_chunk_id),
-            "planned_chunk_ids": [chunk.get("id") for chunk in chunks],
-            "completed_chunk_ids": list(output_by_chunk_id.keys()),
-            "chunk_outputs": [
-                output_by_chunk_id[str(chunk.get("id") or "")]
-                for chunk in chunks
-                if str(chunk.get("id") or "") in output_by_chunk_id
-            ],
+            "completed_chunk_count": len(planned_outputs),
+            "completed_subchunk_count": len(subchunk_outputs),
+            "planned_chunk_ids": planned_ids,
+            "completed_chunk_ids": [str(output.get("chunk_id") or "") for output in planned_outputs],
+            "completed_subchunk_ids": [str(output.get("chunk_id") or "") for output in subchunk_outputs],
+            "chunk_outputs": planned_outputs,
+            "subchunk_outputs": subchunk_outputs,
         }
         temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         temp_path.write_text(json.dumps(redact_obj(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temp_path.replace(self.path)
+        suffix = ""
+        if subchunk_outputs:
+            suffix = f"; {len(subchunk_outputs)} adaptive subchunk(s) cached"
         self.progress(
             f"Deep review checkpoint saved at {self.path}: "
-            f"{len(output_by_chunk_id)}/{len(chunks)} packet(s) complete."
+            f"{len(planned_outputs)}/{len(chunks)} packet(s) complete{suffix}."
         )
+
+
+def build_model_routing_summary(
+    *,
+    original_chunk_count: int,
+    planned_chunks: list[dict[str, Any]],
+    skipped_chunks: list[dict[str, Any]],
+    chunk_outputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "original_chunk_count": original_chunk_count,
+        "planned_model_chunk_count": len(planned_chunks),
+        "completed_model_chunk_count": len(chunk_outputs),
+        "cached_chunk_count": sum(1 for output in chunk_outputs if output.get("cache_hit")),
+        "uncached_chunk_count": sum(1 for output in chunk_outputs if not output.get("cache_hit")),
+        "planned_priority_counts": count_by_key(planned_chunks, "model_review_priority"),
+        "skipped_reason_counts": count_by_key(skipped_chunks, "reason"),
+        "planned_paths": [str(chunk.get("path") or "") for chunk in planned_chunks[:100]],
+        "skipped_paths": [
+            {
+                "path": item.get("path"),
+                "reason": item.get("reason"),
+                "priority": item.get("priority"),
+            }
+            for item in skipped_chunks[:100]
+        ],
+        "coverage_note": (
+            "Low-signal/generated packets may be skipped by deterministic routing; high-risk source, "
+            "config, workflow, test, and deterministic-finding packets remain model-reviewed."
+        ),
+    }
+
+
+def count_by_key(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+class DeepReviewPacketCache:
+    """Content-addressed cache for successful deep-review packet outputs."""
+
+    def __init__(self, path: Path, *, progress: Callable[[str], None]) -> None:
+        self.path = path
+        self.progress = progress
+        self._lock = threading.Lock()
+
+    def key_for(
+        self,
+        *,
+        chunk: dict[str, Any],
+        chunk_input: dict[str, Any],
+        deterministic_findings: list[dict[str, Any]],
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        prompt_max_chars: int,
+    ) -> str:
+        identity = deep_review_packet_cache_identity(
+            chunk=chunk,
+            chunk_input=chunk_input,
+            deterministic_findings=deterministic_findings,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            prompt_max_chars=prompt_max_chars,
+        )
+        blob = json.dumps(redact_obj(identity), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def load(self, key: str) -> dict[str, Any] | None:
+        path = self._path_for_key(key)
+        with self._lock:
+            if not path.exists():
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != "0.1" or payload.get("key") != key:
+            return None
+        output = payload.get("output")
+        return dict(output) if isinstance(output, dict) else None
+
+    def save(self, key: str, output: dict[str, Any]) -> None:
+        path = self._path_for_key(key)
+        payload = {
+            "schema_version": "0.1",
+            "key": key,
+            "review_policy_version": REVIEW_POLICY_VERSION,
+            "saved_at_epoch": int(time.time()),
+            "output": redact_obj(cacheable_review_output(output)),
+        }
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temp_path.replace(path)
+
+    def _path_for_key(self, key: str) -> Path:
+        safe_key = re.sub(r"[^a-f0-9]", "", key.lower())
+        if len(safe_key) != 64:
+            raise ValueError("packet cache key must be a 64-character hex SHA-256 digest")
+        return self.path / "packets" / safe_key[:2] / f"{safe_key}.json"
+
+
+def deep_review_packet_cache_identity(
+    *,
+    chunk: dict[str, Any],
+    chunk_input: dict[str, Any],
+    deterministic_findings: list[dict[str, Any]],
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    prompt_max_chars: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "0.2",
+        "review_policy_version": REVIEW_POLICY_VERSION,
+        "system_prompt_sha256": hash_text(SYSTEM_PROMPT),
+        "response_schema_sha256": hash_json(REVIEW_RESPONSE_SCHEMA),
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "prompt_max_chars": prompt_max_chars,
+        "repo": chunk_input.get("repo"),
+        "pr": stable_pr_identity(chunk_input.get("pr") or {}),
+        "review_scope": strip_packet_cache_volatile(chunk_input.get("review_scope") or {}),
+        "review_packet": strip_packet_cache_volatile(chunk_input.get("review_packet") or {}),
+        "changed_files": strip_packet_cache_volatile(chunk_input.get("changed_files") or []),
+        "full_files": chunk_input.get("full_files") or {},
+        "base_files": chunk_input.get("base_files") or {},
+        "comments": chunk_input.get("comments") or {},
+        "ci": chunk_input.get("ci") or {},
+        "historical_context": chunk_input.get("historical_context") or {},
+        "sdk_manifest": chunk_input.get("sdk_manifest") or {},
+        "sdk_review_inventory": chunk_input.get("sdk_review_inventory") or {},
+        "deterministic_findings": deterministic_findings,
+        "chunk_identity": {
+            "path": chunk.get("path"),
+            "previous_path": chunk.get("previous_path"),
+            "status": chunk.get("status"),
+            "chunk_strategy": chunk.get("chunk_strategy"),
+            "diff_sha256": hash_text(str(chunk.get("diff") or "")),
+            "context_ranges_head": chunk.get("context_ranges_head") or [],
+            "context_ranges_base": chunk.get("context_ranges_base") or [],
+        },
+    }
+
+
+def strip_packet_cache_volatile(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_packet_cache_volatile(item)
+            for key, item in value.items()
+            if key not in PACKET_CACHE_VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        return [strip_packet_cache_volatile(item) for item in value]
+    return value
+
+
+def stable_pr_identity(pr: dict[str, Any]) -> dict[str, Any]:
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "state": pr.get("state"),
+        "draft": pr.get("draft"),
+        "base": {
+            "ref": base.get("ref"),
+            "repo": stable_repo_identity(base.get("repo") if isinstance(base.get("repo"), dict) else {}),
+        },
+        "head": {
+            "ref": head.get("ref"),
+            "repo": stable_repo_identity(head.get("repo") if isinstance(head.get("repo"), dict) else {}),
+        },
+    }
+
+
+def stable_repo_identity(repo: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "full_name": repo.get("full_name"),
+        "name": repo.get("name"),
+        "owner": (repo.get("owner") or {}).get("login") if isinstance(repo.get("owner"), dict) else None,
+    }
+
+
+def cacheable_review_output(output: dict[str, Any]) -> dict[str, Any]:
+    excluded = {
+        "cache_hit",
+        "cache_key",
+        "_packet_cacheable",
+        "chunk_id",
+        "parent_chunk_id",
+        "chunk_path",
+        "chunk_index",
+        "chunk_total",
+    }
+    return {key: value for key, value in output.items() if key not in excluded}
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def hash_json(value: Any) -> str:
+    return hash_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
 def build_deep_review_checkpoint(
@@ -1241,11 +1686,14 @@ def recommended_deep_concurrency(total_chunks: int, chunks: list[dict[str, Any]]
     diff_chars = [int(chunk.get("diff_chars") or len(str(chunk.get("diff") or ""))) for chunk in chunks]
     max_diff = max(diff_chars) if diff_chars else 0
     avg_diff = (sum(diff_chars) / len(diff_chars)) if diff_chars else 0
+    huge_count = sum(1 for size in diff_chars if size >= 28_000)
     high_priority_count = sum(1 for chunk in chunks if chunk.get("model_review_priority") == "high")
-    if max_diff >= 28_000 or avg_diff >= 16_000:
+    if avg_diff >= 16_000 or huge_count >= max(2, total_chunks // 2):
         return 1
     if total_chunks <= 3:
         return 3
+    if max_diff >= 28_000:
+        return 2
     if total_chunks >= 40 or high_priority_count >= 18:
         return 2
     if total_chunks >= 7 or max_diff >= 8_000 or avg_diff >= 5_000 or high_priority_count >= 4:
@@ -1327,6 +1775,139 @@ def build_fresh_chat_retry_prompt(original_user_prompt: str) -> str:
         "Original review request:\n"
         f"{original_user_prompt}"
     )
+
+
+def build_ci_diagnosis_prompt(
+    *,
+    job_name: str,
+    failed_steps: list[str],
+    conclusion: str,
+    deterministic_root_cause: str,
+    deterministic_fix: str,
+    log_excerpt: str,
+) -> str:
+    safe_log = truncate_text(redact_text(log_excerpt), 12_000)
+    return (
+        "Diagnose this GitHub Actions job failure. Return exactly one JSON object and no Markdown.\n\n"
+        "Rules:\n"
+        "- Use only the supplied log excerpt and job metadata.\n"
+        "- Prefer final failure summaries, retry summaries, and tool-specific error lines over stack frame internals.\n"
+        "- Do not infer a code/package problem when the log shows infrastructure, network, or service connectivity failure.\n"
+        "- If the excerpt does not prove the root cause, set diagnosis_status to insufficient_evidence and confidence low.\n"
+        "- evidence_lines must be exact or near-exact lines from the supplied excerpt.\n"
+        "- suggested_fix must tell the user what concrete thing to change or check.\n\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "diagnosis_status": "confirmed|insufficient_evidence",\n'
+        '  "root_cause": "single concrete root cause, or empty string",\n'
+        '  "failure_scenario": "observable failure stated from the log, or empty string",\n'
+        '  "suggested_fix": "specific fix, or conservative next step",\n'
+        '  "evidence_lines": ["short exact log line", "another exact log line"],\n'
+        '  "confidence": "high|medium|low",\n'
+        '  "confidence_score": 0.0\n'
+        "}\n\n"
+        f"Job name: {job_name}\n"
+        f"Conclusion: {conclusion}\n"
+        f"Failed steps: {', '.join(failed_steps) if failed_steps else '(unknown)'}\n"
+        f"Deterministic root-cause guess: {deterministic_root_cause or '(none)'}\n"
+        f"Deterministic suggested fix: {deterministic_fix or '(none)'}\n\n"
+        "Redacted log excerpt:\n"
+        f"{safe_log}"
+    )
+
+
+def build_ci_diagnosis_retry_prompt(original_prompt: str) -> str:
+    return (
+        "Retry the CI diagnosis. Your previous response was not valid JSON. "
+        "Return exactly one valid JSON object with keys diagnosis_status, root_cause, "
+        "failure_scenario, suggested_fix, evidence_lines, confidence, and confidence_score. "
+        "Do not include Markdown or prose outside the JSON object.\n\n"
+        f"{original_prompt}"
+    )
+
+
+def normalize_ci_diagnosis(raw_output: dict[str, Any], *, log_excerpt: str) -> dict[str, Any]:
+    if not isinstance(raw_output, dict):
+        raise GatewayModelFormatError("CI diagnosis response was not a JSON object.")
+
+    status = str(raw_output.get("diagnosis_status") or "").strip().lower()
+    if status not in {"confirmed", "insufficient_evidence"}:
+        status = "insufficient_evidence"
+
+    confidence = str(raw_output.get("confidence") or "").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    try:
+        confidence_score = float(raw_output.get("confidence_score"))
+    except (TypeError, ValueError):
+        confidence_score = {"high": 0.9, "medium": 0.65, "low": 0.3}[confidence]
+    confidence_score = max(0.0, min(1.0, confidence_score))
+
+    evidence_lines = normalize_ci_evidence_lines(raw_output.get("evidence_lines"), log_excerpt=log_excerpt)
+    root_cause = redact_text(str(raw_output.get("root_cause") or "").strip())
+    failure_scenario = redact_text(str(raw_output.get("failure_scenario") or "").strip())
+    suggested_fix = redact_text(str(raw_output.get("suggested_fix") or "").strip())
+
+    if status == "confirmed" and (not evidence_lines or not root_cause or not suggested_fix):
+        status = "insufficient_evidence"
+    if status != "confirmed":
+        confidence = "low"
+        confidence_score = min(confidence_score, 0.4)
+    elif confidence == "high" and confidence_score < 0.8:
+        confidence = "medium"
+    elif confidence == "medium" and confidence_score >= 0.85:
+        confidence_score = 0.84
+
+    return {
+        "diagnosis_status": status,
+        "root_cause": root_cause,
+        "failure_scenario": failure_scenario,
+        "suggested_fix": suggested_fix,
+        "evidence_lines": evidence_lines,
+        "confidence": confidence,
+        "confidence_score": confidence_score,
+    }
+
+
+def normalize_ci_evidence_lines(raw_lines: Any, *, log_excerpt: str) -> list[str]:
+    if isinstance(raw_lines, str):
+        candidates = [raw_lines]
+    elif isinstance(raw_lines, list):
+        candidates = [str(item) for item in raw_lines if str(item).strip()]
+    else:
+        candidates = []
+    excerpt_lines = [line.strip() for line in redact_text(log_excerpt).splitlines() if line.strip()]
+    excerpt_compact = {compact_for_evidence_match(line): line for line in excerpt_lines}
+    output: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        compact = compact_for_evidence_match(redact_text(candidate))
+        if not compact:
+            continue
+        matched = excerpt_compact.get(compact)
+        if matched is None:
+            matched = near_matching_log_line(compact, excerpt_lines)
+        if matched is None or matched in seen:
+            continue
+        seen.add(matched)
+        output.append(matched[:500])
+        if len(output) >= 6:
+            break
+    return output
+
+
+def near_matching_log_line(compact_candidate: str, excerpt_lines: list[str]) -> str | None:
+    for line in excerpt_lines:
+        compact_line = compact_for_evidence_match(line)
+        if not compact_line:
+            continue
+        if compact_candidate in compact_line or compact_line in compact_candidate:
+            return line
+    return None
+
+
+def compact_for_evidence_match(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower()).strip()
 
 
 def extract_chat_completion_text(payload: dict[str, Any]) -> str:
@@ -1526,7 +2107,7 @@ def merge_adaptive_subchunk_outputs(
     )
     if notes:
         model_notes = f"{model_notes}\n" + "\n".join(notes[:10])
-    return normalize_review_output(
+    output = normalize_review_output(
         {
             "summary": f"Reviewed {path} through adaptive subchunks after a transient gateway failure.",
             "overall_status": status,
@@ -1536,3 +2117,5 @@ def merge_adaptive_subchunk_outputs(
         },
         deterministic_findings=deterministic_findings,
     )
+    output["_packet_cacheable"] = all(bool(item.get("_packet_cacheable", True)) for item in sub_outputs)
+    return output

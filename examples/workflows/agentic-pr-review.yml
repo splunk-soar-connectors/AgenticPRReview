@@ -1,24 +1,86 @@
 name: Reusable Push + Agentic PR Review
 
 on:
-  pull_request:
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
+  push:
+    branches:
+      - "sanchaga/bottest*"
+      - "sanchaga/bottest/**"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number for this branch. Leave empty to auto-detect by branch name.
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: reusable-push-agentic-pr-review-${{ github.event.pull_request.number }}
+  group: reusable-push-agentic-pr-review-${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
+  resolve-pr-context:
+    runs-on: ubuntu-latest
+    if: github.repository != 'splunk-soar-connectors/.github'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_found: ${{ steps.resolve.outputs.pr_found }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      is_draft: ${{ steps.resolve.outputs.is_draft }}
+      head_ref: ${{ steps.resolve.outputs.head_ref }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      head_repo_full_name: ${{ steps.resolve.outputs.head_repo_full_name }}
+    steps:
+      - name: Resolve open PR for this branch
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number || '' }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_PR_NUMBER}" ]]; then
+            pr_json=$(gh pr view "${INPUT_PR_NUMBER}" \
+              --repo "${GH_REPO}" \
+              --json number,isDraft,headRefName,headRefOid,headRepository \
+              --jq '{number,is_draft:.isDraft,head_ref:.headRefName,head_sha:.headRefOid,head_repo_full_name:.headRepository.nameWithOwner}')
+          else
+            pr_json=$(gh pr list \
+              --repo "${GH_REPO}" \
+              --state open \
+              --head "${BRANCH_NAME}" \
+              --json number,isDraft,headRefName,headRefOid,headRepository \
+              --jq '.[0] | if . == null then empty else {number,is_draft:.isDraft,head_ref:.headRefName,head_sha:.headRefOid,head_repo_full_name:.headRepository.nameWithOwner} end')
+          fi
+
+          if [[ -z "${pr_json}" ]]; then
+            echo "No open PR found for ${GH_REPO}@${BRANCH_NAME}; skipping branch-only PR workflow jobs."
+            echo "pr_found=false" >> "${GITHUB_OUTPUT}"
+            echo "pr_number=" >> "${GITHUB_OUTPUT}"
+            echo "is_draft=true" >> "${GITHUB_OUTPUT}"
+            echo "head_ref=${BRANCH_NAME}" >> "${GITHUB_OUTPUT}"
+            echo "head_sha=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+            echo "head_repo_full_name=${GH_REPO}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Resolved PR context: ${pr_json}"
+          echo "pr_found=true" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=$(jq -r '.number' <<< "${pr_json}")" >> "${GITHUB_OUTPUT}"
+          echo "is_draft=$(jq -r '.is_draft' <<< "${pr_json}")" >> "${GITHUB_OUTPUT}"
+          echo "head_ref=$(jq -r '.head_ref' <<< "${pr_json}")" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=$(jq -r '.head_sha' <<< "${pr_json}")" >> "${GITHUB_OUTPUT}"
+          echo "head_repo_full_name=$(jq -r '.head_repo_full_name' <<< "${pr_json}")" >> "${GITHUB_OUTPUT}"
+
   pr-labeling:
     runs-on: ubuntu-latest
-    if: github.event.action == 'opened'
+    needs: resolve-pr-context
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     permissions:
       issues: write
       pull-requests: write
@@ -31,10 +93,12 @@ jobs:
           jira-user: ${{ secrets.JIRA_USER }}
           jira-api-key: ${{ secrets.JIRA_API_KEY }}
           repo-name: ${{ github.repository }}
-          pr-number: ${{ github.event.pull_request.number }}
+          pr-number: ${{ needs.resolve-pr-context.outputs.pr_number }}
 
   detect-app-type:
     runs-on: ubuntu-latest
+    needs: resolve-pr-context
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     outputs:
       is_sdkfied: ${{ steps.detect.outputs.is_sdkfied }}
       uv_lock_directory: ${{ steps.detect.outputs.uv_lock_directory }}
@@ -42,8 +106,9 @@ jobs:
       - name: Check out app repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_ref }}
+          allow-unsafe-pr-checkout: true
 
       - name: Detect App Type
         id: detect
@@ -71,8 +136,8 @@ jobs:
 
   pytest:
     runs-on: ubuntu-latest
-    needs: detect-app-type
-    if: needs.detect-app-type.outputs.is_sdkfied == 'true'
+    needs: [resolve-pr-context, detect-app-type]
+    if: needs.resolve-pr-context.outputs.pr_found == 'true' && needs.detect-app-type.outputs.is_sdkfied == 'true'
     permissions:
       contents: read
     env:
@@ -81,9 +146,10 @@ jobs:
       - name: Check out app repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_sha }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Set up SDKfied app environment
         uses: splunk-soar-connectors/.github/.github/actions/sdkfied-app-setup@main
@@ -95,6 +161,8 @@ jobs:
 
   pre-commit:
     runs-on: ubuntu-latest
+    needs: resolve-pr-context
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     steps:
       - name: Setup Environment
         uses: splunk-soar-connectors/.github/.github/actions/env-setup@main
@@ -104,6 +172,8 @@ jobs:
 
   semantic-release-preview:
     runs-on: ubuntu-latest
+    needs: resolve-pr-context
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     permissions:
       contents: write
       issues: write
@@ -112,10 +182,11 @@ jobs:
       - name: Check out app repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Check out shared workflow files
         uses: actions/checkout@v4
@@ -139,7 +210,7 @@ jobs:
       - name: Run Semantic Release as a dry run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REF: ${{ needs.resolve-pr-context.outputs.head_ref }}
         run: |
           unset GITHUB_ACTIONS GITHUB_REF GITHUB_EVENT_NAME
           semantic-release --dry-run --no-ci --branches "$PR_HEAD_REF" --tag-format '${version}'
@@ -148,7 +219,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ needs.resolve-pr-context.outputs.pr_number }}
         run: |
           breadcrumb='<!-- semantic-release-breadcrumb -->'
           message='Merging this PR will not result in a release.'
@@ -179,7 +250,8 @@ jobs:
     runs-on:
       - codebuild-integration-tests-${{ github.run_id }}-${{ github.run_attempt }}
       - image:custom-linux-875003031410.dkr.ecr.us-west-2.amazonaws.com/soar-connectors/pytest:f7150dbb7f347d35f8f4bb285d36985ecd4cf231
-    needs: detect-app-type
+    needs: [resolve-pr-context, detect-app-type]
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     env:
       IS_SDKFIED: ${{ needs.detect-app-type.outputs.is_sdkfied }}
       UV_LOCK_DIRECTORY: ${{ needs.detect-app-type.outputs.uv_lock_directory }}
@@ -187,8 +259,9 @@ jobs:
       - name: Check out app repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_ref }}
+          allow-unsafe-pr-checkout: true
 
       - name: Setup SDKfied App Environment
         if: env.IS_SDKFIED == 'true'
@@ -209,19 +282,20 @@ jobs:
 
   build:
     # connector-template intentionally uses a sentinel app ID and is not a publishable app.
-    if: github.event.repository.name != 'connector-template'
+    if: needs.resolve-pr-context.outputs.pr_found == 'true' && github.event.repository.name != 'connector-template'
     runs-on:
       - codebuild-integration-tests-${{ github.run_id }}-${{ github.run_attempt }}
       - image:custom-linux-875003031410.dkr.ecr.us-west-2.amazonaws.com/soar-connectors/pytest:f7150dbb7f347d35f8f4bb285d36985ecd4cf231
-    needs: [compile, detect-app-type]
+    needs: [resolve-pr-context, compile, detect-app-type]
     env:
       IS_SDKFIED: ${{ needs.detect-app-type.outputs.is_sdkfied }}
       UV_LOCK_DIRECTORY: ${{ needs.detect-app-type.outputs.uv_lock_directory }}
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_ref }}
+          allow-unsafe-pr-checkout: true
 
       - name: Build Application
         if: env.IS_SDKFIED == 'false'
@@ -249,7 +323,8 @@ jobs:
 
   test-setup:
     runs-on: ubuntu-latest
-    needs: [build, detect-app-type]
+    needs: [resolve-pr-context, build, detect-app-type]
+    if: needs.resolve-pr-context.outputs.pr_found == 'true'
     env:
       IS_SDKFIED: ${{ needs.detect-app-type.outputs.is_sdkfied }}
       UV_LOCK_DIRECTORY: ${{ needs.detect-app-type.outputs.uv_lock_directory }}
@@ -260,8 +335,9 @@ jobs:
       - name: Check out actions repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_ref }}
+          allow-unsafe-pr-checkout: true
 
       - name: Setup Python 3.13 for SDKfied apps
         if: env.IS_SDKFIED == 'true'
@@ -303,18 +379,19 @@ jobs:
     runs-on:
       - codebuild-integration-tests-${{ github.run_id }}-${{ github.run_attempt }}
       - image:custom-linux-875003031410.dkr.ecr.us-west-2.amazonaws.com/soar-connectors/pytest:f7150dbb7f347d35f8f4bb285d36985ecd4cf231
-    needs: [test-setup, detect-app-type]
+    needs: [resolve-pr-context, test-setup, detect-app-type]
     env:
       IS_SDKFIED: ${{ needs.detect-app-type.outputs.is_sdkfied }}
       UV_LOCK_DIRECTORY: ${{ needs.detect-app-type.outputs.uv_lock_directory }}
-    if: ${{ needs.test-setup.outputs.publisher == 'Splunk' }}
+    if: ${{ needs.resolve-pr-context.outputs.pr_found == 'true' && needs.test-setup.outputs.publisher == 'Splunk' }}
     continue-on-error: true
     steps:
       - name: Check out actions repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ needs.resolve-pr-context.outputs.head_repo_full_name }}
+          ref: ${{ needs.resolve-pr-context.outputs.head_ref }}
+          allow-unsafe-pr-checkout: true
 
       - name: Setup SDKfied App Environment
         if: env.IS_SDKFIED == 'true'
@@ -507,6 +584,7 @@ jobs:
   agentic-pr-review:
     name: Agentic PR review
     needs:
+      - resolve-pr-context
       - pr-labeling
       - detect-app-type
       - pytest
@@ -520,7 +598,7 @@ jobs:
       - aws-sanity-test
       - aggregate-sanity-results
       - integration-test
-    if: always() && github.event.pull_request.draft == false
+    if: always() && needs.resolve-pr-context.outputs.pr_found == 'true' && needs.resolve-pr-context.outputs.is_draft != 'true'
     permissions:
       actions: read
       checks: read
@@ -530,7 +608,7 @@ jobs:
     uses: splunk-soar-connectors/AgenticPRReview/.github/workflows/pr-review.yml@sanchaga/agenticprreviewbot
     with:
       repo: ${{ github.repository }}
-      pr_number: ${{ github.event.pull_request.number }}
+      pr_number: ${{ needs.resolve-pr-context.outputs.pr_number }}
       circuit_base_url: ${{ vars.CIRCUIT_BASE_URL }}
       circuit_model: ${{ vars.CIRCUIT_MODEL }}
       circuit_token_url: ${{ vars.CIRCUIT_TOKEN_URL }}

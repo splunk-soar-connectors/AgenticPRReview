@@ -13,6 +13,7 @@ import zipfile
 from .config import RuntimeConfig
 from .github_client import GitHubClient, GitHubError
 from .json_utils import truncate_text
+from .review_exclusions import is_review_excluded_path, review_exclusion_reason
 
 
 BINARY_SUFFIXES = {
@@ -105,6 +106,26 @@ def is_relevant_full_file(path: str) -> bool:
     }
 
 
+def partition_review_files(files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    review_files: list[dict[str, Any]] = []
+    excluded_files: list[dict[str, Any]] = []
+    for file in files:
+        path = str(file.get("filename") or "")
+        if is_review_excluded_path(path):
+            excluded_files.append(file)
+            continue
+        review_files.append(file)
+    return review_files, excluded_files
+
+
+def compact_review_excluded_files(files: list[dict[str, Any]]) -> list[dict[str, str]]:
+    output = []
+    for file in files:
+        path = str(file.get("filename") or "")
+        output.append({"path": path, "reason": review_exclusion_reason(path)})
+    return output
+
+
 def compact_user(user: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(user, dict):
         return None
@@ -139,6 +160,7 @@ class PRCollector:
         base_sha = pr["base"]["sha"]
 
         files = self.client.list_pr_files(repo, pr_number)
+        review_files, excluded_review_files = partition_review_files(files)
         issue_comments = self.client.list_issue_comments(repo, pr_number)
         review_comments = self.client.list_review_comments(repo, pr_number)
         reviews = self.client.list_reviews(repo, pr_number)
@@ -149,16 +171,22 @@ class PRCollector:
         checks.update(workflow_jobs)
 
         root_json_files = self._root_json_files(repo, head_sha)
-        full_file_paths = self._select_full_files(files, root_json_files)
-        raw_urls = {file.get("filename"): file.get("raw_url") for file in files if file.get("filename") and file.get("raw_url")}
+        full_file_paths = self._select_full_files(review_files, root_json_files)
+        raw_urls = {
+            file.get("filename"): file.get("raw_url")
+            for file in review_files
+            if file.get("filename") and file.get("raw_url")
+        }
         full_files, full_file_errors = self._fetch_full_files(repo, head_sha, full_file_paths, raw_urls)
-        doc_context = self._fetch_doc_context(repo, head_sha, files)
+        doc_context = self._fetch_doc_context(repo, head_sha, review_files)
 
         base_root_json_files = self._root_json_files(repo, base_sha)
         base_full_file_paths = set(base_root_json_files)
         base_full_file_paths.update(ALWAYS_FETCH_FULL_FILES)
         base_files, base_full_file_errors = self._fetch_full_files(repo, base_sha, base_full_file_paths, {})
-        compact_files = [self._compact_file(file) for file in files]
+        compact_files = [self._compact_file(file) for file in review_files]
+        comment_anchor_files = [self._compact_file(file) for file in excluded_review_files]
+        compact_excluded_review_files = compact_review_excluded_files(excluded_review_files)
 
         return {
             "schema_version": "0.1",
@@ -181,6 +209,7 @@ class PRCollector:
                 "head": {"ref": pr["head"]["ref"], "sha": head_sha},
             },
             "changed_files": compact_files,
+            "comment_anchor_files": comment_anchor_files,
             "full_files": full_files,
             "doc_context": doc_context,
             "base_files": base_files,
@@ -212,6 +241,8 @@ class PRCollector:
                 "base_full_file_fetch_errors": base_full_file_errors[:50],
                 "ci_error_count": len(checks.get("errors", [])) if isinstance(checks, dict) else 0,
                 "target_pipeline_failure_count": len(checks.get("target_job_failures", [])) if isinstance(checks, dict) else 0,
+                "excluded_review_file_count": len(compact_excluded_review_files),
+                "excluded_review_files": compact_excluded_review_files[:50],
             },
         }
 
@@ -575,6 +606,19 @@ def summarize_ci_log(text: str, *, max_lines: int = 80, max_chars: int = 7000) -
 
     selected: list[int] = []
     seen: set[int] = set()
+    for index in terminal_ci_failure_indices(lines):
+        left = max(0, index - 3)
+        right = min(len(lines), index + 4)
+        for candidate in range(left, right):
+            if candidate in seen:
+                continue
+            if is_ci_boilerplate_line(lines[candidate]):
+                continue
+            seen.add(candidate)
+            selected.append(candidate)
+        if len(selected) >= max_lines:
+            break
+
     priority_indices = [index for index, line in enumerate(lines) if is_failure_ci_line(line)]
     candidate_indices = priority_indices or [
         index for index, line in enumerate(lines) if is_actionable_ci_line(line)
@@ -601,6 +645,43 @@ def summarize_ci_log(text: str, *, max_lines: int = 80, max_chars: int = 7000) -
 
     excerpt = "\n".join(lines[index] for index in selected if lines[index].strip())
     return truncate_text(excerpt, max_chars)
+
+
+def terminal_ci_failure_indices(lines: list[str]) -> list[int]:
+    """Return high-value terminal failure lines from the end of CI logs first."""
+    indices: list[int] = []
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if is_terminal_ci_failure_line(line):
+            indices.append(index)
+        if len(indices) >= 8:
+            break
+    return list(reversed(indices))
+
+
+def is_terminal_ci_failure_line(line: str) -> bool:
+    if is_ci_boilerplate_line(line):
+        return False
+    lowered = line.lower()
+    terminal_phrases = (
+        "process completed with exit code",
+        "failed after",
+        "after 3 attempts",
+        "after 2 attempts",
+        "after 1 attempts",
+        "sdkfied app installation failed",
+        "app installation failed",
+        "version compatibility check failed",
+        "max retries exceeded",
+        "connecttimeout",
+        "connecttimeouterror",
+        "connection to ",
+        "timed out",
+        "could not connect",
+        "connection refused",
+        "network is unreachable",
+    )
+    return any(phrase in lowered for phrase in terminal_phrases)
 
 
 def strip_ansi(text: str) -> str:
