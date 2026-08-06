@@ -7,7 +7,12 @@ import re
 from typing import Any
 
 from .github_client import GitHubClient, GitHubError
-from .models import is_actionable_review_finding, should_promote_deterministic_finding
+from .models import (
+    has_publishable_confidence,
+    is_actionable_review_finding,
+    review_confidence_score,
+    should_promote_deterministic_finding,
+)
 from .review_exclusions import (
     finding_mentions_review_excluded_path,
     is_review_excluded_path,
@@ -102,6 +107,13 @@ PRECOMMIT_DETAIL_KEYWORDS = (
     "assertionerror",
     "traceback",
 )
+HTTP_REQUEST_CALL_PATTERN = re.compile(
+    r"\b(?:requests|httpx)\.(?:get|post|put|patch|delete|request)\s*\("
+    r"|\brequest_func\s*\("
+    r"|\b_get_requests_session\(\)\.(?:get|post|put|patch|delete|request)\s*\("
+    r"|\b[A-Za-z_][A-Za-z0-9_]*_session\.(?:get|post|put|patch|delete|request)\s*\("
+)
+
 
 def build_comment_plan(
     review_output: dict[str, Any],
@@ -669,7 +681,7 @@ def group_related_findings_for_comments(findings: list[dict[str, Any]]) -> list[
             continue
         if str(finding.get("severity") or "").lower() == "low":
             continue
-        if str(finding.get("confidence") or "").lower() != "high":
+        if not has_publishable_confidence(finding):
             continue
         key = comment_group_key(finding)
         if not key:
@@ -764,7 +776,9 @@ def merge_comment_group(key: str, items: list[dict[str, Any]]) -> dict[str, Any]
     base = dict(items[0])
     base["title"] = grouped_title(key, items)
     base["severity"] = strongest_severity(items)
-    base["confidence"] = "high" if all(str(item.get("confidence") or "").lower() == "high" for item in items) else "medium"
+    confidence_score = min(review_confidence_score(item) for item in items)
+    base["confidence"] = "high" if confidence_score >= 0.85 else "medium"
+    base["confidence_score"] = confidence_score
     base["evidence"] = grouped_evidence(key, items)
     base["why_it_matters"] = grouped_why(key, items)
     base["suggested_fix"] = grouped_fix(key, items)
@@ -1006,10 +1020,151 @@ def finding_context_filter_reason(finding: dict[str, Any], review_input: dict[st
             "detail": "finding target is not tied to a changed file, changed hunk, CI blocker, or inferable changed anchor",
             "evidence_source": "pr_scope",
         }
+    timeout_reason = unsupported_missing_timeout_reason(finding, review_input)
+    if timeout_reason:
+        return timeout_reason
+    exception_reason = unsupported_broad_exception_reason(finding)
+    if exception_reason:
+        return exception_reason
     unsupported_identifier_reason = unconnected_identifier_inference_reason(finding)
     if unsupported_identifier_reason:
         return unsupported_identifier_reason
     return None
+
+
+def unsupported_missing_timeout_reason(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+) -> dict[str, str] | None:
+    category = str(finding.get("category") or "")
+    root_cause = str(finding.get("root_cause") or "")
+    if category != "api_auth_correctness" and root_cause != "request_timeout":
+        return None
+    text = all_comment_finding_text(finding)
+    if not is_missing_http_timeout_claim(text):
+        return None
+    if changed_diff_has_timeoutless_request_call(finding, review_input):
+        return None
+    return {
+        "reason": "unsupported_missing_timeout_claim",
+        "detail": (
+            "missing-timeout finding was not anchored to a changed HTTP request "
+            "call that lacks a timeout argument"
+        ),
+        "evidence_source": "behavioral_evidence_verifier",
+        "confidence_after": "low",
+    }
+
+
+def is_missing_http_timeout_claim(text: str) -> bool:
+    if "timeout" not in text:
+        return False
+    return any(
+        term in text
+        for term in (
+            "requests.",
+            "httpx.",
+            "_make_rest_call",
+            "request_func",
+            "_get_requests_session",
+            "session.",
+            "api call",
+            "http request",
+            "external request",
+            "external api",
+        )
+    )
+
+
+def changed_diff_has_timeoutless_request_call(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+) -> bool:
+    path = str(finding.get("file") or "").strip()
+    if not path:
+        return False
+    line = normalize_line(finding.get("line"))
+    changed_files = [
+        item
+        for item in review_input.get("changed_files", []) or []
+        if isinstance(item, dict) and str(item.get("filename") or "") == path
+    ]
+    for file_info in changed_files:
+        entries = parse_right_side_diff_entries(str(file_info.get("patch") or ""))
+        if timeoutless_request_call_in_entries(entries, line=line):
+            return True
+    return False
+
+
+def timeoutless_request_call_in_entries(entries: list[dict[str, Any]], *, line: int | None) -> bool:
+    if not entries:
+        return False
+    indexes = [
+        index
+        for index, entry in enumerate(entries)
+        if line is None or int(entry.get("line") or 0) == line
+    ]
+    for index in indexes:
+        snippet = "\n".join(str(entry.get("text") or "") for entry in entries[index : index + 12])
+        if HTTP_REQUEST_CALL_PATTERN.search(snippet) and "timeout=" not in snippet:
+            return True
+    return False
+
+
+def unsupported_broad_exception_reason(finding: dict[str, Any]) -> dict[str, str] | None:
+    text = all_comment_finding_text(finding)
+    if not is_broad_exception_claim(text):
+        return None
+    if broad_exception_problem_is_supported(text):
+        return None
+    return {
+        "reason": "unsupported_broad_exception_claim",
+        "detail": (
+            "broad exception finding did not show swallowed failures, success conversion, "
+            "lost diagnostics, or unrecoverable control flow"
+        ),
+        "evidence_source": "behavioral_evidence_verifier",
+        "confidence_after": "low",
+    }
+
+
+def is_broad_exception_claim(text: str) -> bool:
+    return any(
+        phrase in text
+        for phrase in (
+            "except exception",
+            "`except exception",
+            "broad exception",
+            "catch-all exception",
+            "catches all exceptions",
+        )
+    )
+
+
+def broad_exception_problem_is_supported(text: str) -> bool:
+    return any(
+        phrase in text
+        for phrase in (
+            "silently",
+            "swallow",
+            "swallowed",
+            "suppressed",
+            "converted into success",
+            "converts failures into success",
+            "return app_success",
+            "phantom.app_success",
+            "returns success",
+            "without logging",
+            "does not log",
+            "not logged",
+            "loses diagnostic",
+            "lost diagnostic",
+            "hides the original",
+            "recovery is impossible",
+            "cannot recover",
+            "return true",
+        )
+    )
 
 
 def unconnected_identifier_inference_reason(finding: dict[str, Any]) -> dict[str, str] | None:
@@ -1174,9 +1329,11 @@ def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
         return True
     if not is_actionable_review_finding(finding):
         return True
+    if not has_publishable_confidence(finding):
+        return True
     if category == "ci_pipeline_failure":
         return not has_actionable_pipeline_failure_details(text)
-    if confidence in {"medium", "low"}:
+    if confidence == "low":
         return True
     if category == "ci_synthesis":
         return True
@@ -1457,6 +1614,12 @@ def build_comment_for_finding(
     body = render_short_comment(finding, finding_type, target)
     body = append_code_suggestion_block(body, finding, finding_type, target)
     body = redact_text(body)
+    if not comment_has_required_sections(body):
+        return None
+    if "```suggestion" in body:
+        comment_style = "code_comment_with_github_suggestion"
+    else:
+        comment_style = f"{finding_type}_comment_with_suggested_fix"
 
     return {
         "id": finding_id,
@@ -1477,7 +1640,6 @@ def build_comment_for_finding(
         "pipeline_failure_tool": finding.get("pipeline_failure_tool"),
         "pipeline_source_location": finding.get("pipeline_source_location"),
         "finding_type": finding_type,
-        "comment_style": comment_style_for(finding, finding_type, target),
         "github_comment_type": target["github_comment_type"],
         "path": target.get("path"),
         "line": target.get("line"),
@@ -1485,6 +1647,7 @@ def build_comment_for_finding(
         "target_reason": target["target_reason"],
         "body": body,
         "marker": marker,
+        "comment_style": comment_style,
     }
 
 
@@ -1795,35 +1958,37 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     location = format_conversation_location(target)
     anchor_text = concise_anchor_text(str(target.get("anchor_text") or ""))
 
-    issue_text = title
-    if evidence and evidence.lower() not in title.lower():
-        issue_text = f"{issue_text} {evidence}"
-
-    lines = [f"Issue: {issue_text}"]
+    evidence_parts = []
     if location and target["github_comment_type"] == "conversation":
-        lines.append(f"Location: `{location}`")
+        evidence_parts.append(f"Location: `{location}`")
     if target["github_comment_type"] == "conversation":
         pipeline_jobs_line = format_pipeline_jobs_line(finding)
         if pipeline_jobs_line:
-            lines.append(pipeline_jobs_line)
+            evidence_parts.append(pipeline_jobs_line)
         else:
             pipeline_url = str(finding.get("url") or "").strip()
             if pipeline_url:
-                lines.append(f"Pipeline: [failed job]({pipeline_url})")
+                evidence_parts.append(f"Pipeline: [failed job]({pipeline_url})")
     if code_reference:
-        lines.append(f"Code reference: `{code_reference}`")
+        evidence_parts.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
-        lines.append(f"Current line: `{anchor_text}`")
+        evidence_parts.append(f"Current line: `{anchor_text}`")
+    if evidence:
+        evidence_parts.append(evidence)
     if changed_line_evidence:
-        lines.append(f"Changed behavior: {changed_line_evidence}")
+        evidence_parts.append(f"Changed behavior: {changed_line_evidence}")
     if failure_scenario:
-        lines.append(f"Failure scenario: {failure_scenario}")
+        evidence_parts.append(f"Failure scenario: {failure_scenario}")
+
+    lines = [f"Issue: {title}"]
+    if evidence_parts:
+        lines.append(f"Evidence: {' '.join(evidence_parts)}")
     if why:
         lines.append(f"Impact: {why}")
     if fix:
-        lines.append(f"How to fix: {fix}")
+        lines.append(f"Recommendation: {fix}")
 
-    return clamp_text("\n\n".join(lines), 1900)
+    return clamp_comment_text("\n\n".join(lines))
 
 
 def render_pipeline_failure_comment(finding: dict[str, Any], target: dict[str, Any]) -> str:
@@ -1839,26 +2004,30 @@ def render_pipeline_failure_comment(finding: dict[str, Any], target: dict[str, A
     location = format_conversation_location(target)
     fix = concise_fix_text(finding)
 
-    lines = [f"Issue: {title}"]
+    evidence_parts = []
     if location and target["github_comment_type"] == "conversation":
-        lines.append(f"Location: `{location}`")
+        evidence_parts.append(f"Location: `{location}`")
     if primary_failure:
-        lines.append(f"Primary failure: {primary_failure}")
+        evidence_parts.append(f"Primary failure: {primary_failure}")
     if additional_failures:
-        lines.append(f"Also failing: {'; '.join(additional_failures[:5])}")
+        evidence_parts.append(f"Also failing: {'; '.join(additional_failures[:5])}")
     if pipeline_line:
-        lines.append(pipeline_line)
+        evidence_parts.append(pipeline_line)
     if code_reference:
-        lines.append(f"Code reference: `{code_reference}`")
+        evidence_parts.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
-        lines.append(f"Current line: `{anchor_text}`")
+        evidence_parts.append(f"Current line: `{anchor_text}`")
+
+    lines = [f"Issue: {title}"]
+    if evidence_parts:
+        lines.append(f"Evidence: {' '.join(evidence_parts)}")
     impact = pipeline_failure_impact_text(finding)
     if impact:
         lines.append(f"Impact: {impact}")
     if fix:
-        lines.append(f"How to fix: {fix}")
+        lines.append(f"Recommendation: {fix}")
 
-    return clamp_text("\n\n".join(lines), 1900)
+    return clamp_comment_text("\n\n".join(lines))
 
 
 def pipeline_job_name_from_finding(finding: dict[str, Any]) -> str:
@@ -1929,6 +2098,8 @@ def pipeline_hook_summary(hook: dict[str, Any]) -> str:
         return "`package-app-dependencies` regenerated packaged dependency files"
     if tool == "notice":
         return "`notice` regenerated dependency notice output"
+    if tool == "build-docs":
+        return "`build-docs` reported generated documentation drift"
     return root_cause if root_cause.startswith(f"`{tool}`") else f"`{tool}` failed"
 
 
@@ -2024,12 +2195,6 @@ def concise_failure_scenario(finding: dict[str, Any]) -> str:
     return concise_comment_text("; ".join(parts), max_chars=500, max_sentences=3)
 
 
-def comment_style_for(finding: dict[str, Any], finding_type: str, target: dict[str, Any]) -> str:
-    if code_suggestion_for(finding, finding_type, target):
-        return "code_comment_with_github_suggestion"
-    return f"{finding_type}_comment_with_suggested_fix"
-
-
 def append_code_suggestion_block(
     body: str,
     finding: dict[str, Any],
@@ -2039,7 +2204,19 @@ def append_code_suggestion_block(
     suggestion = code_suggestion_for(finding, finding_type, target)
     if not suggestion:
         return body
-    return f"{body}\n\n```suggestion\n{suggestion}\n```"
+    candidate = f"{body}\n\n```suggestion\n{suggestion}\n```"
+    if not comment_within_budget(candidate):
+        return body
+    return candidate
+
+
+def comment_within_budget(text: str, *, max_words: int = 200, max_chars: int = 1500) -> bool:
+    return len(text) <= max_chars and len(text.split()) <= max_words
+
+
+def comment_has_required_sections(text: str) -> bool:
+    required = ("Issue:", "Evidence:", "Impact:", "Recommendation:")
+    return all(re.search(rf"(^|\n\n){re.escape(section)}\s+\S", text) for section in required)
 
 
 def code_suggestion_for(finding: dict[str, Any], finding_type: str, target: dict[str, Any]) -> str:
@@ -2147,6 +2324,14 @@ def clamp_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "..."
+
+
+def clamp_comment_text(text: str, *, max_words: int = 200, max_chars: int = 1500) -> str:
+    text = clamp_text(text.strip(), max_chars)
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[: max_words - 1]).rstrip() + "..."
 
 
 def render_comment_plan(plan: dict[str, Any]) -> str:

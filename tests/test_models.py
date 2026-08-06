@@ -124,6 +124,58 @@ class ModelsTest(unittest.TestCase):
 
         self.assertEqual(output["findings"], [])
 
+    def test_review_output_drops_high_label_with_low_numeric_confidence_score(self):
+        output = normalize_review_output(
+            {
+                "overall_status": "needs_review",
+                "findings": [
+                    {
+                        "id": "f1",
+                        "title": "Changed request is missing timeout",
+                        "category": "api_auth_correctness",
+                        "severity": "medium",
+                        "confidence": "high",
+                        "confidence_score": 0.79,
+                        "file": "connector.py",
+                        "line": 10,
+                        "evidence": "`requests.get(url)` was added without a timeout.",
+                        "why_it_matters": "A hung external API call can tie up a SOAR worker.",
+                        "suggested_fix": "Add a bounded `timeout=` to this request.",
+                    }
+                ],
+            },
+            deterministic_findings=[],
+        )
+
+        self.assertEqual(output["findings"], [])
+        self.assertEqual(output["overall_status"], "looks_good")
+
+    def test_review_output_drops_high_label_with_low_string_confidence_score(self):
+        output = normalize_review_output(
+            {
+                "overall_status": "needs_review",
+                "findings": [
+                    {
+                        "id": "f1",
+                        "title": "Changed request is missing timeout",
+                        "category": "api_auth_correctness",
+                        "severity": "medium",
+                        "confidence": "high",
+                        "confidence_score": "0.79",
+                        "file": "connector.py",
+                        "line": 10,
+                        "evidence": "`requests.get(url)` was added without a timeout.",
+                        "why_it_matters": "A hung external API call can tie up a SOAR worker.",
+                        "suggested_fix": "Add a bounded `timeout=` to this request.",
+                    }
+                ],
+            },
+            deterministic_findings=[],
+        )
+
+        self.assertEqual(output["findings"], [])
+        self.assertEqual(output["overall_status"], "looks_good")
+
     def test_review_output_promotes_high_confidence_deterministic_findings(self):
         output = normalize_review_output(
             {

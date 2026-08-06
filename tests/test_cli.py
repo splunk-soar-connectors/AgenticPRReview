@@ -154,7 +154,7 @@ class CLITest(unittest.TestCase):
         self.assertIn("agentic-pr-review:", review_input["comments"]["issue_comments"][0]["body"])
         self.assertTrue(any("before model review" in message for message in progress_messages))
 
-    def test_target_pipeline_publish_keeps_medium_confidence_compile_failure(self):
+    def test_target_pipeline_publish_suppresses_low_score_compile_failure(self):
         class FakeClient:
             def __init__(self):
                 self.bodies = []
@@ -229,11 +229,11 @@ class CLITest(unittest.TestCase):
             )
             plan = json.loads((Path(tmp) / "ci_pipeline_comment_plan.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(result["posted"], 2)
-        self.assertEqual(len(plan["comments"]), 2)
-        self.assertEqual(len(client.bodies), 2)
-        self.assertEqual(review_input["ci"]["published_target_pipeline_jobs"], ["compile", "pre-commit"])
-        self.assertTrue(any("Publishing 2 target pipeline" in message for message in progress_messages))
+        self.assertEqual(result["posted"], 1)
+        self.assertEqual(len(plan["comments"]), 1)
+        self.assertEqual(len(client.bodies), 1)
+        self.assertEqual(review_input["ci"]["published_target_pipeline_jobs"], ["pre-commit"])
+        self.assertTrue(any("Publishing 1 target pipeline" in message for message in progress_messages))
 
     def test_target_pipeline_publish_groups_same_root_cause_jobs_with_all_job_links(self):
         class FakeClient:

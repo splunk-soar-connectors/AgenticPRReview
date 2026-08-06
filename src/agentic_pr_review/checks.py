@@ -5660,6 +5660,7 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
 
         diagnosis = diagnose_target_pipeline_failure(target_name, failure, conclusion)
         source_location = pipeline_failure_source_location(diagnosis.get("details") or [], review_input)
+        diagnosis = reconcile_pipeline_diagnosis_source_location(diagnosis, source_location)
         reason = str(diagnosis.get("reason") or "")
         fix = target_pipeline_suggested_fix(target_name, reason, conclusion, diagnosis=diagnosis)
         url = str(failure.get("html_url") or failure.get("details_url") or failure.get("url") or "").strip() or None
@@ -5706,17 +5707,55 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
     return findings
 
 
+def reconcile_pipeline_diagnosis_source_location(
+    diagnosis: dict[str, Any],
+    source_location: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not source_location:
+        return diagnosis
+    path = str(source_location.get("path") or "")
+    reported_line = source_location.get("reported_line")
+    current_line = source_location.get("line")
+    if not path or not isinstance(reported_line, int) or not isinstance(current_line, int):
+        return diagnosis
+    if reported_line == current_line:
+        return diagnosis
+    old_location = f"{path}:{reported_line}"
+    new_location = f"{path}:{current_line}"
+    return replace_pipeline_location(diagnosis, old_location, new_location)
+
+
+def replace_pipeline_location(value: Any, old_location: str, new_location: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old_location, new_location)
+    if isinstance(value, list):
+        return [replace_pipeline_location(item, old_location, new_location) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: replace_pipeline_location(item, old_location, new_location)
+            for key, item in value.items()
+        }
+    return value
+
+
 def pipeline_failure_source_location(detail_lines: list[str], review_input: dict[str, Any]) -> dict[str, Any] | None:
     anchors = pipeline_source_location_anchors(review_input)
     if not anchors:
         return None
 
+    requires_current_line_match = pipeline_source_location_requires_current_line_match(detail_lines)
     for line in detail_lines:
         for path, line_number in source_locations_in_text(line):
             info = anchors.get(path)
             if not info:
                 continue
             if line_number in info.get("right_lines", set()):
+                current_line = pipeline_entry_text_for_line(info, line_number)
+                if requires_current_line_match and not pipeline_source_line_matches_failure(current_line, detail_lines):
+                    remapped = remap_pipeline_source_location(path, line_number, detail_lines, info, source=line)
+                    if remapped:
+                        return remapped
+                    continue
                 return {
                     "path": path,
                     "line": line_number,
@@ -5737,10 +5776,98 @@ def pipeline_source_location_anchors(review_input: dict[str, Any]) -> dict[str, 
                 continue
             if str(item.get("status") or "") == "removed":
                 continue
-            right_lines = right_side_diff_lines(str(item.get("patch") or ""))
+            right_entries = right_side_diff_entries(str(item.get("patch") or ""))
+            right_lines = {int(entry["line"]) for entry in right_entries}
             if right_lines:
-                anchors[path] = {"right_lines": right_lines}
+                anchors[path] = {"right_lines": right_lines, "right_entries": right_entries}
     return anchors
+
+
+def pipeline_source_location_requires_current_line_match(detail_lines: list[str]) -> bool:
+    detail_text = "\n".join(detail_lines).lower()
+    return any(
+        term in detail_text
+        for term in (
+            "detect-secrets",
+            "detect secrets",
+            "secret type:",
+            "potential secrets",
+        )
+    )
+
+
+def pipeline_entry_text_for_line(info: dict[str, Any], line_number: int) -> str:
+    for entry in info.get("right_entries") or []:
+        if int(entry.get("line") or 0) == line_number:
+            return str(entry.get("text") or "")
+    return ""
+
+
+def pipeline_source_line_matches_failure(line_text: str, detail_lines: list[str]) -> bool:
+    detail_text = "\n".join(detail_lines).lower()
+    if any(term in detail_text for term in ("detect-secrets", "detect secrets", "secret type:", "potential secrets")):
+        return line_looks_like_secret_keyword_hit(line_text)
+    return True
+
+
+def line_looks_like_secret_keyword_hit(line_text: str) -> bool:
+    stripped = line_text.strip()
+    lowered = stripped.lower()
+    if not stripped or stripped.startswith("#"):
+        return False
+    if any(marker in lowered for marker in ("${{ secrets.", "${{secrets.", "secret_name", "secret-name")):
+        return False
+    if not any(
+        word in lowered
+        for word in (
+            "password",
+            "passwd",
+            "secret",
+            "api_key",
+            "api-key",
+            "apikey",
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "private_key",
+            "credential",
+            "token",
+        )
+    ):
+        return False
+    return re.search(r"[:=]\s*['\"]?[^'\"{}\s#][^#\n]*", stripped) is not None
+
+
+def remap_pipeline_source_location(
+    path: str,
+    reported_line: int,
+    detail_lines: list[str],
+    info: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    candidates = []
+    for entry in info.get("right_entries") or []:
+        line_number = int(entry.get("line") or 0)
+        if not line_number:
+            continue
+        if abs(line_number - reported_line) > 20:
+            continue
+        if not pipeline_source_line_matches_failure(str(entry.get("text") or ""), detail_lines):
+            continue
+        candidates.append((abs(line_number - reported_line), 0 if entry.get("kind") == "added" else 1, line_number))
+
+    if not candidates:
+        return None
+
+    _, _, line_number = sorted(candidates)[0]
+    return {
+        "path": path,
+        "line": line_number,
+        "reported_line": reported_line,
+        "source": source,
+        "target_reason": "CI log line was remapped to matching current diff content",
+    }
 
 
 def source_locations_in_text(text: str) -> list[tuple[str, int]]:
@@ -5761,7 +5888,11 @@ def normalize_source_location_path(path: str) -> str:
 
 
 def right_side_diff_lines(patch: str) -> set[int]:
-    lines: set[int] = set()
+    return {int(entry["line"]) for entry in right_side_diff_entries(patch)}
+
+
+def right_side_diff_entries(patch: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
     right_line: int | None = None
     left_line: int | None = None
     hunk_pattern = re.compile(r"^@@ -(?P<left>\d+)(?:,\d+)? \+(?P<right>\d+)(?:,\d+)? @@")
@@ -5774,15 +5905,15 @@ def right_side_diff_lines(patch: str) -> set[int]:
         if right_line is None or left_line is None:
             continue
         if raw_line.startswith("+") and not raw_line.startswith("+++"):
-            lines.add(right_line)
+            entries.append({"line": right_line, "text": raw_line[1:], "kind": "added"})
             right_line += 1
         elif raw_line.startswith("-") and not raw_line.startswith("---"):
             left_line += 1
         elif raw_line.startswith(" "):
-            lines.add(right_line)
+            entries.append({"line": right_line, "text": raw_line[1:], "kind": "context"})
             left_line += 1
             right_line += 1
-    return lines
+    return entries
 
 
 def target_pipeline_failures_from_check_runs(ci: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6199,6 +6330,8 @@ def precommit_hook_root_summary(hook: dict[str, Any]) -> str:
         return "`package-app-dependencies` regenerated packaged dependency files"
     if tool == "notice":
         return "`notice` regenerated dependency notice output"
+    if tool == "build-docs":
+        return "`build-docs` reported generated documentation drift"
     if root_cause.startswith(f"`{tool}`"):
         return root_cause
     return f"`{tool}`: {root_cause}" if root_cause else f"`{tool}` failed"
@@ -6367,6 +6500,10 @@ def is_passing_ci_result_line(line: str) -> bool:
     return re.search(r"\.{5,}\s*(passed|skipped)\b", line.strip(), flags=re.IGNORECASE) is not None
 
 
+def is_ci_result_line(line: str) -> bool:
+    return re.search(r"\.{5,}\s*(passed|failed|skipped|cancelled)\b", line.strip(), flags=re.IGNORECASE) is not None
+
+
 def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str]) -> str:
     detail_text = "\n".join(detail_lines)
     lowered = detail_text.lower()
@@ -6402,9 +6539,15 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
             return f"`semgrep` reported `{semgrep_line}`"
         return "`semgrep` reported a static-analysis failure"
     if tool in {"djlint", "mdformat", "build-docs", "release-notes"}:
-        line = first_line_matching(detail_lines, r"error:|failed|files were modified|[\w./-]+\.(?:md|html|json|txt|py):\d+")
+        specific_detail_lines = [line for line in detail_lines if not is_ci_result_line(line)]
+        line = first_line_matching(
+            specific_detail_lines,
+            r"error:|failed|files were modified|[\w./-]+\.(?:md|html|json|txt|py):\d+",
+        )
         if line:
             return f"`{tool}` reported `{line}`"
+        if tool == "build-docs":
+            return "`build-docs` reported generated documentation drift"
         return f"`{tool}` reported generated-file or formatting drift"
     if tool in {"soar-app-linter", "static-tests"}:
         line = first_line_matching(

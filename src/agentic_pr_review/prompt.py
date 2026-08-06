@@ -207,6 +207,10 @@ High-value review pattern library:
 Strict output rules:
 - The default outcome is zero findings. Return [] unless the supplied context
   proves a concrete, actionable issue.
+- Prefer fewer, higher-confidence findings over exhaustive coverage. It is
+  better to miss a minor issue than to post a speculative or misleading comment.
+- Only return findings with confidence_score >= 0.8. If confidence is below
+  0.8, suppress the finding or describe the uncertainty in model_notes.
 - Do not praise the PR.
 - Do not summarize obvious changes, migrations, file moves, or generated output.
 - Do not report "verify", "confirm", "consider", or "unclear" findings. Put
@@ -214,6 +218,10 @@ Strict output rules:
 - Do not report a finding just because a risky area changed. Report it only
   when the diff, full file, docs, app JSON, comments, or CI excerpts show the
   exact bug or missing artifact.
+- Before returning a finding, verify all of these are true: the issue is
+  introduced or modified by this PR, the cited line is the actual source of the
+  issue, the failure scenario is supported by code/log evidence, and the
+  suggested_fix follows directly from that root cause.
 - Every finding must include a non-null file plus either a changed-line number
   or a concrete code reference such as a function, action identifier, parameter,
   output path, hook name with file path, or commit SHA when commit metadata is
@@ -295,6 +303,13 @@ Evidence rules:
   not include "no action required" items in findings.
 - Do not invent vendor API requirements. If a PR comment or doc link indicates
   an API contract, use it. Otherwise omit the API-contract concern.
+- Do not automatically flag every broad `except Exception:` handler. Report it
+  only when exceptions are silently swallowed, converted into success, important
+  diagnostics are lost, or recovery becomes impossible. If the exception is
+  logged and converted into an explicit connector error, omit it.
+- Only report missing HTTP timeouts when the request call shown in the diff
+  actually lacks a timeout argument. Do not infer missing timeouts solely from
+  surrounding exception handling.
 - Do not return "verify/confirm this" as an active finding. If the evidence only
   supports a verification reminder, put it in model_notes instead.
 - For docs accuracy findings, compare the supplied README/manual docs content
@@ -318,6 +333,16 @@ Evidence rules:
   bumping are separate root causes. Poll controls, checkpointing, container
   labels, artifact metadata, and save return handling are also separate root
   causes unless one changed code path directly connects them into one failure.
+- If multiple candidate findings share the same root cause, return one finding,
+  list all affected locations in evidence/code_reference, and explain the shared
+  root cause once. Do not create multiple findings for the same exception
+  handling flaw, logging issue, timeout issue, CI hook failure, or broad design
+  flaw.
+- When reviewing CI/pre-commit logs, identify the primary blocking failure and
+  additional failed hooks separately. Distinguish generated formatting or
+  packaging drift from developer-action failures such as secrets, syntax,
+  lint, semgrep, or metadata errors. Never summarize a multi-hook pre-commit
+  failure as only a formatter issue.
 - Distinguish correctness from policy. Version bumps and release notes are
   release-management findings unless an explicit repository rule makes them
   merge-blocking. Preferred patterns are not correctness bugs without a concrete
@@ -335,6 +360,9 @@ Evidence rules:
   serious issues already exist.
 - For each finding, set file and line to the exact GitHub comment target when
   possible. Keep suggested_fix short, direct, and contributor-facing.
+- Severity must match proof strength: use critical or high only when the code
+  or CI log clearly demonstrates a severe issue. Classify weaker items as
+  medium, low, informational, or suppress them.
 - For code findings, include suggested_code only when you can provide the exact
   replacement code for the targeted changed line or block. Do not put prose in
   suggested_code. Omit it or set it to null when the fix needs contributor
@@ -415,11 +443,16 @@ def build_synthesis_prompt(
         "instructions": [
             "Merge duplicate findings across chunks.",
             "Drop speculative, weak, already-fixed, README-only, or generic CI findings.",
+            "Drop every finding with confidence_score below 0.8.",
             "Drop behavioral identifier findings when the candidate evidence does not prove the reviewed variable's source, sink, expected runtime value, and failure path.",
             "Do not merge evidence across different identifier roles such as asset ID and application ID unless a supplied assignment trace connects them.",
             "Keep one root cause per finding; split timeout, TLS, logging, rate-limit, test-connectivity, polling, checkpoint, artifact, and version concerns instead of creating mega-findings.",
+            "When multiple candidates share one root cause, keep one finding and mention all affected locations in evidence/code_reference.",
             "Classify each finding with category, review_area, causality, publication_destination, merge_blocking, and root_cause.",
             "Inline destinations require a concrete PR-caused failure scenario; broad design or release-management observations should go to summary/artifact destinations.",
+            "Only report broad exception handling when the supplied code swallows failures, converts them to success, or loses important diagnostics.",
+            "Only report missing timeouts when the changed HTTP request call itself lacks a timeout argument.",
+            "For CI/pre-commit failures, identify the primary blocking failure and additional failed hooks; do not collapse multi-hook failures into a formatter-only issue.",
             "Keep only concrete findings that should be posted to an external contributor.",
             "Prefer exact file/line targets from chunk findings or deterministic findings.",
             "Use CI/check/comment context to confirm whether findings are real blockers.",

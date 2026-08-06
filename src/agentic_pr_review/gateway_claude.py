@@ -1794,6 +1794,8 @@ def build_ci_diagnosis_prompt(
         "- Prefer final failure summaries, retry summaries, and tool-specific error lines over stack frame internals.\n"
         "- Do not infer a code/package problem when the log shows infrastructure, network, or service connectivity failure.\n"
         "- If the excerpt does not prove the root cause, set diagnosis_status to insufficient_evidence and confidence low.\n"
+        "- Use diagnosis_status confirmed only when confidence_score is at least 0.8 and the cited evidence lines directly support the root cause.\n"
+        "- For pre-commit, identify the primary blocking hook and mention additional failed hooks separately; do not summarize multi-hook failures as only formatting.\n"
         "- evidence_lines must be exact or near-exact lines from the supplied excerpt.\n"
         "- suggested_fix must tell the user what concrete thing to change or check.\n\n"
         "Required JSON shape:\n"
@@ -1850,11 +1852,11 @@ def normalize_ci_diagnosis(raw_output: dict[str, Any], *, log_excerpt: str) -> d
 
     if status == "confirmed" and (not evidence_lines or not root_cause or not suggested_fix):
         status = "insufficient_evidence"
+    if status == "confirmed" and confidence_score < 0.8:
+        status = "insufficient_evidence"
     if status != "confirmed":
         confidence = "low"
         confidence_score = min(confidence_score, 0.4)
-    elif confidence == "high" and confidence_score < 0.8:
-        confidence = "medium"
     elif confidence == "medium" and confidence_score >= 0.85:
         confidence_score = 0.84
 

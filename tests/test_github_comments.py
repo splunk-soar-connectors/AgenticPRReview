@@ -147,7 +147,7 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["path"], "connector.py")
         self.assertEqual(comment["line"], 10)
         self.assertEqual(comment["comment_style"], "code_comment_with_github_suggestion")
-        self.assertIn("How to fix:", comment["body"])
+        self.assertIn("Recommendation:", comment["body"])
         self.assertIn("Current line: `new`", comment["body"])
         self.assertIn("```suggestion\nnew = validated_value\n```", comment["body"])
 
@@ -191,7 +191,7 @@ class GitHubCommentsTest(unittest.TestCase):
                 {
                     "filename": "connector.py",
                     "status": "modified",
-                    "patch": "@@ -9,2 +9,2 @@\n context\n-old\n+new\n",
+                    "patch": "@@ -9,2 +9,2 @@\n context\n-old\n+response = requests.get(url)\n",
                 }
             ],
         }
@@ -224,7 +224,7 @@ class GitHubCommentsTest(unittest.TestCase):
                 {
                     "filename": "connector.py",
                     "status": "modified",
-                    "patch": "@@ -9,2 +9,2 @@\n context\n-old\n+new\n",
+                    "patch": "@@ -9,2 +9,2 @@\n context\n-old\n+response = requests.get(url)\n",
                 }
             ],
         }
@@ -238,7 +238,7 @@ class GitHubCommentsTest(unittest.TestCase):
                     "confidence": "high",
                     "file": "connector.py",
                     "line": 10,
-                    "evidence": "`new` starts a request without a timeout.",
+                    "evidence": "`requests.get(url)` was added without a timeout.",
                     "why_it_matters": "A hung request can tie up a worker.",
                     "suggested_fix": "Add a bounded `timeout=` to this request.",
                 }
@@ -248,6 +248,128 @@ class GitHubCommentsTest(unittest.TestCase):
         plan = build_comment_plan(review_output, review_input)
 
         self.assertEqual(len(plan["comments"]), 1)
+
+    def test_high_confidence_label_with_low_numeric_score_is_not_planned(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -9,1 +9,1 @@\n+response = requests.get(url)\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Changed request is missing timeout",
+                    "category": "api_auth_correctness",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "confidence_score": 0.79,
+                    "file": "connector.py",
+                    "line": 9,
+                    "evidence": "`requests.get(url)` was added without a timeout.",
+                    "why_it_matters": "A hung external API call can tie up a SOAR worker.",
+                    "suggested_fix": "Add a bounded `timeout=` to this request.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+
+    def test_comment_body_uses_required_sections_and_word_budget(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -9,1 +9,1 @@\n+response = requests.get(url)\n",
+                }
+            ],
+        }
+        long_text = (
+            "The changed line calls `requests.get(url)` without a `timeout=` argument, "
+            "so the evidence is tied to the current diff. "
+        ) * 20
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Changed request is missing timeout",
+                    "category": "api_auth_correctness",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "confidence_score": 0.95,
+                    "file": "connector.py",
+                    "line": 9,
+                    "evidence": long_text,
+                    "why_it_matters": (
+                        "A hung external API call can tie up a SOAR worker and leave "
+                        "the action running without useful progress."
+                    ),
+                    "suggested_fix": (
+                        "Add a bounded `timeout=` to this request and cover the "
+                        "timeout/error path in the connector tests."
+                    ),
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        body = plan["comments"][0]["body"]
+
+        for section in ("Issue:", "Evidence:", "Impact:", "Recommendation:"):
+            self.assertIn(section, body)
+        self.assertLessEqual(len(body.split()), 200)
+        self.assertLessEqual(len(body), 1500)
+
+    def test_long_suggestion_is_omitted_to_keep_comment_budget(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -9,1 +9,1 @@\n+response = requests.get(url)\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Changed request is missing timeout",
+                    "category": "api_auth_correctness",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "confidence_score": 0.95,
+                    "file": "connector.py",
+                    "line": 9,
+                    "evidence": "`requests.get(url)` was added without a timeout.",
+                    "why_it_matters": "A hung external API call can tie up a SOAR worker.",
+                    "suggested_fix": "Add a bounded `timeout=` to this request.",
+                    "suggested_code": "\n".join(
+                        [f"line_{index} = value" for index in range(120)]
+                    ),
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertNotIn("```suggestion", comment["body"])
+        self.assertEqual(comment["comment_style"], "code_comment_with_suggested_fix")
+        self.assertLessEqual(len(comment["body"].split()), 200)
 
     def test_unconnected_identifier_inference_is_filtered_before_publication(self):
         review_input = {
@@ -332,6 +454,101 @@ class GitHubCommentsTest(unittest.TestCase):
 
         self.assertEqual(len(filtered["findings"]), 1)
         self.assertEqual(len(plan["comments"]), 1)
+
+    def test_missing_timeout_claim_requires_changed_request_call(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,1 +20,2 @@\n"
+                        "+try:\n"
+                        "+    return self._make_rest_call(endpoint)\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "needs_review",
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Exception handling suggests a missing request timeout",
+                    "category": "api_auth_correctness",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "confidence_score": 0.95,
+                    "source": "claude",
+                    "file": "connector.py",
+                    "line": 20,
+                    "evidence": (
+                        "The changed exception path is used to claim the external API "
+                        "call lacks a timeout, but no changed request call is cited."
+                    ),
+                    "why_it_matters": "A hung request can tie up a SOAR worker.",
+                    "suggested_fix": "Add a bounded `timeout=` to the external API request.",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual(
+            filtered["behavioral_verification"]["suppressed_findings"][0]["reason"],
+            "unsupported_missing_timeout_claim",
+        )
+        self.assertEqual(plan["comments"], [])
+
+    def test_broad_exception_claim_requires_supported_failure_mode(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,1 +20,2 @@\n"
+                        "+except Exception as exc:\n"
+                        "+    return action_result.set_status(phantom.APP_ERROR, str(exc))\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "overall_status": "needs_review",
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Broad exception handler catches all exceptions",
+                    "category": "validation",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "confidence_score": 0.95,
+                    "source": "claude",
+                    "file": "connector.py",
+                    "line": 20,
+                    "evidence": "The diff adds `except Exception as exc:`.",
+                    "why_it_matters": "Catching all exceptions can make troubleshooting harder.",
+                    "suggested_fix": "Catch narrower exception types.",
+                }
+            ],
+        }
+
+        filtered = filter_review_output_for_pr_context(review_output, review_input)
+        plan = build_comment_plan(filtered, review_input)
+
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual(
+            filtered["behavioral_verification"]["suppressed_findings"][0]["reason"],
+            "unsupported_broad_exception_claim",
+        )
+        self.assertEqual(plan["comments"], [])
 
     def test_agentic_pr_review_workflow_finding_is_filtered(self):
         review_input = {
@@ -540,7 +757,7 @@ class GitHubCommentsTest(unittest.TestCase):
 
         self.assertIn("Issue: OAuth token request uses the wrong body format", body)
         self.assertIn("Impact:", body)
-        self.assertIn("How to fix:", body)
+        self.assertIn("Recommendation:", body)
         self.assertIn("application/x-www-form-urlencoded", body)
         self.assertIn("Keep `timeout=` on the request", body)
         self.assertIn("Authorization header", body)
@@ -1464,7 +1681,7 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertIn("Pipeline: [`compile` failed job](https://github.example/actions/runs/123/job/99)", comment["body"])
         self.assertIn("Primary failure:", comment["body"])
         self.assertIn("SyntaxError", comment["body"])
-        self.assertIn("How to fix:", comment["body"])
+        self.assertIn("Recommendation:", comment["body"])
         self.assertIn("rerun the compile job", comment["body"])
 
     def test_precommit_pipeline_comment_prioritizes_primary_failed_hook(self):
@@ -1549,7 +1766,7 @@ class GitHubCommentsTest(unittest.TestCase):
         )
         self.assertLess(body.index("Primary failure:"), body.index("Also failing:"))
         self.assertIn("Pipeline: [`pre-commit` failed job](https://github.example/actions/runs/123/job/99)", body)
-        self.assertIn("How to fix: Fix the primary `detect-secrets` failure first", body)
+        self.assertIn("Recommendation: Fix the primary `detect-secrets` failure first", body)
 
     def test_ci_wrapper_precommit_finding_is_not_posted(self):
         review_input = {
@@ -1905,7 +2122,7 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["finding_category"], "introduced_bug")
         self.assertEqual(comment["causality"], "introduced_by_pr")
         self.assertTrue(comment["merge_blocking"])
-        self.assertIn("How to fix:", comment["body"])
+        self.assertIn("Recommendation:", comment["body"])
         self.assertIn("Remove the committed `import pudb`", comment["body"])
 
     def test_broad_polling_redesign_comment_is_not_inline(self):

@@ -406,6 +406,71 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertEqual(finding["file"], ".github/workflows/agentic-pr-review.yml")
         self.assertEqual(finding["line"], 279)
 
+    def test_target_precommit_detect_secrets_remaps_stale_log_line_to_current_diff_line(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -290,0 +290,10 @@\n"
+                        "+          next_phantom_ip: ${{ vars.PHANTOM_INSTANCE_NEXT_OL8_VERSION_IP }}\n"
+                        "+          previous_phantom_ip: ${{ vars.PHANTOM_INSTANCE_PREVIOUS_VERSION_IP }}\n"
+                        "+          phantom_username: ${{ vars.PHANTOM_USERNAME }}\n"
+                        "+          phantom_password: password\n"
+                        "+          is_sdkfied: ${{ needs.detect-app-type.outputs.is_sdkfied }}\n"
+                        "+          uv_lock_directory: ${{ needs.detect-app-type.outputs.uv_lock_directory }}\n"
+                        "+\n"
+                        "+  build:\n"
+                        "+    # connector-template intentionally uses a sentinel app ID and is not a publishable app.\n"
+                        "+    if: needs.resolve-pr-context.outputs.pr_found == 'true' && github.event.repository.name != 'connector-template'\n"
+                    ),
+                }
+            ],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "pre-commit",
+                        "target_name": "pre-commit",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/99",
+                        "steps": [{"name": "Pre-commit", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "Detect secrets...........................................................Failed\n"
+                            "- hook id: detect-secrets\n"
+                            "- exit code: 1\n"
+                            "ERROR: Potential secrets about to be committed to git repo!\n"
+                            "Secret Type: Secret Keyword\n"
+                            "Location:    .github/workflows/agentic-pr-review.yml:299\n"
+                            "build docs...............................................................Failed\n"
+                            "- hook id: build-docs\n"
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        finding = pipeline[0]
+        self.assertEqual(finding["file"], ".github/workflows/agentic-pr-review.yml")
+        self.assertEqual(finding["line"], 293)
+        self.assertEqual(finding["pipeline_source_location"]["reported_line"], 299)
+        self.assertIn(".github/workflows/agentic-pr-review.yml:293", finding["root_cause"])
+        self.assertIn(".github/workflows/agentic-pr-review.yml:293", finding["suggested_fix"])
+        self.assertNotIn(".github/workflows/agentic-pr-review.yml:299", finding["root_cause"])
+        self.assertNotIn(".github/workflows/agentic-pr-review.yml:299", finding["suggested_fix"])
+        self.assertIn("build-docs` reported generated documentation drift", finding["root_cause"])
+        self.assertNotIn("build docs...............................................................Failed", finding["root_cause"])
+
     def test_target_compile_failure_extracts_import_error(self):
         review_input = {
             "pr": {"title": "test", "body": ""},

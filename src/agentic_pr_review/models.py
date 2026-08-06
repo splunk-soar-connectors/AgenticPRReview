@@ -52,6 +52,7 @@ ALLOWED_PUBLICATION_DESTINATIONS = {
     "suppress",
 }
 REQUIRED_TEXT_FIELDS = ("evidence", "why_it_matters", "suggested_fix")
+MIN_PUBLISH_CONFIDENCE_SCORE = 0.8
 SPECULATIVE_PHRASES = (
     "cannot confirm",
     "could not confirm",
@@ -148,8 +149,11 @@ def normalize_confidence(confidence: Any, confidence_score: Any = None) -> tuple
         if score >= 0.55:
             return "medium", score
         return "low", score
-    if isinstance(confidence_score, (int, float)):
-        score = max(0.0, min(1.0, float(confidence_score)))
+    score_provided = False
+    parsed_confidence_score = parse_confidence_score(confidence_score)
+    if parsed_confidence_score is not None:
+        score = parsed_confidence_score
+        score_provided = True
         if not confidence:
             if score >= 0.85:
                 return "high", score
@@ -159,11 +163,24 @@ def normalize_confidence(confidence: Any, confidence_score: Any = None) -> tuple
     else:
         score = 0.5
     label = str(confidence or "medium").lower()
+    if score_provided and label in {"high", "medium", "low"}:
+        return label, score
     if label == "high":
         return "high", max(score, 0.9)
     if label == "low":
         return "low", min(score, 0.35)
     return "medium", score if confidence_score is not None else 0.65
+
+
+def parse_confidence_score(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except ValueError:
+            return None
+    return None
 
 
 def infer_finding_category(raw: dict[str, Any], *, category: str) -> str:
@@ -279,7 +296,7 @@ def merge_promotable_deterministic_findings(
 def should_promote_deterministic_finding(finding: dict[str, Any]) -> bool:
     if str(finding.get("category") or "") == "ci_pipeline_failure":
         return is_actionable_review_finding(finding)
-    if str(finding.get("confidence") or "").lower() != "high":
+    if not has_publishable_confidence(finding):
         return False
     if str(finding.get("category") or "") in {"ci_synthesis"}:
         return False
@@ -308,6 +325,8 @@ def is_actionable_review_finding(finding: dict[str, Any]) -> bool:
     if str(finding.get("finding_category") or "") == "insufficient_evidence":
         return False
     if str(finding.get("publication_destination") or "") == "suppress":
+        return False
+    if not has_publishable_confidence(finding):
         return False
 
     file_path = str(finding.get("file") or "").strip()
@@ -338,7 +357,7 @@ def is_actionable_fileless_finding(finding: dict[str, Any]) -> bool:
     category = str(finding.get("category") or "")
     if category != "ci_pipeline_failure":
         return False
-    if str(finding.get("confidence") or "").lower() not in {"high", "medium"}:
+    if not has_publishable_confidence(finding):
         return False
     if any(not str(finding.get(field) or "").strip() for field in REQUIRED_TEXT_FIELDS):
         return False
@@ -351,6 +370,32 @@ def is_actionable_fileless_finding(finding: dict[str, Any]) -> bool:
     if any(phrase in text for phrase in SPECULATIVE_PHRASES):
         return False
     return True
+
+
+def has_publishable_confidence(finding: dict[str, Any]) -> bool:
+    return review_confidence_score(finding) >= MIN_PUBLISH_CONFIDENCE_SCORE
+
+
+def review_confidence_score(finding: dict[str, Any]) -> float:
+    for key in ("confidence_score", "ci_diagnosis_confidence_score"):
+        value = finding.get(key)
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        if isinstance(value, str):
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except ValueError:
+                pass
+
+    for key in ("confidence", "ci_diagnosis_confidence"):
+        label = str(finding.get(key) or "").lower()
+        if label == "high":
+            return 0.9
+        if label == "medium":
+            return 0.65
+        if label == "low":
+            return 0.35
+    return 0.0
 
 
 def has_pipeline_job_link(finding: dict[str, Any]) -> bool:
