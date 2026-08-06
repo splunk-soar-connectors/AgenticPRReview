@@ -51,7 +51,8 @@ jobs:
               --jq '{number,is_draft:.isDraft,head_ref:.headRefName,head_sha:.headRefOid,head_repo_full_name:.headRepository.nameWithOwner}')
           else
             pr_json=""
-            for attempt in 1 2 3 4 5 6; do
+            max_attempts=25
+            for attempt in $(seq 1 "${max_attempts}"); do
               pr_json=$(gh pr list \
                 --repo "${GH_REPO}" \
                 --state open \
@@ -63,8 +64,10 @@ jobs:
                 break
               fi
 
-              echo "No open PR found yet for ${GH_REPO}@${BRANCH_NAME} on attempt ${attempt}/6."
-              sleep 5
+              echo "No open PR found yet for ${GH_REPO}@${BRANCH_NAME} on attempt ${attempt}/${max_attempts}."
+              if [[ "${attempt}" -lt "${max_attempts}" ]]; then
+                sleep 5
+              fi
             done
           fi
 
