@@ -5697,6 +5697,7 @@ def check_target_pipeline_failures(review_input: dict[str, Any]) -> list[dict[st
                 "ci_diagnosis_confidence_score": diagnosis.get("confidence_score", 0.7),
                 "ci_diagnosis_needs_model": diagnosis.get("needs_model_diagnosis", False),
                 "pipeline_failed_steps": diagnosis.get("failed_steps") or [],
+                "pipeline_failed_hooks": diagnosis.get("failed_hooks") or [],
                 "pipeline_failure_tool": diagnosis.get("tool"),
                 "pipeline_source_location": source_location or None,
                 "pipeline_log_excerpt": str(failure.get("log_excerpt") or "")[:12000],
@@ -5826,9 +5827,16 @@ def normalize_target_pipeline_job(job_name: str) -> str:
 def diagnose_target_pipeline_failure(job_name: str, job: dict[str, Any], conclusion: str) -> dict[str, Any]:
     failed_steps = failed_pipeline_steps(job)
     lines = normalized_pipeline_log_lines(str(job.get("log_excerpt") or ""))
-    tool = detect_pipeline_failure_tool(job_name, lines, failed_steps)
-    detail_lines = pipeline_failure_detail_lines(job_name, lines, tool)
-    root_cause = pipeline_failure_root_cause(job_name, tool, detail_lines)
+    failed_hooks = precommit_failed_hook_failures(lines) if job_name == "pre-commit" else []
+    if failed_hooks:
+        failed_hooks = prioritize_precommit_failed_hooks(failed_hooks)
+        tool = failed_hooks[0]["tool"] if len(failed_hooks) == 1 else "pre-commit"
+        detail_lines = precommit_failed_hook_detail_lines(failed_hooks)
+        root_cause = precommit_failed_hooks_root_cause(failed_hooks)
+    else:
+        tool = detect_pipeline_failure_tool(job_name, lines, failed_steps)
+        detail_lines = pipeline_failure_detail_lines(job_name, lines, tool)
+        root_cause = pipeline_failure_root_cause(job_name, tool, detail_lines)
     confidence, confidence_score = pipeline_failure_diagnosis_confidence(
         job_name,
         tool,
@@ -5857,6 +5865,7 @@ def diagnose_target_pipeline_failure(job_name: str, job: dict[str, Any], conclus
         "needs_model_diagnosis": confidence != "high",
         "reason": " ".join(parts).strip(),
         "failure_scenario": pipeline_failure_scenario(job_name, tool, root_cause, detail_lines, conclusion),
+        "failed_hooks": failed_hooks,
     }
 
 
@@ -5887,10 +5896,28 @@ def pipeline_failure_diagnosis_confidence(
             "uv.lock",
             "release_notes/unreleased.md",
             "invalid json/yaml",
+            "was invoked with",
+            "expected one argument",
         )
     ):
         return "high", 0.95
-    if tool in {"detect-secrets", "ruff-format", "check-json", "check-yaml"}:
+    if tool == "pre-commit":
+        if detail_lines and any(
+            term in f"{root_lower}\n{detail_text}"
+            for term in (
+                "detect-secrets",
+                "secret keyword",
+                "semgrep",
+                "ruff-format",
+                "files were modified",
+                "copyright",
+                "package-app-dependencies",
+                "hook id:",
+            )
+        ):
+            return "high", 0.93
+        return "medium", 0.65
+    if tool in {"detect-secrets", "ruff-format", "check-json", "check-yaml", "copyright", "package-app-dependencies"}:
         return "high", 0.93
     if tool == "ruff" and re.search(r"\b[FEW]\d{3}\b", detail_text):
         return "high", 0.92
@@ -6023,6 +6050,7 @@ def normalize_failure_tool(raw_tool: str) -> str:
     lowered = re.sub(r"\s+", " ", raw_tool.strip().lower())
     lowered = lowered.strip(".:- ")
     aliases = {
+        "copyright": "copyright",
         "detect secrets": "detect-secrets",
         "detect-secrets": "detect-secrets",
         "ruff (legacy alias)": "ruff",
@@ -6033,6 +6061,7 @@ def normalize_failure_tool(raw_tool: str) -> str:
         "djlint linting for django": "djlint",
         "soar app linter": "soar-app-linter",
         "build docs": "build-docs",
+        "update copyright headers": "copyright",
         "update release notes": "release-notes",
         "run static tests": "static-tests",
         "package app dependencies": "package-app-dependencies",
@@ -6045,6 +6074,134 @@ def normalize_failure_tool(raw_tool: str) -> str:
         "semantic-release": "semantic-release",
     }
     return aliases.get(lowered, lowered.replace(" ", "-"))
+
+
+def precommit_failed_hook_failures(lines: list[str]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"(?P<name>.+?)\.{5,}\s*failed\b", lines[index].strip(), flags=re.IGNORECASE)
+        if not match:
+            index += 1
+            continue
+
+        start = index
+        index += 1
+        while index < len(lines):
+            if re.search(r"\.{5,}\s*(passed|failed|skipped|cancelled)\b", lines[index], flags=re.IGNORECASE):
+                break
+            index += 1
+
+        section = lines[start:index]
+        display_name = match.group("name").strip()
+        hook_id = precommit_hook_id(section) or display_name
+        tool = normalize_failure_tool(hook_id)
+        details = precommit_hook_detail_lines(section, tool)
+        root_cause = pipeline_failure_root_cause("pre-commit", tool, details)
+        failures.append(
+            {
+                "tool": tool,
+                "display_name": display_name,
+                "details": details,
+                "root_cause": root_cause or f"`{tool}` failed",
+                "log_order": len(failures),
+            }
+        )
+    return failures
+
+
+def prioritize_precommit_failed_hooks(failed_hooks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(failed_hooks, key=precommit_failed_hook_sort_key)
+
+
+def precommit_failed_hook_sort_key(hook: dict[str, Any]) -> tuple[int, int]:
+    tool = str(hook.get("tool") or "")
+    priorities = {
+        "detect-secrets": 0,
+        "semgrep": 10,
+        "ruff": 20,
+        "check-json": 25,
+        "check-yaml": 25,
+        "soar-app-linter": 30,
+        "static-tests": 30,
+        "python-compile": 30,
+        "ruff-format": 50,
+        "djlint": 55,
+        "mdformat": 55,
+        "copyright": 60,
+        "package-app-dependencies": 65,
+        "notice": 65,
+        "build-docs": 70,
+        "release-notes": 70,
+        "end-of-file-fixer": 80,
+        "trailing-whitespace": 80,
+    }
+    log_order = hook.get("log_order")
+    return priorities.get(tool, 40), int(log_order) if isinstance(log_order, int) else 999
+
+
+def precommit_hook_id(section: list[str]) -> str:
+    for line in section:
+        match = re.search(r"-\s*hook id:\s*([^\s]+)", line, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def precommit_hook_detail_lines(section: list[str], tool: str) -> list[str]:
+    detail_lines = []
+    for line in section:
+        if is_pipeline_detail_line("pre-commit", line, tool):
+            detail_lines.append(line)
+    if not detail_lines:
+        detail_lines = [line for line in section if not is_passing_ci_result_line(line)]
+    output: list[str] = []
+    seen: set[str] = set()
+    for line in detail_lines:
+        compact = line.strip()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        output.append(compact[:500])
+        if len(output) >= 6:
+            break
+    return output
+
+
+def precommit_failed_hook_detail_lines(failed_hooks: list[dict[str, Any]]) -> list[str]:
+    output = []
+    for hook in failed_hooks:
+        tool = str(hook.get("tool") or "")
+        for detail in hook.get("details") or []:
+            output.append(f"`{tool}`: {detail}")
+    return output[:12]
+
+
+def precommit_failed_hooks_root_cause(failed_hooks: list[dict[str, Any]]) -> str:
+    if len(failed_hooks) == 1:
+        return str(failed_hooks[0].get("root_cause") or "")
+    primary = precommit_hook_root_summary(failed_hooks[0])
+    secondary = [precommit_hook_root_summary(hook) for hook in failed_hooks[1:6]]
+    return (
+        f"primary pre-commit failure: {primary}. "
+        f"Additional failed hooks also keep the job red: {'; '.join(secondary)}"
+    )
+
+
+def precommit_hook_root_summary(hook: dict[str, Any]) -> str:
+    tool = str(hook.get("tool") or "")
+    root_cause = str(hook.get("root_cause") or "").strip().rstrip(".")
+    if tool == "ruff-format":
+        return "`ruff-format` reformatted files"
+    if tool == "copyright":
+        return "`copyright` updated copyright headers"
+    if tool == "package-app-dependencies":
+        return "`package-app-dependencies` regenerated packaged dependency files"
+    if tool == "notice":
+        return "`notice` regenerated dependency notice output"
+    if root_cause.startswith(f"`{tool}`"):
+        return root_cause
+    return f"`{tool}`: {root_cause}" if root_cause else f"`{tool}` failed"
 
 
 def pipeline_failure_detail_lines(job_name: str, lines: list[str], tool: str) -> list[str]:
@@ -6228,6 +6385,12 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         return "`ruff` reported lint errors"
     if tool == "ruff-format":
         return "`ruff format` reported files that need formatting"
+    if tool == "copyright":
+        return "`copyright` updated copyright headers"
+    if tool == "package-app-dependencies":
+        return "`package-app-dependencies` regenerated packaged dependency files"
+    if tool == "notice":
+        return "`notice` regenerated dependency notice output"
     if tool in {"check-json", "check-yaml"}:
         syntax_line = first_line_matching(detail_lines, r"\b[\w./-]+\.(?:json|ya?ml):\d+|error:")
         if syntax_line:
@@ -6238,8 +6401,8 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         if semgrep_line:
             return f"`semgrep` reported `{semgrep_line}`"
         return "`semgrep` reported a static-analysis failure"
-    if tool in {"djlint", "mdformat", "build-docs", "release-notes", "package-app-dependencies", "notice"}:
-        line = first_line_matching(detail_lines, r"error:|failed|[\w./-]+\.(?:md|html|json|txt|py):\d+")
+    if tool in {"djlint", "mdformat", "build-docs", "release-notes"}:
+        line = first_line_matching(detail_lines, r"error:|failed|files were modified|[\w./-]+\.(?:md|html|json|txt|py):\d+")
         if line:
             return f"`{tool}` reported `{line}`"
         return f"`{tool}` reported generated-file or formatting drift"
@@ -6255,6 +6418,9 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         network_root_cause = pipeline_install_network_root_cause("compile", detail_text)
         if network_root_cause:
             return network_root_cause
+        argparse_root_cause = pipeline_argparse_root_cause(detail_lines)
+        if argparse_root_cause:
+            return argparse_root_cause
         line = first_line_matching(
             detail_lines,
             r"syntaxerror|modulenotfounderror|importerror|no module named|error:|manifest|soarapps",
@@ -6265,6 +6431,9 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         network_root_cause = pipeline_install_network_root_cause("build", detail_text)
         if network_root_cause:
             return network_root_cause
+        argparse_root_cause = pipeline_argparse_root_cause(detail_lines)
+        if argparse_root_cause:
+            return argparse_root_cause
         line = first_line_matching(detail_lines, r"error:|package build|soarapps|dependency|uv.lock|requirements|wheel")
         if line:
             return f"`build` failed on `{line}`"
@@ -6273,6 +6442,15 @@ def pipeline_failure_root_cause(job_name: str, tool: str, detail_lines: list[str
         if line:
             return f"`semantic-release-preview` failed on `{line}`"
     return ""
+
+
+def pipeline_argparse_root_cause(detail_lines: list[str]) -> str:
+    line = first_line_matching(detail_lines, r": error: argument --[\w-]+: expected one argument")
+    if not line:
+        return ""
+    option = first_regex_group(line, r"argument\s+(--[\w-]+):\s+expected one argument") or "a required option"
+    script = first_regex_group(line, r"^([\w./-]+):\s+error:") or "the pipeline helper"
+    return f"`{script}` was invoked with `{option}` but no value"
 
 
 def pipeline_install_network_root_cause(job_name: str, detail_text: str) -> str:
@@ -6377,10 +6555,19 @@ def target_pipeline_suggested_fix(
             "the linked job for the cancellation source before merging."
         )
     if job_name == "pre-commit":
+        failed_hooks = (diagnosis or {}).get("failed_hooks") if isinstance(diagnosis, dict) else None
+        if isinstance(failed_hooks, list) and failed_hooks:
+            return precommit_failed_hooks_suggested_fix(failed_hooks)
         if tool:
             return precommit_tool_suggested_fix(tool, reason)
         return precommit_suggested_fix(reason)
     if job_name == "compile":
+        if "app-repo-branch" in lowered and ("expected one argument" in lowered or "no value" in lowered):
+            return (
+                "Fix the workflow/action input that builds the compile command so `--app-repo-branch` receives a "
+                "non-empty branch/ref value, or omit that flag when the value is empty. For PR workflows, use the "
+                "pull request head ref/SHA instead of an unset branch variable, then rerun compile."
+            )
         if is_pipeline_network_reason(lowered):
             return (
                 "Check that the configured SOAR/Phantom instance IP is reachable from the CI runner on port 443, "
@@ -6403,6 +6590,12 @@ def target_pipeline_suggested_fix(
             "and rerun compile."
         )
     if job_name == "build":
+        if "app-repo-branch" in lowered and ("expected one argument" in lowered or "no value" in lowered):
+            return (
+                "Fix the workflow/action input that builds the build command so `--app-repo-branch` receives a "
+                "non-empty branch/ref value, or omit that flag when the value is empty. For PR workflows, use the "
+                "pull request head ref/SHA instead of an unset branch variable, then rerun build."
+            )
         if is_pipeline_network_reason(lowered):
             return (
                 "Check that the configured SOAR/Phantom instance IP is reachable from the CI runner on port 443, "
@@ -6477,6 +6670,92 @@ def precommit_tool_suggested_fix(tool: str, evidence: str) -> str:
     if lowered_tool in {"end-of-file-fixer", "trailing-whitespace"}:
         return "Run the pre-commit hook locally and commit the automatic whitespace/end-of-file fix."
     return precommit_suggested_fix(evidence)
+
+
+def precommit_failed_hooks_suggested_fix(failed_hooks: list[dict[str, Any]]) -> str:
+    failed_hooks = prioritize_precommit_failed_hooks([hook for hook in failed_hooks if isinstance(hook, dict)])
+    tools = [str(hook.get("tool") or "") for hook in failed_hooks if isinstance(hook, dict)]
+    tool_set = set(tools)
+    steps = []
+
+    if "detect-secrets" in tool_set:
+        locations = precommit_hook_source_locations(failed_hooks, "detect-secrets")
+        location_text = f" at {format_backticked_list(locations)}" if locations else ""
+        steps.append(
+            "Fix the primary `detect-secrets` failure first: remove the secret-like value"
+            f"{location_text}, or add an inline allowlist/baseline update only after confirming it is a false positive."
+        )
+    else:
+        steps.append("Run `pre-commit run --all-files --show-diff-on-failure` locally.")
+
+    generated_hooks = [
+        tool
+        for tool in tools
+        if tool
+        in {
+            "ruff-format",
+            "copyright",
+            "package-app-dependencies",
+            "notice",
+            "mdformat",
+            "build-docs",
+            "release-notes",
+        }
+    ]
+    if generated_hooks:
+        steps.append(
+            "Then run `pre-commit run --all-files --show-diff-on-failure` locally and commit the generated changes "
+            f"from {format_backticked_list(generated_hooks)}."
+        )
+
+    if "ruff" in tool_set:
+        steps.append("Apply the reported ruff lint fixes at the named file/line.")
+    if "semgrep" in tool_set:
+        steps.append("Apply the semgrep-reported code change, or suppress it only with a clear false-positive justification.")
+
+    remaining = [
+        tool
+        for tool in tools
+        if tool and tool not in set(generated_hooks) | {"detect-secrets", "ruff", "semgrep"}
+    ]
+    if remaining:
+        steps.append(f"Fix the reported failure from {format_backticked_list(remaining)}.")
+
+    steps.append("Rerun pre-commit after committing those changes.")
+    return " ".join(steps)
+
+
+def precommit_hook_source_locations(failed_hooks: list[dict[str, Any]], tool: str) -> list[str]:
+    locations = []
+    seen = set()
+    for hook in failed_hooks:
+        if not isinstance(hook, dict) or str(hook.get("tool") or "") != tool:
+            continue
+        for detail in hook.get("details") or []:
+            for path, line in source_locations_in_text(str(detail)):
+                location = f"{path}:{line}"
+                if location not in seen:
+                    seen.add(location)
+                    locations.append(location)
+    return locations[:3]
+
+
+def format_backticked_list(values: list[str]) -> str:
+    unique = []
+    seen = set()
+    for value in values:
+        value = str(value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(f"`{value}`")
+    if not unique:
+        return ""
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) == 2:
+        return f"{unique[0]} and {unique[1]}"
+    return f"{', '.join(unique[:-1])}, and {unique[-1]}"
 
 
 def check_precommit_failures(review_input: dict[str, Any]) -> list[dict[str, Any]]:

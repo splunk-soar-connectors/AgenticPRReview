@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -382,7 +384,13 @@ def publish_target_pipeline_failure_comments(
         return None
 
     progress(f"Target pipeline failure notification planned for {len(pipeline_findings)} failed job(s).")
-    review_output = deterministic_only_output(pipeline_findings)
+    publish_findings = group_target_pipeline_findings_for_publication(pipeline_findings)
+    if len(publish_findings) != len(pipeline_findings):
+        progress(
+            f"Target pipeline failure notification grouped {len(pipeline_findings)} failed job(s) "
+            f"into {len(publish_findings)} root-cause comment(s)."
+        )
+    review_output = deterministic_only_output(publish_findings)
     comment_plan = build_comment_plan(review_output, review_input, max_comments=None)
     write_json(run_dir / "ci_pipeline_comment_plan.json", comment_plan)
     planned_count = len(comment_plan.get("comments") or [])
@@ -632,9 +640,16 @@ def record_successfully_published_target_pipeline_jobs(
     for comment in comment_plan.get("comments", []) or []:
         if str(comment.get("id") or "") not in successful_ids:
             continue
-        job = normalize_pipeline_job_name(target_job_name_from_finding(comment))
-        if job:
-            jobs.add(job)
+        comment_jobs = comment.get("pipeline_failed_jobs")
+        if isinstance(comment_jobs, list):
+            for item in comment_jobs:
+                job = normalize_pipeline_job_name(item)
+                if job:
+                    jobs.add(job)
+        else:
+            job = normalize_pipeline_job_name(target_job_name_from_finding(comment))
+            if job:
+                jobs.add(job)
 
     if jobs:
         ci = review_input.get("ci")
@@ -654,6 +669,138 @@ def normalize_pipeline_job_name(name: Any) -> str:
         if normalized in aliases:
             return job
     return normalized
+
+
+def group_target_pipeline_findings_for_publication(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for finding in findings:
+        key = target_pipeline_shared_reason_key(finding)
+        if key:
+            grouped.setdefault(key, []).append(finding)
+        else:
+            passthrough.append(finding)
+
+    output = passthrough[:]
+    for _key, items in grouped.items():
+        if len(items) == 1:
+            output.append(items[0])
+        else:
+            output.append(merge_target_pipeline_findings(items))
+    return output
+
+
+def target_pipeline_shared_reason_key(finding: dict[str, Any]) -> str:
+    job_name = normalize_pipeline_job_name(target_job_name_from_finding(finding))
+    root_cause = normalize_shared_pipeline_reason(finding.get("root_cause"), job_name=job_name)
+    suggested_fix = normalize_shared_pipeline_reason(finding.get("suggested_fix"), job_name=job_name)
+    if not root_cause:
+        return ""
+    generic_phrases = (
+        "did not prove a more specific root cause",
+        "ended without a passing result",
+        "open the linked",
+        "fix the first terminal failure",
+    )
+    if any(phrase in root_cause for phrase in generic_phrases):
+        return ""
+    return f"{root_cause}|{suggested_fix}"
+
+
+def normalize_shared_pipeline_reason(value: Any, *, job_name: str = "") -> str:
+    text = " ".join(str(value or "").strip().lower().split())
+    if not text:
+        return ""
+    text = text.replace("`", "")
+    text = re.sub(r"https?://\S+", "<url>", text)
+    job_aliases = pipeline_job_name_variants(job_name)
+    for alias in sorted(job_aliases, key=len, reverse=True):
+        if alias:
+            text = re.sub(rf"\b{re.escape(alias)}\b", "<job>", text)
+    return text
+
+
+def pipeline_job_name_variants(job_name: str) -> set[str]:
+    if not job_name:
+        return set()
+    variants = {job_name}
+    spaced = job_name.replace("-", " ")
+    if spaced != job_name:
+        variants.add(spaced)
+    if job_name == "pre-commit":
+        variants.update({"precommit", "pre commit"})
+    if job_name == "semantic-release-preview":
+        variants.update({"semantic release preview", "semantic-release", "semantic release"})
+    return variants
+
+
+def merge_target_pipeline_findings(findings: list[dict[str, Any]]) -> dict[str, Any]:
+    items = sorted(findings, key=lambda item: normalize_pipeline_job_name(target_job_name_from_finding(item)))
+    jobs = [normalize_pipeline_job_name(target_job_name_from_finding(item)) for item in items]
+    jobs = [job for job in jobs if job]
+    job_text = ", ".join(f"`{job}`" for job in jobs)
+    first = dict(items[0])
+    digest = hashlib.sha1("|".join(sorted(str(item.get("id") or "") for item in items)).encode("utf-8")).hexdigest()[:12]
+    pipeline_jobs = [
+        {
+            "job": normalize_pipeline_job_name(target_job_name_from_finding(item)),
+            "url": item.get("url"),
+            "evidence": item.get("evidence"),
+            "code_reference": item.get("code_reference"),
+        }
+        for item in items
+    ]
+    first_job = normalize_pipeline_job_name(target_job_name_from_finding(first))
+    root_cause = shared_pipeline_display_text(first.get("root_cause"), first_job)
+    suggested_fix = shared_pipeline_display_text(first.get("suggested_fix"), first_job)
+    evidence_parts = [f"{job_text} failed for the same root cause."]
+    if root_cause:
+        evidence_parts.append(f"Shared root cause: {root_cause.rstrip('.')}.")
+    for item in pipeline_jobs:
+        job = item.get("job")
+        url = item.get("url")
+        if job and url:
+            evidence_parts.append(f"`{job}` failed job: {url}.")
+    first.update(
+        {
+            "id": f"ci-pipeline-shared-{digest}",
+            "title": f"{job_text} pipeline jobs failed for the same root cause",
+            "code_reference": f"GitHub Actions jobs {', '.join(jobs)}",
+            "evidence": " ".join(evidence_parts),
+            "root_cause": root_cause,
+            "observable_failure": (
+                f"The {job_text} jobs cannot pass because {observable_pipeline_reason(root_cause)}."
+                if root_cause
+                else None
+            ),
+            "suggested_fix": suggested_fix,
+            "url": None,
+            "pipeline_failed_jobs": jobs,
+            "pipeline_jobs": pipeline_jobs,
+        }
+    )
+    return first
+
+
+def shared_pipeline_display_text(value: Any, job_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for alias in sorted(pipeline_job_name_variants(job_name), key=len, reverse=True):
+        if not alias:
+            continue
+        text = re.sub(rf"`\s*{re.escape(alias)}\s*`", "the pipeline job", text, flags=re.IGNORECASE)
+        text = re.sub(rf"\b{re.escape(alias)}\b", "the pipeline job", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brerun the pipeline job\b", "rerun the failed jobs", text, flags=re.IGNORECASE)
+    return text
+
+
+def observable_pipeline_reason(root_cause: str) -> str:
+    text = root_cause.strip().rstrip(".")
+    prefix = "the pipeline job failed because "
+    if text.lower().startswith(prefix):
+        return text[len(prefix) :]
+    return text
 
 
 def conservatively_downgrade_low_confidence_pipeline_findings(

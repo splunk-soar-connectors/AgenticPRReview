@@ -664,6 +664,9 @@ def group_related_findings_for_comments(findings: list[dict[str, Any]]) -> list[
     for finding in findings:
         if not isinstance(finding, dict):
             continue
+        if str(finding.get("category") or "") == "ci_pipeline_failure":
+            passthrough.append(finding)
+            continue
         if str(finding.get("severity") or "").lower() == "low":
             continue
         if str(finding.get("confidence") or "").lower() != "high":
@@ -1171,11 +1174,11 @@ def should_skip_posted_comment(finding: dict[str, Any]) -> bool:
         return True
     if not is_actionable_review_finding(finding):
         return True
+    if category == "ci_pipeline_failure":
+        return not has_actionable_pipeline_failure_details(text)
     if confidence in {"medium", "low"}:
         return True
     if category == "ci_synthesis":
-        return True
-    if category == "ci_pipeline_failure" and not has_actionable_pipeline_failure_details(text):
         return True
     if category == "merge_conflict" and is_unhelpful_mergeability_finding(finding):
         return True
@@ -1468,6 +1471,11 @@ def build_comment_for_finding(
         "publication_destination": finding.get("publication_destination"),
         "merge_blocking": finding.get("merge_blocking"),
         "root_cause": finding.get("root_cause"),
+        "pipeline_failed_jobs": finding.get("pipeline_failed_jobs"),
+        "pipeline_jobs": finding.get("pipeline_jobs"),
+        "pipeline_failed_hooks": finding.get("pipeline_failed_hooks"),
+        "pipeline_failure_tool": finding.get("pipeline_failure_tool"),
+        "pipeline_source_location": finding.get("pipeline_source_location"),
         "finding_type": finding_type,
         "comment_style": comment_style_for(finding, finding_type, target),
         "github_comment_type": target["github_comment_type"],
@@ -1774,6 +1782,9 @@ def is_code_path(path: str) -> bool:
 
 
 def render_short_comment(finding: dict[str, Any], finding_type: str, target: dict[str, Any]) -> str:
+    if str(finding.get("category") or "") == "ci_pipeline_failure":
+        return render_pipeline_failure_comment(finding, target)
+
     title = first_sentence(str(finding.get("title") or "Review finding."))
     evidence = concise_comment_text(str(finding.get("evidence") or ""), max_chars=650, max_sentences=3)
     why = concise_comment_text(str(finding.get("why_it_matters") or ""), max_chars=420, max_sentences=2)
@@ -1791,9 +1802,14 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     lines = [f"Issue: {issue_text}"]
     if location and target["github_comment_type"] == "conversation":
         lines.append(f"Location: `{location}`")
-    pipeline_url = str(finding.get("url") or "").strip()
-    if pipeline_url and target["github_comment_type"] == "conversation":
-        lines.append(f"Pipeline: [failed job]({pipeline_url})")
+    if target["github_comment_type"] == "conversation":
+        pipeline_jobs_line = format_pipeline_jobs_line(finding)
+        if pipeline_jobs_line:
+            lines.append(pipeline_jobs_line)
+        else:
+            pipeline_url = str(finding.get("url") or "").strip()
+            if pipeline_url:
+                lines.append(f"Pipeline: [failed job]({pipeline_url})")
     if code_reference:
         lines.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
@@ -1808,6 +1824,150 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
         lines.append(f"How to fix: {fix}")
 
     return clamp_text("\n\n".join(lines), 1900)
+
+
+def render_pipeline_failure_comment(finding: dict[str, Any], target: dict[str, Any]) -> str:
+    job_name = pipeline_job_name_from_finding(finding)
+    job_text = f"`{job_name}`" if job_name else "The pipeline job"
+    title = f"{job_text} pipeline job failed" if job_name else first_sentence(str(finding.get("title") or "Pipeline job failed."))
+    root_cause = concise_comment_text(str(finding.get("root_cause") or ""), max_chars=650, max_sentences=2)
+    primary_failure = primary_pipeline_failure_text(finding) or non_hook_pipeline_primary_failure_text(finding) or root_cause
+    additional_failures = additional_pipeline_failure_texts(finding)
+    pipeline_line = format_pipeline_jobs_line(finding) or format_single_pipeline_job_line(finding, job_name)
+    code_reference = str(finding.get("code_reference") or "").strip()
+    anchor_text = concise_anchor_text(str(target.get("anchor_text") or ""))
+    location = format_conversation_location(target)
+    fix = concise_fix_text(finding)
+
+    lines = [f"Issue: {title}"]
+    if location and target["github_comment_type"] == "conversation":
+        lines.append(f"Location: `{location}`")
+    if primary_failure:
+        lines.append(f"Primary failure: {primary_failure}")
+    if additional_failures:
+        lines.append(f"Also failing: {'; '.join(additional_failures[:5])}")
+    if pipeline_line:
+        lines.append(pipeline_line)
+    if code_reference:
+        lines.append(f"Code reference: `{code_reference}`")
+    if anchor_text and target["github_comment_type"] == "line":
+        lines.append(f"Current line: `{anchor_text}`")
+    impact = pipeline_failure_impact_text(finding)
+    if impact:
+        lines.append(f"Impact: {impact}")
+    if fix:
+        lines.append(f"How to fix: {fix}")
+
+    return clamp_text("\n\n".join(lines), 1900)
+
+
+def pipeline_job_name_from_finding(finding: dict[str, Any]) -> str:
+    code_reference = str(finding.get("code_reference") or "").strip()
+    if code_reference.startswith("GitHub Actions job "):
+        return code_reference.removeprefix("GitHub Actions job ").strip()
+    title = str(finding.get("title") or "").strip()
+    if title.endswith(" pipeline job failed"):
+        return title.removesuffix(" pipeline job failed").strip()
+    return ""
+
+
+def primary_pipeline_failure_text(finding: dict[str, Any]) -> str:
+    failed_hooks = finding.get("pipeline_failed_hooks")
+    if isinstance(failed_hooks, list) and failed_hooks:
+        hook = failed_hooks[0]
+        if isinstance(hook, dict):
+            summary = pipeline_hook_summary(hook)
+            if summary:
+                return summary
+    return ""
+
+
+def non_hook_pipeline_primary_failure_text(finding: dict[str, Any]) -> str:
+    root_cause = str(finding.get("root_cause") or "").strip()
+    title = first_sentence(str(finding.get("title") or "")).strip()
+    if root_cause and root_cause.lower() != title.lower():
+        return root_cause
+
+    observable = str(finding.get("observable_failure") or "").strip()
+    if observable:
+        match = re.search(r"cannot pass because\s+(.+)", observable, flags=re.IGNORECASE)
+        return match.group(1).strip().rstrip(".") if match else observable
+
+    evidence = str(finding.get("evidence") or "")
+    match = re.search(r"Root cause:\s*(.+?)(?:\.\s+Failed job:|$)", evidence, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip().rstrip(".")
+    return ""
+
+
+def additional_pipeline_failure_texts(finding: dict[str, Any]) -> list[str]:
+    failed_hooks = finding.get("pipeline_failed_hooks")
+    if not isinstance(failed_hooks, list) or len(failed_hooks) <= 1:
+        return []
+    summaries = []
+    for hook in failed_hooks[1:]:
+        if not isinstance(hook, dict):
+            continue
+        summary = pipeline_hook_summary(hook)
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def pipeline_hook_summary(hook: dict[str, Any]) -> str:
+    tool = str(hook.get("tool") or "").strip()
+    root_cause = str(hook.get("root_cause") or "").strip().rstrip(".")
+    if not tool:
+        return root_cause
+    if tool == "detect-secrets":
+        return root_cause or "`detect-secrets` reported a potential secret"
+    if tool == "ruff-format":
+        return "`ruff-format` reformatted files"
+    if tool == "copyright":
+        return "`copyright` updated copyright headers"
+    if tool == "package-app-dependencies":
+        return "`package-app-dependencies` regenerated packaged dependency files"
+    if tool == "notice":
+        return "`notice` regenerated dependency notice output"
+    return root_cause if root_cause.startswith(f"`{tool}`") else f"`{tool}` failed"
+
+
+def format_single_pipeline_job_line(finding: dict[str, Any], job_name: str) -> str:
+    pipeline_url = str(finding.get("url") or "").strip()
+    if not pipeline_url:
+        return ""
+    if job_name:
+        return f"Pipeline: [`{job_name}` failed job]({pipeline_url})"
+    return f"Pipeline: [failed job]({pipeline_url})"
+
+
+def pipeline_failure_impact_text(finding: dict[str, Any]) -> str:
+    why = concise_comment_text(str(finding.get("why_it_matters") or ""), max_chars=300, max_sentences=1)
+    if why:
+        return why
+    return "This required upstream pipeline job is failing, so the PR does not have a clean merge signal."
+
+
+def format_pipeline_jobs_line(finding: dict[str, Any]) -> str:
+    pipeline_jobs = finding.get("pipeline_jobs")
+    if not isinstance(pipeline_jobs, list):
+        return ""
+
+    parts = []
+    for item in pipeline_jobs:
+        if not isinstance(item, dict):
+            continue
+        job = str(item.get("job") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not job:
+            continue
+        if url:
+            parts.append(f"`{job}` [failed job]({url})")
+        else:
+            parts.append(f"`{job}` failed job")
+    if not parts:
+        return ""
+    return "Pipeline: " + "; ".join(parts)
 
 
 def concise_fix_text(finding: dict[str, Any]) -> str:

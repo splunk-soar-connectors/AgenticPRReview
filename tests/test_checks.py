@@ -327,6 +327,85 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertEqual(pipeline[0]["file"], ".github/workflows/agentic-pr-review.yml")
         self.assertEqual(pipeline[0]["line"], 206)
 
+    def test_target_precommit_multiple_failed_hooks_are_all_reported(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": "@@ -278,0 +279,1 @@\n+phantom_password: password\n",
+                }
+            ],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "pre-commit",
+                        "target_name": "pre-commit",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/99",
+                        "steps": [{"name": "Pre-commit", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "ruff-format..............................................................Failed\n"
+                            "- hook id: ruff-format\n"
+                            "- files were modified by this hook\n"
+                            "3 files reformatted, 3 files left unchanged\n"
+                            "Detect secrets...........................................................Failed\n"
+                            "- hook id: detect-secrets\n"
+                            "- exit code: 1\n"
+                            "ERROR: Potential secrets about to be committed to git repo!\n"
+                            "Secret Type: Secret Keyword\n"
+                            "Location:    .github/workflows/agentic-pr-review.yml:279\n"
+                            "update copyright headers.................................................Failed\n"
+                            "- hook id: copyright\n"
+                            "- files were modified by this hook\n"
+                            "package app dependencies.................................................Failed\n"
+                            "- hook id: package-app-dependencies\n"
+                            "- files were modified by this hook\n"
+                            "pre-commit hook(s) made changes.\n"
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        finding = pipeline[0]
+        self.assertEqual(finding["pipeline_failure_tool"], "pre-commit")
+        self.assertEqual([hook["tool"] for hook in finding["pipeline_failed_hooks"]], [
+            "detect-secrets",
+            "ruff-format",
+            "copyright",
+            "package-app-dependencies",
+        ])
+        self.assertIn("primary pre-commit failure", finding["root_cause"])
+        self.assertLess(finding["root_cause"].index("detect-secrets"), finding["root_cause"].index("ruff-format"))
+        self.assertIn("ruff-format", finding["root_cause"])
+        self.assertIn("detect-secrets", finding["root_cause"])
+        self.assertIn("Secret Keyword", finding["root_cause"])
+        self.assertIn("copyright", finding["root_cause"])
+        self.assertIn("package-app-dependencies", finding["root_cause"])
+        self.assertIn(".github/workflows/agentic-pr-review.yml:279", finding["suggested_fix"])
+        self.assertTrue(finding["suggested_fix"].startswith("Fix the primary `detect-secrets` failure first"))
+        self.assertLess(finding["suggested_fix"].index("detect-secrets"), finding["suggested_fix"].index("ruff-format"))
+        self.assertIn("ruff-format", finding["suggested_fix"])
+        self.assertIn("copyright", finding["suggested_fix"])
+        self.assertIn("package-app-dependencies", finding["suggested_fix"])
+        self.assertNotEqual(
+            finding["suggested_fix"],
+            "Run `pre-commit run ruff-format --all-files` or `ruff format` locally, commit the formatting changes, and rerun pre-commit.",
+        )
+        self.assertEqual(finding["file"], ".github/workflows/agentic-pr-review.yml")
+        self.assertEqual(finding["line"], 279)
+
     def test_target_compile_failure_extracts_import_error(self):
         review_input = {
             "pr": {"title": "test", "body": ""},
@@ -411,6 +490,51 @@ class DeterministicChecksTest(unittest.TestCase):
         self.assertNotIn("Python/package/metadata", pipeline[0]["suggested_fix"])
         self.assertIsNone(pipeline[0]["file"])
         self.assertIsNone(pipeline[0]["line"])
+
+    def test_target_compile_failure_extracts_missing_app_repo_branch_argument(self):
+        review_input = {
+            "pr": {"title": "test", "body": ""},
+            "changed_files": [],
+            "full_files": {},
+            "comments": {},
+            "ci": {
+                "check_runs": [],
+                "statuses": [],
+                "target_job_failures": [
+                    {
+                        "name": "compile",
+                        "target_name": "compile",
+                        "conclusion": "failure",
+                        "html_url": "https://github.example/actions/runs/123/job/100",
+                        "steps": [{"name": "Compile Traditional App", "conclusion": "failure"}],
+                        "log_excerpt": (
+                            "Run splunk-soar-connectors/.github/.github/actions/compile-app@main\n"
+                            "Install Requirements\n"
+                            "Compile Traditional App\n"
+                            "Run set -e\n"
+                            "usage: compile_app_in_instance.py [-h] [--app-repo-branch APP_REPO_BRANCH]\n"
+                            "                                  [--current-phantom-ip CURRENT_PHANTOM_IP]\n"
+                            "                                  app_repo\n"
+                            "compile_app_in_instance.py: error: argument --app-repo-branch: expected one argument\n"
+                            "Error: Process completed with exit code 2."
+                        ),
+                    }
+                ],
+            },
+        }
+
+        findings = run_deterministic_checks(review_input)
+        pipeline = [finding for finding in findings if finding["category"] == "ci_pipeline_failure"]
+
+        self.assertEqual(len(pipeline), 1)
+        self.assertIn("compile_app_in_instance.py", pipeline[0]["root_cause"])
+        self.assertIn("--app-repo-branch", pipeline[0]["root_cause"])
+        self.assertIn("but no value", pipeline[0]["root_cause"])
+        self.assertEqual(pipeline[0]["confidence"], "high")
+        self.assertFalse(pipeline[0]["ci_diagnosis_needs_model"])
+        self.assertIn("workflow/action input", pipeline[0]["suggested_fix"])
+        self.assertIn("non-empty branch/ref", pipeline[0]["suggested_fix"])
+        self.assertNotIn("Python/package/metadata", pipeline[0]["suggested_fix"])
 
     def test_target_build_failure_extracts_lockfile_error(self):
         review_input = {

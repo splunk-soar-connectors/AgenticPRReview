@@ -1461,11 +1461,95 @@ class GitHubCommentsTest(unittest.TestCase):
 
         self.assertEqual(comment["github_comment_type"], "conversation")
         self.assertEqual(comment["finding_type"], "text")
-        self.assertIn("Pipeline: [failed job](https://github.example/actions/runs/123/job/99)", comment["body"])
-        self.assertIn("Failure scenario:", comment["body"])
+        self.assertIn("Pipeline: [`compile` failed job](https://github.example/actions/runs/123/job/99)", comment["body"])
+        self.assertIn("Primary failure:", comment["body"])
         self.assertIn("SyntaxError", comment["body"])
         self.assertIn("How to fix:", comment["body"])
         self.assertIn("rerun the compile job", comment["body"])
+
+    def test_precommit_pipeline_comment_prioritizes_primary_failed_hook(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [],
+            "comment_anchor_files": [
+                {
+                    "filename": ".github/workflows/agentic-pr-review.yml",
+                    "status": "modified",
+                    "patch": "@@ -278,0 +279,1 @@\n+phantom_password: password\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "ci-precommit",
+                    "title": "pre-commit pipeline job failed",
+                    "category": "ci_pipeline_failure",
+                    "finding_category": "introduced_bug",
+                    "causality": "exposed_by_pr",
+                    "severity": "high",
+                    "confidence": "high",
+                    "merge_blocking": True,
+                    "publication_destination": "inline_blocking",
+                    "file": ".github/workflows/agentic-pr-review.yml",
+                    "line": 279,
+                    "code_reference": "GitHub Actions job pre-commit",
+                    "evidence": (
+                        "`pre-commit` concluded `failure`. Root cause: primary pre-commit failure: "
+                        "`detect-secrets` reported `Secret Keyword` at `.github/workflows/agentic-pr-review.yml:279`."
+                    ),
+                    "root_cause": (
+                        "primary pre-commit failure: `detect-secrets` reported `Secret Keyword` at "
+                        "`.github/workflows/agentic-pr-review.yml:279`. Additional failed hooks also keep the job red: "
+                        "`ruff-format` reformatted files; `copyright` updated copyright headers; "
+                        "`package-app-dependencies` regenerated packaged dependency files"
+                    ),
+                    "pipeline_failed_hooks": [
+                        {
+                            "tool": "detect-secrets",
+                            "root_cause": (
+                                "`detect-secrets` reported `Secret Keyword` at "
+                                "`.github/workflows/agentic-pr-review.yml:279`"
+                            ),
+                        },
+                        {"tool": "ruff-format", "root_cause": "`ruff format` reported files that need formatting"},
+                        {"tool": "copyright", "root_cause": "`copyright` updated copyright headers"},
+                        {
+                            "tool": "package-app-dependencies",
+                            "root_cause": "`package-app-dependencies` regenerated packaged dependency files",
+                        },
+                    ],
+                    "why_it_matters": "The failed required job blocks the PR.",
+                    "suggested_fix": (
+                        "Fix the primary `detect-secrets` failure first: remove the secret-like value at "
+                        "`.github/workflows/agentic-pr-review.yml:279`. Then run `pre-commit run --all-files "
+                        "--show-diff-on-failure` locally and commit the generated changes from `ruff-format`, "
+                        "`copyright`, and `package-app-dependencies`."
+                    ),
+                    "url": "https://github.example/actions/runs/123/job/99",
+                }
+            ]
+        }
+
+        plan = real_build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+        body = comment["body"]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertIn("Issue: `pre-commit` pipeline job failed", body)
+        self.assertIn(
+            "Primary failure: `detect-secrets` reported `Secret Keyword` at `.github/workflows/agentic-pr-review.yml:279`",
+            body,
+        )
+        self.assertIn(
+            "Also failing: `ruff-format` reformatted files; `copyright` updated copyright headers; "
+            "`package-app-dependencies` regenerated packaged dependency files",
+            body,
+        )
+        self.assertLess(body.index("Primary failure:"), body.index("Also failing:"))
+        self.assertIn("Pipeline: [`pre-commit` failed job](https://github.example/actions/runs/123/job/99)", body)
+        self.assertIn("How to fix: Fix the primary `detect-secrets` failure first", body)
 
     def test_ci_wrapper_precommit_finding_is_not_posted(self):
         review_input = {

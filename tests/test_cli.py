@@ -154,6 +154,175 @@ class CLITest(unittest.TestCase):
         self.assertIn("agentic-pr-review:", review_input["comments"]["issue_comments"][0]["body"])
         self.assertTrue(any("before model review" in message for message in progress_messages))
 
+    def test_target_pipeline_publish_keeps_medium_confidence_compile_failure(self):
+        class FakeClient:
+            def __init__(self):
+                self.bodies = []
+
+            def create_issue_comment(self, repo, number, *, body):
+                self.bodies.append(body)
+                return {"html_url": f"https://github.example/{repo}/pull/{number}#issuecomment-{len(self.bodies)}"}
+
+            def add_issue_labels(self, repo, number, labels):
+                return [{"name": labels[0]}]
+
+        progress_messages = []
+        client = FakeClient()
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [],
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+        }
+        deterministic_findings = [
+            {
+                "id": "ci-precommit",
+                "title": "pre-commit pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "finding_category": "introduced_bug",
+                "causality": "exposed_by_pr",
+                "severity": "high",
+                "confidence": "high",
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": None,
+                "line": None,
+                "code_reference": "GitHub Actions job pre-commit",
+                "evidence": "`pre-commit` concluded `failure`. Failed job: https://github.example/actions/runs/123",
+                "why_it_matters": "The pre-commit failure blocks merge.",
+                "suggested_fix": "Fix the detect-secrets failure and rerun pre-commit.",
+                "url": "https://github.example/actions/runs/123",
+            },
+            {
+                "id": "ci-compile",
+                "title": "compile pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "finding_category": "introduced_bug",
+                "causality": "exposed_by_pr",
+                "severity": "high",
+                "confidence": "medium",
+                "confidence_score": 0.55,
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": None,
+                "line": None,
+                "code_reference": "GitHub Actions job compile",
+                "evidence": "`compile` concluded `failure`. Failed job: https://github.example/actions/runs/123",
+                "why_it_matters": "The compile failure blocks merge.",
+                "suggested_fix": (
+                    "Open the linked `compile` job log and fix the first terminal failure summary "
+                    "before rerunning the workflow."
+                ),
+                "url": "https://github.example/actions/runs/123",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = publish_target_pipeline_failure_comments(
+                client,
+                review_input,
+                deterministic_findings,
+                run_dir=Path(tmp),
+                publish_comments=True,
+                allow_duplicates=False,
+                progress=progress_messages.append,
+            )
+            plan = json.loads((Path(tmp) / "ci_pipeline_comment_plan.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["posted"], 2)
+        self.assertEqual(len(plan["comments"]), 2)
+        self.assertEqual(len(client.bodies), 2)
+        self.assertEqual(review_input["ci"]["published_target_pipeline_jobs"], ["compile", "pre-commit"])
+        self.assertTrue(any("Publishing 2 target pipeline" in message for message in progress_messages))
+
+    def test_target_pipeline_publish_groups_same_root_cause_jobs_with_all_job_links(self):
+        class FakeClient:
+            def __init__(self):
+                self.bodies = []
+
+            def create_issue_comment(self, repo, number, *, body):
+                self.bodies.append(body)
+                return {"html_url": f"https://github.example/{repo}/pull/{number}#issuecomment-{len(self.bodies)}"}
+
+            def add_issue_labels(self, repo, number, labels):
+                return [{"name": labels[0]}]
+
+        progress_messages = []
+        client = FakeClient()
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [],
+            "comments": {"issue_comments": [], "review_comments": [], "reviews": []},
+        }
+        deterministic_findings = [
+            {
+                "id": "ci-compile",
+                "title": "compile pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "finding_category": "introduced_bug",
+                "causality": "exposed_by_pr",
+                "severity": "high",
+                "confidence": "high",
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": None,
+                "line": None,
+                "code_reference": "GitHub Actions job compile",
+                "evidence": "`compile` concluded `failure`. Failed job: https://github.example/actions/runs/123/job/1",
+                "root_cause": (
+                    "`compile` failed because the SOAR instance at 10.1.66.159 timed out "
+                    "during app installation."
+                ),
+                "why_it_matters": "The compile failure blocks merge.",
+                "suggested_fix": "Verify network access to the SOAR instance and rerun compile.",
+                "url": "https://github.example/actions/runs/123/job/1",
+            },
+            {
+                "id": "ci-build",
+                "title": "build pipeline job failed",
+                "category": "ci_pipeline_failure",
+                "finding_category": "introduced_bug",
+                "causality": "exposed_by_pr",
+                "severity": "high",
+                "confidence": "high",
+                "merge_blocking": True,
+                "publication_destination": "inline_blocking",
+                "file": None,
+                "line": None,
+                "code_reference": "GitHub Actions job build",
+                "evidence": "`build` concluded `failure`. Failed job: https://github.example/actions/runs/123/job/2",
+                "root_cause": (
+                    "`build` failed because the SOAR instance at 10.1.66.159 timed out "
+                    "during app installation."
+                ),
+                "why_it_matters": "The build failure blocks merge.",
+                "suggested_fix": "Verify network access to the SOAR instance and rerun build.",
+                "url": "https://github.example/actions/runs/123/job/2",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = publish_target_pipeline_failure_comments(
+                client,
+                review_input,
+                deterministic_findings,
+                run_dir=Path(tmp),
+                publish_comments=True,
+                allow_duplicates=False,
+                progress=progress_messages.append,
+            )
+            plan = json.loads((Path(tmp) / "ci_pipeline_comment_plan.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["posted"], 1)
+        self.assertEqual(len(plan["comments"]), 1)
+        self.assertEqual(len(client.bodies), 1)
+        self.assertEqual(plan["comments"][0]["pipeline_failed_jobs"], ["build", "compile"])
+        self.assertEqual(review_input["ci"]["published_target_pipeline_jobs"], ["build", "compile"])
+        self.assertIn("`build` [failed job](https://github.example/actions/runs/123/job/2)", client.bodies[0])
+        self.assertIn("`compile` [failed job](https://github.example/actions/runs/123/job/1)", client.bodies[0])
+        self.assertTrue(any("grouped 2 failed job(s) into 1 root-cause comment(s)" in message for message in progress_messages))
+
     def test_published_precommit_pipeline_comment_suppresses_final_duplicates(self):
         review_input = {
             "ci": {"published_target_pipeline_jobs": ["pre-commit"]},

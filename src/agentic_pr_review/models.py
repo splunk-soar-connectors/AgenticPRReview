@@ -127,6 +127,16 @@ def normalize_finding(raw: dict[str, Any], *, default_source: str) -> dict[str, 
         "repository_rule": normalize_optional_text(raw.get("repository_rule")),
         "source": str(raw.get("source") or default_source),
         "url": raw.get("url"),
+        "ci_diagnosis_confidence": raw.get("ci_diagnosis_confidence"),
+        "ci_diagnosis_confidence_score": raw.get("ci_diagnosis_confidence_score"),
+        "ci_diagnosis_needs_model": raw.get("ci_diagnosis_needs_model"),
+        "pipeline_failed_steps": raw.get("pipeline_failed_steps"),
+        "pipeline_failed_hooks": raw.get("pipeline_failed_hooks"),
+        "pipeline_failure_tool": raw.get("pipeline_failure_tool"),
+        "pipeline_source_location": raw.get("pipeline_source_location"),
+        "pipeline_log_excerpt": raw.get("pipeline_log_excerpt"),
+        "pipeline_failed_jobs": raw.get("pipeline_failed_jobs"),
+        "pipeline_jobs": raw.get("pipeline_jobs"),
     }
 
 
@@ -267,6 +277,8 @@ def merge_promotable_deterministic_findings(
 
 
 def should_promote_deterministic_finding(finding: dict[str, Any]) -> bool:
+    if str(finding.get("category") or "") == "ci_pipeline_failure":
+        return is_actionable_review_finding(finding)
     if str(finding.get("confidence") or "").lower() != "high":
         return False
     if str(finding.get("category") or "") in {"ci_synthesis"}:
@@ -326,11 +338,11 @@ def is_actionable_fileless_finding(finding: dict[str, Any]) -> bool:
     category = str(finding.get("category") or "")
     if category != "ci_pipeline_failure":
         return False
-    if str(finding.get("confidence") or "").lower() != "high":
+    if str(finding.get("confidence") or "").lower() not in {"high", "medium"}:
         return False
     if any(not str(finding.get(field) or "").strip() for field in REQUIRED_TEXT_FIELDS):
         return False
-    if not str(finding.get("url") or "").strip():
+    if not str(finding.get("url") or "").strip() and not has_pipeline_job_link(finding):
         return False
     text = " ".join(
         str(finding.get(field) or "")
@@ -339,6 +351,13 @@ def is_actionable_fileless_finding(finding: dict[str, Any]) -> bool:
     if any(phrase in text for phrase in SPECULATIVE_PHRASES):
         return False
     return True
+
+
+def has_pipeline_job_link(finding: dict[str, Any]) -> bool:
+    pipeline_jobs = finding.get("pipeline_jobs")
+    if not isinstance(pipeline_jobs, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("url") or "").strip() for item in pipeline_jobs)
 
 
 def has_line_or_code_reference(finding: dict[str, Any]) -> bool:
