@@ -53,7 +53,11 @@ class AdaptiveETA:
             model_seconds = remaining_requests * request_estimate
         else:
             minimum_current_remaining = min(30.0, request_estimate * 0.25)
-            current_remaining = max(request_estimate - current_request_elapsed, minimum_current_remaining)
+            if current_request_elapsed > request_estimate:
+                overdue_allowance = max(request_estimate, current_request_elapsed * 0.5)
+                current_remaining = max(minimum_current_remaining, overdue_allowance)
+            else:
+                current_remaining = max(request_estimate - current_request_elapsed, minimum_current_remaining)
             model_seconds = current_remaining + max(0, remaining_requests - 1) * request_estimate
         return model_seconds + self.final_processing_seconds
 

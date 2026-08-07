@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from agentic_pr_review.cli import (
     build_parser,
+    format_review_timing_summary,
     publish_target_pipeline_failure_comments,
     refine_low_confidence_pipeline_findings,
     suppress_redundant_published_pipeline_findings,
@@ -36,6 +37,21 @@ class CLITest(unittest.TestCase):
         args = build_parser().parse_args(["review", "owner/repo", "1"])
 
         self.assertEqual(args.max_published_comments, 0)
+
+    def test_format_review_timing_summary_lists_recorded_stages(self):
+        summary = format_review_timing_summary(
+            125,
+            {
+                "collection": 12,
+                "deterministic_checks": 1,
+                "model_review": 101,
+                "artifact_writing": 2,
+            },
+        )
+
+        self.assertIn("total 00:02:05", summary)
+        self.assertIn("collection 00:00:12", summary)
+        self.assertIn("model review 00:01:41", summary)
 
     def test_write_artifacts_redacts_runtime_secrets(self):
         env = {"CIRCUIT_CLIENT_SECRET": "canary-artifact-secret"}

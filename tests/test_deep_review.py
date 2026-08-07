@@ -3,11 +3,13 @@ import unittest
 
 from agentic_pr_review.deep_review import (
     DeepPRCollector,
+    MANIFEST_PACKET_MAX_LOGICAL_UNITS,
     PACKET_MAX_LOGICAL_UNITS,
     build_chunk_review_input,
     chunk_unified_diff,
     collect_related_python_context_paths,
     dedupe_and_merge_review_chunks,
+    filter_findings_for_chunk,
     generate_unified_diff,
     infer_local_python_import_paths,
     order_circuit_review_chunks,
@@ -527,6 +529,51 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertEqual(stats["coverage"]["covered_logical_unit_count"], len(chunks))
         self.assertEqual(stats["coverage"]["uncovered_logical_unit_ids"], [])
 
+    def test_connector_manifest_json_chunks_merge_into_fewer_bounded_packets(self):
+        chunks = []
+        for index in range(16):
+            line = index * 20 + 10
+            chunks.append(
+                {
+                    "id": f"confluence.json:{index + 1}",
+                    "path": "confluence.json",
+                    "status": "modified",
+                    "chunk_strategy": "json_object",
+                    "logical_unit": f"identifier:action_{index}",
+                    "logical_unit_kind": "json_object",
+                    "logical_unit_start_line": line,
+                    "logical_unit_end_line": line + 8,
+                    "diff": (
+                        f"@@ -{line},3 +{line},3 @@\n"
+                        f' "identifier": "action_{index}",\n'
+                        '- "read_only": true\n'
+                        '+ "read_only": false'
+                    ),
+                    "diff_chars": 120,
+                }
+            )
+
+        merged, stats = dedupe_and_merge_review_chunks(chunks, max_chars=60_000)
+
+        self.assertLessEqual(len(merged), 2)
+        self.assertTrue(
+            all(int(packet.get("packet_logical_unit_count") or 1) <= MANIFEST_PACKET_MAX_LOGICAL_UNITS for packet in merged)
+        )
+        self.assertEqual(stats["coverage"]["covered_logical_unit_count"], len(chunks))
+        self.assertEqual(stats["coverage"]["uncovered_logical_unit_ids"], [])
+
+    def test_chunk_deterministic_findings_exclude_fileless_global_findings(self):
+        chunk = {"id": "connector.py:1", "path": "connector.py"}
+        findings = [
+            {"id": "global-ci", "category": "ci_pipeline_failure", "file": None},
+            {"id": "same-file", "category": "validation", "file": "connector.py"},
+            {"id": "other-file", "category": "validation", "file": "other.py"},
+        ]
+
+        selected = filter_findings_for_chunk(findings, chunk)
+
+        self.assertEqual([finding["id"] for finding in selected], ["same-file"])
+
     def test_packet_planner_excludes_bot_invocation_workflow_from_ai_review(self):
         planned, skipped = plan_circuit_review_chunks(
             [
@@ -678,8 +725,7 @@ class DeepReviewHelpersTest(unittest.TestCase):
         self.assertEqual(len(chunk_input["comments"]["reviews"]), 1)
         self.assertEqual(len(chunk_input["ci"]["failed_check_logs"]), 1)
         self.assertIn("connector.py", chunk_input["ci"]["failed_check_logs"][0]["body"])
-        self.assertLess(len(chunk_input["ci"]["check_runs"][0]["output"]["summary"]), 900)
-        self.assertLess(len(chunk_input["ci"]["check_runs"][0]["output"]["text"]), 1300)
+        self.assertNotIn("check_runs", chunk_input["ci"])
 
     def test_split_chunk_for_adaptive_retry_preserves_all_diff_lines(self):
         diff = generate_unified_diff(

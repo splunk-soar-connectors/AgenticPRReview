@@ -38,6 +38,12 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(eta.remaining_seconds(), 195)
         self.assertEqual(eta.remaining_seconds(current_request_elapsed=20), 175)
 
+    def test_adaptive_eta_accounts_for_overdue_active_request(self):
+        eta = AdaptiveETA(total_requests=2, initial_request_seconds=120, final_processing_seconds=15)
+        eta.complete_request(60)
+
+        self.assertEqual(eta.remaining_seconds(current_request_elapsed=300), 165)
+
     def test_gateway_heartbeat_reports_request_elapsed_time(self):
         class StopAfterFirstHeartbeat:
             def __init__(self):

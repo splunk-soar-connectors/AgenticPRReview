@@ -44,6 +44,11 @@ PACKET_SOFT_DIFF_CHARS = 14_000
 PACKET_HARD_DIFF_CHARS = 26_000
 PACKET_SOFT_ESTIMATED_PROMPT_CHARS = 48_000
 PACKET_HARD_CONTEXT_RANGE_COUNT = 24
+MANIFEST_PACKET_MAX_LOGICAL_UNITS = 10
+MANIFEST_PACKET_SOFT_DIFF_CHARS = 22_000
+MANIFEST_PACKET_HARD_DIFF_CHARS = 30_000
+MANIFEST_PACKET_SOFT_ESTIMATED_PROMPT_CHARS = 58_000
+MANIFEST_PACKET_HARD_CONTEXT_RANGE_COUNT = 36
 ADAPTIVE_PACKET_MAX_LOGICAL_UNITS = 3
 ADAPTIVE_SEMANTIC_HARD_DIFF_CHARS = 12_000
 PYTHON_RELATED_CONTEXT_FILE_LIMIT = 20
@@ -441,6 +446,9 @@ def dedupe_and_merge_review_chunks(
             "hard_diff_chars": PACKET_HARD_DIFF_CHARS,
             "soft_estimated_prompt_chars": PACKET_SOFT_ESTIMATED_PROMPT_CHARS,
             "hard_context_range_count": PACKET_HARD_CONTEXT_RANGE_COUNT,
+            "connector_manifest_max_logical_units": MANIFEST_PACKET_MAX_LOGICAL_UNITS,
+            "connector_manifest_soft_diff_chars": MANIFEST_PACKET_SOFT_DIFF_CHARS,
+            "connector_manifest_soft_estimated_prompt_chars": MANIFEST_PACKET_SOFT_ESTIMATED_PROMPT_CHARS,
         },
         "coverage": build_packet_coverage_summary(deduped, merged),
     }
@@ -496,6 +504,13 @@ def dependency_edge_between(left: dict[str, Any], right: dict[str, Any]) -> dict
 
     if left_path == right_path and left.get("unit") == right.get("unit") and left.get("unit"):
         return {"kind": "same_logical_unit", "strength": "strong", "reason": "same changed logical unit"}
+
+    if left_path == right_path and is_connector_manifest_json_path(left_path):
+        return {
+            "kind": "same_connector_manifest",
+            "strength": "medium",
+            "reason": "same connector manifest JSON file; review adjacent changed objects together",
+        }
 
     if left_path == right_path and left.get("top_scope") and left.get("top_scope") == right.get("top_scope"):
         return {"kind": "same_enclosing_scope", "strength": "strong", "reason": "same enclosing class or section"}
@@ -650,16 +665,26 @@ def split_component_into_balanced_batches(
 
 
 def packet_fits_budget(batch: list[dict[str, Any]], *, max_chars: int, max_units: int) -> bool:
-    if len(batch) > max_units:
+    manifest_packet = is_connector_manifest_packet_batch(batch)
+    effective_max_units = max(max_units, MANIFEST_PACKET_MAX_LOGICAL_UNITS) if manifest_packet else max_units
+    hard_diff_chars = MANIFEST_PACKET_HARD_DIFF_CHARS if manifest_packet else PACKET_HARD_DIFF_CHARS
+    soft_diff_chars = MANIFEST_PACKET_SOFT_DIFF_CHARS if manifest_packet else PACKET_SOFT_DIFF_CHARS
+    soft_prompt_chars = (
+        MANIFEST_PACKET_SOFT_ESTIMATED_PROMPT_CHARS
+        if manifest_packet
+        else PACKET_SOFT_ESTIMATED_PROMPT_CHARS
+    )
+    hard_context_ranges = MANIFEST_PACKET_HARD_CONTEXT_RANGE_COUNT if manifest_packet else PACKET_HARD_CONTEXT_RANGE_COUNT
+    if len(batch) > effective_max_units:
         return False
     diff_chars = merged_diff_chars(batch)
-    if diff_chars > min(max_chars, PACKET_HARD_DIFF_CHARS):
+    if diff_chars > min(max_chars, hard_diff_chars):
         return False
-    if diff_chars > PACKET_SOFT_DIFF_CHARS and len(batch) > 1:
+    if diff_chars > soft_diff_chars and len(batch) > 1:
         return False
-    if packet_context_range_count(batch) > PACKET_HARD_CONTEXT_RANGE_COUNT:
+    if packet_context_range_count(batch) > hard_context_ranges:
         return False
-    return estimate_packet_prompt_chars(batch) <= PACKET_SOFT_ESTIMATED_PROMPT_CHARS
+    return estimate_packet_prompt_chars(batch) <= soft_prompt_chars
 
 
 def chunk_sort_key(chunk: dict[str, Any]) -> tuple[str, int, str]:
@@ -753,6 +778,23 @@ def is_metadata_implementation_pair(left_path: str, right_path: str) -> bool:
     paths = {left_path, right_path}
     suffixes = {PurePosixPath(path).suffix.lower() for path in paths}
     return ".json" in suffixes and any(path.endswith(".py") for path in paths)
+
+
+def is_connector_manifest_json_path(path: str) -> bool:
+    name = PurePosixPath(path).name.lower()
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix != ".json" or "/" in path:
+        return False
+    if name in {"package.json", "tsconfig.json", "manifest.json", "renovate.json"}:
+        return False
+    return True
+
+
+def is_connector_manifest_packet_batch(batch: list[dict[str, Any]]) -> bool:
+    if not batch:
+        return False
+    paths = {str(chunk.get("path") or "") for chunk in batch}
+    return len(paths) == 1 and is_connector_manifest_json_path(next(iter(paths)))
 
 
 def is_test_source_pair(left_path: str, right_path: str) -> bool:
@@ -917,14 +959,32 @@ def chunk_context_ranges(chunk: dict[str, Any]) -> tuple[list[tuple[int, int]], 
 
 
 def dedupe_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    output: list[tuple[int, int]] = []
+    normalized: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
     for start, count in ranges:
         key = (max(1, int(start)), max(1, int(count)))
         if key in seen:
             continue
         seen.add(key)
-        output.append(key)
+        normalized.append(key)
+    if not normalized:
+        return []
+
+    output: list[tuple[int, int]] = []
+    current_start = 0
+    current_end = 0
+    for start, count in sorted(normalized):
+        end = start + count - 1
+        if not output:
+            current_start, current_end = start, end
+            output.append((current_start, current_end - current_start + 1))
+            continue
+        if start <= current_end:
+            current_end = max(current_end, end)
+            output[-1] = (current_start, current_end - current_start + 1)
+            continue
+        current_start, current_end = start, end
+        output.append((current_start, current_end - current_start + 1))
     return output
 
 
@@ -3328,22 +3388,29 @@ def select_chunk_ci(ci: dict[str, Any], path: str) -> dict[str, Any]:
     for key in ("errors", "statuses"):
         value = ci.get(key)
         if isinstance(value, list):
-            output[key] = value[:20]
+            selected = [
+                item
+                for item in value
+                if ci_item_mentions_path(item, path, basename)
+            ][:20]
+            if selected:
+                output[key] = selected
     check_runs = ci.get("check_runs") or []
     if isinstance(check_runs, list):
-        output["check_runs"] = [
+        selected_check_runs = [
             compact_check_run(item)
-            for item in check_runs[:80]
-            if isinstance(item, dict)
-        ]
+            for item in check_runs
+            if isinstance(item, dict) and ci_item_mentions_path(item, path, basename)
+        ][:12]
+        if selected_check_runs:
+            output["check_runs"] = selected_check_runs
     failed_logs = ci.get("failed_check_logs") or []
     if isinstance(failed_logs, list):
         selected_logs = []
         for item in failed_logs:
             if not isinstance(item, dict):
                 continue
-            text = " ".join(str(item.get(key) or "") for key in ("name", "path", "body", "log", "text", "summary"))
-            if path in text or (basename and basename in text):
+            if ci_item_mentions_path(item, path, basename):
                 compact = dict(item)
                 for body_key in ("body", "log", "text", "summary"):
                     if body_key in compact:
@@ -3353,6 +3420,11 @@ def select_chunk_ci(ci: dict[str, Any], path: str) -> dict[str, Any]:
                 break
         output["failed_check_logs"] = selected_logs
     return output
+
+
+def ci_item_mentions_path(item: Any, path: str, basename: str) -> bool:
+    text = str(item)
+    return path in text or (bool(basename) and basename in text)
 
 
 def compact_check_run(item: dict[str, Any]) -> dict[str, Any]:
@@ -3508,8 +3580,15 @@ def filter_findings_for_chunk(deterministic_findings: list[dict[str, Any]], chun
     return [
         finding
         for finding in deterministic_findings
-        if not finding.get("file") or str(finding.get("file")) == path
+        if finding_applies_to_chunk(finding, path)
     ]
+
+
+def finding_applies_to_chunk(finding: dict[str, Any], path: str) -> bool:
+    finding_file = str(finding.get("file") or "")
+    if not finding_file:
+        return False
+    return finding_file == path
 
 
 def dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:

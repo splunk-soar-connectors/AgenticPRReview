@@ -148,7 +148,7 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["line"], 10)
         self.assertEqual(comment["comment_style"], "code_comment_with_github_suggestion")
         self.assertIn("Recommendation:", comment["body"])
-        self.assertIn("Current line: `new`", comment["body"])
+        self.assertIn("Changed line (connector.py:10): `new`", comment["body"])
         self.assertIn("```suggestion\nnew = validated_value\n```", comment["body"])
 
     def test_code_finding_without_exact_code_does_not_add_suggestion_block(self):
@@ -718,7 +718,353 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["github_comment_type"], "line")
         self.assertEqual(comment["path"], "connector.py")
         self.assertEqual(comment["line"], 55)
-        self.assertIn("Current line: `ref_date_str =", comment["body"])
+        self.assertIn("Changed line (connector.py:55): `ref_date_str =", comment["body"])
+
+    def test_inline_anchor_relocates_from_json_object_start_to_offending_field(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,0 +20,4 @@\n"
+                        "+\"lookup_user\": {\n"
+                        "+  \"contains\": [\"email\"]\n"
+                        "+}\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Action metadata uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "connector.json",
+                    "line": 20,
+                    "code_reference": "lookup_user.contains",
+                    "evidence": "The changed `contains` field declares `email`, but this parameter should contain `user name`.",
+                    "changed_line_evidence": "`\"contains\": [\"email\"]` is the changed field that violates the expected metadata.",
+                    "why_it_matters": "SOAR will classify the parameter with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value to the expected metadata type.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["line"], 21)
+        self.assertIn(comment["anchor_validation_status"], {"exact_changed_line", "relocated_exact_changed_line"})
+        self.assertIn("Changed line (connector.json:21): `\"contains\": [\"email\"]`", comment["body"])
+
+    def test_json_section_header_anchor_relocates_to_explicit_changed_field_line(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -100,0 +100,7 @@\n"
+                        "+\"example_action\": {\n"
+                        "+  \"parameters\": [\n"
+                        "+    {\n"
+                        "+      \"name\": \"user\",\n"
+                        "+      \"data_type\": \"string\",\n"
+                        "+      \"contains\": [\"email\"]\n"
+                        "+    }\n"
+                        "+  ]\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Action parameter uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 100,
+                    "code_reference": "example_action.parameters[].contains",
+                    "evidence": "The issue is on app.json:105 where the changed `contains` field declares `email`.",
+                    "changed_line_evidence": "Line 105, `\"contains\": [\"email\"]`, is the changed field that violates the expected metadata.",
+                    "why_it_matters": "SOAR will classify the parameter with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value to the expected metadata type.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "app.json")
+        self.assertEqual(comment["line"], 105)
+        self.assertIn(comment["anchor_validation_status"], {"exact_changed_line", "relocated_exact_changed_line"})
+        self.assertIn("Changed line (app.json:105): `\"contains\": [\"email\"]`", comment["body"])
+
+    def test_json_array_header_anchor_relocates_to_matching_changed_field_snippet(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "metadata.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -50,0 +50,6 @@\n"
+                        "+\"outputs\": [\n"
+                        "+  {\n"
+                        "+    \"name\": \"result\",\n"
+                        "+    \"contains\": [\"email\"]\n"
+                        "+  }\n"
+                        "+]\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Output metadata uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "metadata.json",
+                    "line": 50,
+                    "code_reference": "outputs[].contains",
+                    "evidence": "The changed `\"contains\": [\"email\"]` field uses the wrong artifact metadata.",
+                    "why_it_matters": "SOAR will classify the output with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value to the expected metadata type.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "metadata.json")
+        self.assertEqual(comment["line"], 53)
+        self.assertIn(comment["anchor_validation_status"], {"exact_changed_line", "relocated_exact_changed_line"})
+        self.assertIn("Changed line (metadata.json:53): `\"contains\": [\"email\"]`", comment["body"])
+
+    def test_inline_anchor_corrects_model_line_that_is_off_by_a_few_lines(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -30,0 +30,5 @@\n"
+                        "+\"action\": {\n"
+                        "+  \"parameters\": [\n"
+                        "+    \"data_type\": \"string\",\n"
+                        "+    \"contains\": [\"email\"]\n"
+                        "+  ]\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Parameter metadata uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 30,
+                    "evidence": "The changed `\"contains\": [\"email\"]` field uses the wrong metadata.",
+                    "why_it_matters": "SOAR will classify the parameter with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value to the expected metadata type.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "app.json")
+        self.assertEqual(comment["line"], 33)
+        self.assertIn("Changed line (app.json:33): `\"contains\": [\"email\"]`", comment["body"])
+
+    def test_inline_anchor_falls_back_when_cited_line_does_not_match_evidence(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -40,0 +40,4 @@\n"
+                        "+\"action\": {\n"
+                        "+  \"parameters\": [\n"
+                        "+    \"data_type\": \"string\"\n"
+                        "+  ]\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Parameter metadata uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 40,
+                    "evidence": "The issue is on app.json:42 where the changed `\"contains\": [\"email\"]` field uses the wrong metadata.",
+                    "why_it_matters": "SOAR will classify the parameter with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value to the expected metadata type.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "conversation")
+        self.assertEqual(comment["path"], "app.json")
+        self.assertEqual(comment["anchor_validation_status"], "conversation_fallback")
+        self.assertIn("Anchor note:", comment["body"])
+
+    def test_exact_non_header_changed_line_stays_inline_without_quoted_snippet(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -70,0 +70,2 @@\n"
+                        "+result = client.get_user(user_id)\n"
+                        "+return result\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "The lookup result is returned without status validation",
+                    "category": "validation",
+                    "severity": "medium",
+                    "file": "connector.py",
+                    "line": 70,
+                    "evidence": "The added lookup call result is used without checking whether the request succeeded.",
+                    "why_it_matters": "A failed lookup can be reported as successful output.",
+                    "suggested_fix": "Check the result status before returning data.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "connector.py")
+        self.assertEqual(comment["line"], 70)
+        self.assertEqual(comment["anchor_validation_status"], "exact_changed_line")
+        self.assertIn("Changed line (connector.py:70): `result = client.get_user(user_id)`", comment["body"])
+
+    def test_inline_anchor_on_context_line_falls_back_to_file_comment_when_no_changed_line_matches(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -40,3 +40,3 @@\n"
+                        " def existing_helper():\n"
+                        "-    old_value = 1\n"
+                        "+    new_value = 2\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Existing helper lacks required input guard",
+                    "category": "validation",
+                    "severity": "medium",
+                    "publication_destination": "inline_non_blocking",
+                    "file": "connector.py",
+                    "line": 40,
+                    "code_reference": "existing_helper",
+                    "evidence": "The helper definition is the referenced location, but the modified expression does not itself demonstrate the validation issue.",
+                    "why_it_matters": "Weak validation can allow bad input.",
+                    "suggested_fix": "Add the validation at the specific source expression before publishing this as an inline code issue.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "conversation")
+        self.assertEqual(comment["path"], "connector.py")
+        self.assertEqual(comment["line"], 40)
+        self.assertEqual(comment["anchor_validation_status"], "conversation_fallback")
+        self.assertIn("Anchor note:", comment["body"])
+
+    def test_multiline_suggestion_is_suppressed_even_with_valid_inline_anchor(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -20,0 +20,3 @@\n"
+                        "+\"contains\": [\"email\"]\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Action metadata uses the wrong contains value",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "connector.json",
+                    "line": 20,
+                    "evidence": "`\"contains\": [\"email\"]` is the changed field with the wrong metadata.",
+                    "why_it_matters": "SOAR will classify the parameter with the wrong artifact type.",
+                    "suggested_fix": "Change the `contains` value.",
+                    "suggested_code": "\"contains\": [\n  \"user name\"\n]",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertNotIn("```suggestion", comment["body"])
 
     def test_comment_preserves_concrete_multi_sentence_fix_details(self):
         review_input = {
@@ -829,6 +1175,47 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(len(client.bodies), 1)
         self.assertIn(REDACTED_SECRET, client.bodies[0])
         self.assertNotIn("canary-comment-secret", client.bodies[0])
+
+    def test_publish_downgrades_unvalidated_inline_anchor_to_issue_comment(self):
+        class FakeClient:
+            def __init__(self):
+                self.issue_comments = []
+
+            def create_pull_request_line_comment(self, *args, **kwargs):
+                raise AssertionError("unvalidated inline anchor should not be sent to GitHub")
+
+            def create_issue_comment(self, repo, number, *, body):
+                self.issue_comments.append((repo, number, body))
+                return {"html_url": f"https://github.example/{repo}/pull/{number}#issuecomment-1"}
+
+            def add_issue_labels(self, repo, number, labels):
+                return [{"name": labels[0], "url": f"https://github.example/{repo}/labels/{labels[0]}"}]
+
+        client = FakeClient()
+        plan = {
+            "repo": "owner/repo",
+            "pr_number": 1,
+            "head_sha": "abc",
+            "comments": [
+                {
+                    "id": "f1",
+                    "github_comment_type": "line",
+                    "path": "app.json",
+                    "line": 100,
+                    "side": "RIGHT",
+                    "body": "Issue: bad anchor\n\nEvidence: Changed line (app.json:100): `\"action\": {`\n\nImpact: confusing review.\n\nRecommendation: use the exact line.",
+                    "marker": "<!-- agentic-pr-review:f1 -->",
+                    "anchor_validation_status": "conversation_fallback",
+                    "line_kind": "added",
+                }
+            ],
+        }
+
+        result = publish_comment_plan(client, plan, {"comments": {}})
+
+        self.assertEqual(result["posted"], 1)
+        self.assertEqual(result["results"][0]["status"], "posted_fallback_unvalidated_anchor")
+        self.assertEqual(len(client.issue_comments), 1)
 
     def test_publish_skips_ai_reviewed_label_when_no_comment_was_posted(self):
         class FakeClient:
@@ -2251,7 +2638,7 @@ class GitHubCommentsTest(unittest.TestCase):
 
         self.assertEqual(comment["publication_destination"], "inline_non_blocking")
         self.assertIn("timeout=", comment["body"])
-        self.assertIn("Failure scenario:", comment["body"])
+        self.assertIn("Runtime evidence:", comment["body"])
 
     def test_collect_existing_markers(self):
         review_input = {

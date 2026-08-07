@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import random
 import re
+import socket
 import threading
 import time
 from typing import Any, Callable
@@ -239,6 +240,10 @@ class GatewayClaudeReviewer:
             "packet_cache_misses": 0,
             "packet_cache_writes": 0,
             "packet_cache_errors": 0,
+            "adaptive_subchunks_created": 0,
+            "proactive_subchunks_created": 0,
+            "fallback_chunk_outputs": 0,
+            "model_request_timeouts": 0,
             "transient_retries": 0,
             "non_json_responses": 0,
             "json_repair_model_calls": 0,
@@ -312,6 +317,7 @@ class GatewayClaudeReviewer:
         deep_concurrency: int = 1,
         checkpoint_path: str | Path | None = None,
     ) -> dict[str, Any]:
+        model_review_started = time.monotonic()
         chunks = list(((review_input.get("deep_review") or {}).get("chunks")) or [])
         if max_chunks > 0:
             chunks = chunks[:max_chunks]
@@ -414,6 +420,7 @@ class GatewayClaudeReviewer:
             for chunk_id, output in output_by_chunk_id.items()
             if ":retry-" in chunk_id
         }
+        chunk_review_started = time.monotonic()
         if remaining_chunks:
             self._review_deep_chunks(
                 review_input,
@@ -427,6 +434,7 @@ class GatewayClaudeReviewer:
             )
         elif checkpoint is not None:
             checkpoint.save(output_by_chunk_id, chunks, status="chunks_complete")
+        chunk_review_seconds = time.monotonic() - chunk_review_started
 
         chunk_outputs = [
             output_by_chunk_id[str(chunk.get("id") or "")]
@@ -454,7 +462,14 @@ class GatewayClaudeReviewer:
             self.progress(f"Synthesis failed; using deduplicated chunk findings: {safe_error}")
             final_output = fallback_deep_output(deterministic_findings, chunk_outputs, model_notes=safe_error)
         synthesis_elapsed = format_duration(time.monotonic() - synthesis_started)
+        synthesis_seconds = time.monotonic() - synthesis_started
         self.progress(f"Synthesis completed in {synthesis_elapsed}.")
+        model_metrics = self._model_metrics_snapshot()
+        model_metrics["phase_seconds"] = {
+            "chunk_review": chunk_review_seconds,
+            "synthesis": synthesis_seconds,
+            "model_review_total": time.monotonic() - model_review_started,
+        }
         final_output["deep_review"] = {
             "enabled": True,
             "chunk_count": original_chunk_count,
@@ -471,9 +486,18 @@ class GatewayClaudeReviewer:
                 skipped_chunks=skipped_model_chunks,
                 chunk_outputs=chunk_outputs,
             ),
-            "model_metrics": self._model_metrics_snapshot(),
+            "model_metrics": model_metrics,
         }
         final_output["chunk_review_outputs"] = chunk_outputs
+        self.progress(
+            build_model_efficiency_summary(
+                original_chunk_count=original_chunk_count,
+                planned_chunk_count=total_chunks,
+                reviewed_chunk_count=len(chunk_outputs),
+                skipped_chunk_count=len(skipped_model_chunks),
+                metrics=model_metrics,
+            )
+        )
         return final_output
 
     def _review_deep_chunks(
@@ -592,46 +616,10 @@ class GatewayClaudeReviewer:
                 f"with {finding_count} finding(s); estimated whole-review time remaining: {self._eta_text()}."
             )
             return output
-        estimated_request_seconds = self._estimated_request_seconds_for_prompt(len(chunk_prompt))
         can_split_for_adaptive_retry = can_adaptively_split_chunk(
             chunk,
-            max_chars=PROACTIVE_SUBCHUNK_DIFF_CHARS,
+            max_chars=18_000,
         )
-        if should_proactively_subchunk(
-            chunk,
-            chunk_prompt,
-            chunk_deterministic,
-            estimated_request_seconds=estimated_request_seconds,
-        ) and can_split_for_adaptive_retry:
-            output = self._review_chunk_as_adaptive_subchunks(
-                review_input,
-                deterministic_findings,
-                chunk,
-                parent_position=position,
-                parent_total=total_chunks,
-                original_error=GatewayTransientModelError(
-                    "Proactively split timeout-risk CIRCUIT packet before first model request."
-                ),
-                proactive=True,
-                restored_subchunk_outputs=restored_subchunk_outputs,
-                on_subchunk_output=on_subchunk_output,
-            )
-            output = dict(output)
-            output["chunk_id"] = chunk.get("id")
-            output["chunk_path"] = chunk.get("path")
-            output["chunk_index"] = chunk.get("chunk_index")
-            output["chunk_total"] = chunk.get("chunk_total")
-            output["cache_hit"] = False
-            output["cache_key"] = cache_key
-            if output.pop("_packet_cacheable", True):
-                self._save_packet_cache(cache_key, output)
-            chunk_elapsed = format_duration(time.monotonic() - chunk_started)
-            finding_count = len(output.get("findings") or [])
-            self.progress(
-                f"Deep-review chunk {position}/{total_chunks} completed in {chunk_elapsed} "
-                f"with {finding_count} finding(s); estimated whole-review time remaining: {self._eta_text()}."
-            )
-            return output
         cacheable_output = True
         try:
             output = self._invoke_review(
@@ -656,6 +644,8 @@ class GatewayClaudeReviewer:
                     f"Deep-review chunk {position}/{total_chunks} for {path} could not be split into multiple "
                     "meaningful adaptive subchunks; retaining deterministic findings for this packet."
                 )
+                self._increment_model_metric("fallback_chunk_outputs")
+                self._skip_eta_requests(1)
                 output = fallback_chunk_transient_output(chunk, chunk_deterministic, exc)
                 cacheable_output = False
         except GatewayModelFormatError as exc:
@@ -675,6 +665,8 @@ class GatewayClaudeReviewer:
                     f"Deep-review chunk {position}/{total_chunks} for {path} returned malformed JSON after "
                     "recovery and could not be split; retaining deterministic findings for this packet."
                 )
+                self._increment_model_metric("fallback_chunk_outputs")
+                self._skip_eta_requests(1)
                 output = fallback_chunk_format_output(chunk, chunk_deterministic, exc)
                 cacheable_output = False
         output = dict(output)
@@ -715,6 +707,9 @@ class GatewayClaudeReviewer:
         if len(subchunks) <= 1:
             raise original_error
         self._add_eta_requests(max(0, len(subchunks) - 1))
+        self._increment_model_metric("adaptive_subchunks_created", len(subchunks))
+        if proactive:
+            self._increment_model_metric("proactive_subchunks_created", len(subchunks))
         if proactive:
             for subchunk in subchunks:
                 subchunk["proactive_review"] = True
@@ -742,6 +737,7 @@ class GatewayClaudeReviewer:
             if restored_subchunk_outputs and subchunk_id in restored_subchunk_outputs:
                 sub_output = dict(restored_subchunk_outputs[subchunk_id])
                 sub_outputs.append(sub_output)
+                self._skip_eta_requests(1)
                 self.progress(
                     f"Adaptive subchunk {sub_position}/{len(subchunks)} restored for {path} "
                     f"with {len(sub_output.get('findings') or [])} finding(s)."
@@ -778,6 +774,8 @@ class GatewayClaudeReviewer:
                         f"Adaptive subchunk {sub_position}/{len(subchunks)} for {path} still hit a transient "
                         "gateway failure; retaining deterministic findings for this slice."
                     )
+                    self._increment_model_metric("fallback_chunk_outputs")
+                    self._skip_eta_requests(1)
                     sub_output = fallback_chunk_transient_output(subchunk, sub_deterministic, exc)
                     sub_cacheable = False
             sub_output = dict(sub_output)
@@ -812,6 +810,7 @@ class GatewayClaudeReviewer:
         deterministic_findings: list[dict[str, Any]],
         *,
         request_max_attempts: int | None = None,
+        request_timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         body = self._model_body(user_prompt)
         heartbeat_stop = threading.Event()
@@ -827,7 +826,11 @@ class GatewayClaudeReviewer:
             heartbeat_thread.start()
         request_succeeded = False
         try:
-            response_payload = self._post_model_json(body, max_attempts=request_max_attempts)
+            response_payload = self._post_model_json(
+                body,
+                max_attempts=request_max_attempts,
+                timeout_seconds=request_timeout_seconds or self.config.gateway_review_request_timeout_seconds,
+            )
             request_succeeded = True
             self._increment_model_metric("successful_model_calls")
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
@@ -867,7 +870,8 @@ class GatewayClaudeReviewer:
             try:
                 self._increment_model_metric("new_chat_retries")
                 fresh_payload = self._post_model_json(
-                    self._model_body(build_fresh_chat_retry_prompt(original_user_prompt))
+                    self._model_body(build_fresh_chat_retry_prompt(original_user_prompt)),
+                    timeout_seconds=self.config.gateway_review_request_timeout_seconds,
                 )
                 fresh_text = extract_chat_completion_text(fresh_payload)
                 raw_output = extract_json_object(fresh_text)
@@ -878,7 +882,10 @@ class GatewayClaudeReviewer:
         self.progress("Gateway model returned non-JSON; attempting one JSON repair request.")
         try:
             self._increment_model_metric("json_repair_model_calls")
-            repair_payload = self._post_model_json(self._model_body(build_json_repair_prompt(previous_text)))
+            repair_payload = self._post_model_json(
+                self._model_body(build_json_repair_prompt(previous_text)),
+                timeout_seconds=self.config.gateway_review_request_timeout_seconds,
+            )
             repair_text = extract_chat_completion_text(repair_payload)
             raw_output = extract_json_object(repair_text)
             return raw_output, repair_payload, "Recovered from a non-JSON model response with one JSON repair retry."
@@ -887,7 +894,10 @@ class GatewayClaudeReviewer:
 
         try:
             self._increment_model_metric("strict_json_retry_calls")
-            retry_payload = self._post_model_json(self._model_body(build_strict_json_retry_prompt(original_user_prompt)))
+            retry_payload = self._post_model_json(
+                self._model_body(build_strict_json_retry_prompt(original_user_prompt)),
+                timeout_seconds=self.config.gateway_review_request_timeout_seconds,
+            )
             retry_text = extract_chat_completion_text(retry_payload)
             raw_output = extract_json_object(retry_text)
             return raw_output, retry_payload, "Recovered from a non-JSON model response with a strict JSON retry."
@@ -951,19 +961,29 @@ class GatewayClaudeReviewer:
             return {"type": "json_object"}
         return None
 
-    def _post_model_json(self, body: dict[str, Any], *, max_attempts: int | None = None) -> dict[str, Any]:
+    def _post_model_json(
+        self,
+        body: dict[str, Any],
+        *,
+        max_attempts: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         max_attempts = max(1, int(max_attempts or self.config.gateway_request_max_attempts))
+        request_timeout = max(1, int(timeout_seconds or self.config.gateway_request_timeout_seconds))
         attempt = 1
         auth_refreshed = False
         while True:
             try:
-                return self._post_model_json_once(body)
+                return self._post_model_json_once(body, timeout_seconds=request_timeout)
             except HTTPError as exc:
                 downgraded_body = self._downgrade_response_format_after_rejection(exc, body)
                 if downgraded_body is not None:
                     body = downgraded_body
                     continue
                 if exc.code not in GATEWAY_AUTH_RETRY_STATUS_CODES or auth_refreshed:
+                    if exc.code in GATEWAY_TRANSIENT_STATUS_CODES:
+                        if exc.code == 408:
+                            self._increment_model_metric("model_request_timeouts")
                     if exc.code in GATEWAY_TRANSIENT_STATUS_CODES and attempt < max_attempts:
                         delay = retry_after_delay_seconds(exc)
                         if delay is None:
@@ -988,6 +1008,8 @@ class GatewayClaudeReviewer:
                 auth_refreshed = True
                 continue
             except (TimeoutError, URLError, OSError) as exc:
+                if is_timeout_exception(exc):
+                    self._increment_model_metric("model_request_timeouts")
                 if attempt >= max_attempts:
                     raise
                 delay = transient_retry_delay_seconds(
@@ -1040,7 +1062,7 @@ class GatewayClaudeReviewer:
             return next_body
         return None
 
-    def _post_model_json_once(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _post_model_json_once(self, body: dict[str, Any], *, timeout_seconds: int | None = None) -> dict[str, Any]:
         self._increment_model_metric("model_http_attempts")
         request = Request(
             str(self.config.gateway_base_url),
@@ -1048,7 +1070,8 @@ class GatewayClaudeReviewer:
             headers=self._model_headers(),
             method="POST",
         )
-        with urlopen(request, timeout=self.config.gateway_request_timeout_seconds) as response:
+        request_timeout = max(1, int(timeout_seconds or self.config.gateway_request_timeout_seconds))
+        with urlopen(request, timeout=request_timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _model_headers(self) -> dict[str, str]:
@@ -1372,6 +1395,53 @@ def build_model_routing_summary(
     }
 
 
+def build_model_efficiency_summary(
+    *,
+    original_chunk_count: int,
+    planned_chunk_count: int,
+    reviewed_chunk_count: int,
+    skipped_chunk_count: int,
+    metrics: dict[str, Any],
+) -> str:
+    latency = metrics.get("latency_seconds") if isinstance(metrics.get("latency_seconds"), dict) else {}
+    prompt_chars = metrics.get("prompt_chars") if isinstance(metrics.get("prompt_chars"), dict) else {}
+    phases = metrics.get("phase_seconds") if isinstance(metrics.get("phase_seconds"), dict) else {}
+    return (
+        "Model efficiency summary: "
+        f"original logical chunks {original_chunk_count}, planned packets {planned_chunk_count}, "
+        f"reviewed packets {reviewed_chunk_count}, skipped packets {skipped_chunk_count}, "
+        f"adaptive subchunks {int(metrics.get('adaptive_subchunks_created') or 0)} "
+        f"(proactive {int(metrics.get('proactive_subchunks_created') or 0)}), "
+        f"provider attempts {int(metrics.get('model_http_attempts') or 0)}, "
+        f"successful calls {int(metrics.get('successful_model_calls') or 0)}, "
+        f"cache hits/misses {int(metrics.get('packet_cache_hits') or 0)}/"
+        f"{int(metrics.get('packet_cache_misses') or 0)}, "
+        f"retries {int(metrics.get('transient_retries') or 0)}, "
+        f"timeouts {int(metrics.get('model_request_timeouts') or 0)}, "
+        f"provider latency avg/p50/p95 {format_metric_seconds(latency.get('avg'))}/"
+        f"{format_metric_seconds(latency.get('p50'))}/{format_metric_seconds(latency.get('p95'))}, "
+        f"prompt chars avg/p50/p95 {format_metric_number(prompt_chars.get('avg'))}/"
+        f"{format_metric_number(prompt_chars.get('p50'))}/{format_metric_number(prompt_chars.get('p95'))}, "
+        f"chunk review {format_duration(float(phases.get('chunk_review') or 0))}, "
+        f"synthesis {format_duration(float(phases.get('synthesis') or 0))}, "
+        f"model wall time {format_duration(float(phases.get('model_review_total') or 0))}."
+    )
+
+
+def format_metric_seconds(value: Any) -> str:
+    try:
+        return format_duration(float(value))
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def format_metric_number(value: Any) -> str:
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def count_by_key(items: list[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in items:
@@ -1677,7 +1747,7 @@ def normalize_deep_concurrency(
     if total_chunks <= 1:
         return 1
     requested = int(value or 0)
-    explicit_cap = requested if requested > 0 else 3
+    explicit_cap = requested if requested > 0 else configured_auto_deep_concurrency_cap()
     recommended = recommended_deep_concurrency(total_chunks, chunks or [])
     return min(max(1, explicit_cap), recommended, total_chunks)
 
@@ -1696,9 +1766,24 @@ def recommended_deep_concurrency(total_chunks: int, chunks: list[dict[str, Any]]
         return 2
     if total_chunks >= 40 or high_priority_count >= 18:
         return 2
+    if total_chunks >= 12 and max_diff < 10_000 and avg_diff < 6_000:
+        return 4
     if total_chunks >= 7 or max_diff >= 8_000 or avg_diff >= 5_000 or high_priority_count >= 4:
-        return 2
+        return 3
     return 3
+
+
+def configured_auto_deep_concurrency_cap() -> int:
+    raw = os.getenv("AGENTIC_PR_REVIEW_AUTO_DEEP_CONCURRENCY_MAX")
+    if raw is None or raw.strip() == "":
+        raw = os.getenv("AGENTIC_PR_REVIEW_DEEP_CONCURRENCY_MAX")
+    if raw is None or raw.strip() == "":
+        return 3
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(4, value))
 
 
 def mask_secret_for_github_actions(value: str) -> None:
@@ -1949,6 +2034,15 @@ def format_http_error(exc: BaseException) -> str:
         body = redact_text(read_error_body(exc))
         return f"HTTP {exc.code} {redact_text(exc.reason)}: {body}".strip()
     return redact_text(str(exc))
+
+
+def is_timeout_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException) and is_timeout_exception(reason):
+        return True
+    return "timed out" in str(exc).lower() or "timeout" in exc.__class__.__name__.lower()
 
 
 def retry_after_delay_seconds(error: HTTPError) -> float | None:

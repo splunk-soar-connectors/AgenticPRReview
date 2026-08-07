@@ -222,6 +222,17 @@ Strict output rules:
   introduced or modified by this PR, the cited line is the actual source of the
   issue, the failure scenario is supported by code/log evidence, and the
   suggested_fix follows directly from that root cause.
+- For inline findings, choose the exact changed line responsible for the issue:
+  the changed field, parameter, function call, config value, or expression. Do
+  not anchor to the beginning of a JSON object, function, class, or hunk when a
+  more specific changed line demonstrates the problem.
+- `changed_line_evidence` must quote or precisely describe the changed line the
+  reviewer will see on GitHub. If multiple changed lines contribute, set `line`
+  to the most directly responsible line and mention the remaining changed lines
+  in `evidence`.
+- Clearly separate changed-code evidence from supporting evidence. In
+  `evidence`, first state what the changed line does, then separately identify
+  supporting schema/docs/config evidence or runtime CI/test evidence.
 - Every finding must include a non-null file plus either a changed-line number
   or a concrete code reference such as a function, action identifier, parameter,
   output path, hook name with file path, or commit SHA when commit metadata is
@@ -363,10 +374,10 @@ Evidence rules:
 - Severity must match proof strength: use critical or high only when the code
   or CI log clearly demonstrates a severe issue. Classify weaker items as
   medium, low, informational, or suppress them.
-- For code findings, include suggested_code only when you can provide the exact
-  replacement code for the targeted changed line or block. Do not put prose in
-  suggested_code. Omit it or set it to null when the fix needs contributor
-  judgment.
+- For code findings, include suggested_code only when the exact changed line to
+  replace is known and the replacement will not remove or rewrite unrelated
+  surrounding fields. Prefer null over a risky suggestion. Do not put prose in
+  suggested_code.
 - If a finding is already fixed in the current head, do not report it as active.
 - If only CI data is missing, say so in model_notes, not as a blocking finding.
 - Return only valid JSON. No Markdown fences.

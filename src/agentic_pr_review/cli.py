@@ -195,6 +195,7 @@ def run_review(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressReporter()
     review_started = time.monotonic()
+    stage_durations: dict[str, float] = {}
     review_mode = "shallow" if args.shallow else "deep"
     publish_mode = "publishing enabled" if args.publish_comments else "dry run"
     progress(f"Review started for {args.repo}#{args.pr_number} ({review_mode}; {publish_mode}).")
@@ -217,8 +218,10 @@ def run_review(args: argparse.Namespace) -> int:
         review_input = collector.collect(args.repo, args.pr_number)
         changed_file_count = len(review_input.get("changed_files") or [])
         deep_chunk_count = len(((review_input.get("deep_review") or {}).get("chunks")) or [])
+        elapsed = time.monotonic() - stage_started
+        stage_durations["collection"] = elapsed
         progress(
-            f"Collection completed in {format_duration(time.monotonic() - stage_started)}: "
+            f"Collection completed in {format_duration(elapsed)}: "
             f"{changed_file_count} changed file(s), {deep_chunk_count} deep-review chunk(s)."
         )
         if args.enable_sdk_manifest:
@@ -230,7 +233,9 @@ def run_review(args: argparse.Namespace) -> int:
                 args.repo,
                 timeout_seconds=args.sdk_manifest_timeout,
             )
-            progress(f"SDK manifest generation completed in {format_duration(time.monotonic() - stage_started)}.")
+            elapsed = time.monotonic() - stage_started
+            stage_durations["sdk_manifest"] = elapsed
+            progress(f"SDK manifest generation completed in {format_duration(elapsed)}.")
         else:
             review_input = mark_sdk_manifest_disabled(
                 review_input,
@@ -250,15 +255,19 @@ def run_review(args: argparse.Namespace) -> int:
                 max_examples=args.historical_max_examples,
                 min_score=args.historical_min_score,
             )
+            elapsed = time.monotonic() - stage_started
+            stage_durations["historical_context"] = elapsed
             progress(
                 f"Historical review context retrieval completed in "
-                f"{format_duration(time.monotonic() - stage_started)}."
+                f"{format_duration(elapsed)}."
             )
         stage_started = time.monotonic()
         progress("Deterministic checks started.")
         deterministic_findings = run_deterministic_checks(review_input)
+        elapsed = time.monotonic() - stage_started
+        stage_durations["deterministic_checks"] = elapsed
         progress(
-            f"Deterministic checks completed in {format_duration(time.monotonic() - stage_started)} "
+            f"Deterministic checks completed in {format_duration(elapsed)} "
             f"with {len(deterministic_findings)} finding(s)."
         )
         reviewer: GatewayClaudeReviewer | None = None
@@ -276,6 +285,7 @@ def run_review(args: argparse.Namespace) -> int:
             )
         else:
             deterministic_findings = conservatively_downgrade_low_confidence_pipeline_findings(deterministic_findings)
+        stage_started = time.monotonic()
         publish_target_pipeline_failure_comments(
             client,
             review_input,
@@ -285,6 +295,7 @@ def run_review(args: argparse.Namespace) -> int:
             allow_duplicates=args.allow_duplicate_comments,
             progress=progress,
         )
+        stage_durations["target_pipeline_comments"] = time.monotonic() - stage_started
 
         if args.skip_model:
             progress("Model review skipped by --skip-model.")
@@ -303,7 +314,9 @@ def run_review(args: argparse.Namespace) -> int:
                     deep_concurrency=args.deep_concurrency,
                     checkpoint_path=run_dir / "deep_review_checkpoint.json",
                 )
-            progress(f"Model review completed in {format_duration(time.monotonic() - stage_started)}.")
+            elapsed = time.monotonic() - stage_started
+            stage_durations["model_review"] = elapsed
+            progress(f"Model review completed in {format_duration(elapsed)}.")
 
         stage_started = time.monotonic()
         progress("Filtering findings and building the GitHub comment plan.")
@@ -317,8 +330,10 @@ def run_review(args: argparse.Namespace) -> int:
         max_comments = args.max_published_comments if args.max_published_comments > 0 else None
         comment_plan = build_comment_plan(review_output, review_input, max_comments=max_comments)
         planned_comment_count = len(comment_plan.get("comments") or [])
+        elapsed = time.monotonic() - stage_started
+        stage_durations["comment_planning"] = elapsed
         progress(
-            f"Comment plan completed in {format_duration(time.monotonic() - stage_started)} "
+            f"Comment plan completed in {format_duration(elapsed)} "
             f"with {planned_comment_count} publishable comment(s)."
         )
         publish_result = None
@@ -332,13 +347,17 @@ def run_review(args: argparse.Namespace) -> int:
                 allow_duplicates=args.allow_duplicate_comments,
                 max_comments=max_comments,
             )
+            elapsed = time.monotonic() - stage_started
+            stage_durations["github_publication"] = elapsed
             progress(
-                f"GitHub publication completed in {format_duration(time.monotonic() - stage_started)}: "
+                f"GitHub publication completed in {format_duration(elapsed)}: "
                 f"{publish_result.get('posted', 0)} posted, {publish_result.get('skipped', 0)} skipped, "
                 f"{publish_result.get('errors', 0)} error(s)."
             )
+        stage_started = time.monotonic()
         progress("Writing review artifacts.")
         write_artifacts(run_dir, review_input, review_output, comment, comment_plan, publish_result)
+        stage_durations["artifact_writing"] = time.monotonic() - stage_started
     except (GitHubError, GatewayReviewError, RuntimeError, OSError, ValueError) as exc:
         safe_error = redact_text(str(exc))
         error_payload = {
@@ -356,13 +375,37 @@ def run_review(args: argparse.Namespace) -> int:
         print(f"artifacts: {run_dir}")
         return 1
 
-    progress(f"Review completed successfully in {format_duration(time.monotonic() - review_started)}.")
+    total_elapsed = time.monotonic() - review_started
+    progress(format_review_timing_summary(total_elapsed, stage_durations))
+    progress(f"Review completed successfully in {format_duration(total_elapsed)}.")
     print(f"artifacts: {run_dir}")
     print(f"comment: {run_dir / 'comment.md'}")
     print(f"planned comments: {run_dir / 'planned_comments.md'}")
     if args.publish_comments:
         print(f"publish result: {run_dir / 'publish_result.json'}")
     return 0
+
+
+def format_review_timing_summary(total_elapsed: float, stage_durations: dict[str, float]) -> str:
+    ordered_keys = [
+        "collection",
+        "sdk_manifest",
+        "historical_context",
+        "deterministic_checks",
+        "target_pipeline_comments",
+        "model_review",
+        "comment_planning",
+        "github_publication",
+        "artifact_writing",
+    ]
+    parts = [
+        f"{key.replace('_', ' ')} {format_duration(stage_durations[key])}"
+        for key in ordered_keys
+        if key in stage_durations
+    ]
+    if not parts:
+        return f"Review timing summary: total {format_duration(total_elapsed)}."
+    return f"Review timing summary: total {format_duration(total_elapsed)}; " + "; ".join(parts) + "."
 
 
 def publish_target_pipeline_failure_comments(

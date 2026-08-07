@@ -1607,8 +1607,15 @@ def build_comment_for_finding(
         inferred_path, inferred_line = infer_code_anchor(finding, target_diff_index, preferred_path=path)
         path = inferred_path or path
         line = inferred_line or line
-    finding_type = classify_finding(finding, path=path)
     target = choose_target(path, line, target_diff_index)
+    target = validate_comment_target(
+        finding,
+        target,
+        target_diff_index,
+        original_path=str(finding.get("file") or "").strip() or None,
+        original_line=normalize_line(finding.get("line")),
+    )
+    finding_type = classify_finding(finding, path=str(target.get("path") or path or ""))
     finding_id = stable_finding_id(finding)
     marker = f"{MARKER_PREFIX}{finding_id} -->"
     body = render_short_comment(finding, finding_type, target)
@@ -1645,6 +1652,10 @@ def build_comment_for_finding(
         "line": target.get("line"),
         "side": target.get("side"),
         "target_reason": target["target_reason"],
+        "anchor_validation_status": target.get("anchor_validation_status"),
+        "anchor_validation_note": target.get("anchor_validation_note"),
+        "anchor_text": target.get("anchor_text"),
+        "line_kind": target.get("line_kind"),
         "body": body,
         "marker": marker,
         "comment_style": comment_style,
@@ -1667,10 +1678,13 @@ def build_diff_index(
             continue
         right_entries = parse_right_side_diff_entries(str(item.get("patch") or ""))
         right_lines = {entry["line"] for entry in right_entries}
+        added_lines = {entry["line"] for entry in right_entries if entry.get("kind") == "added"}
         output[str(path)] = {
             "right_lines": right_lines,
+            "added_lines": added_lines,
             "right_entries": right_entries,
             "first_right_line": min(right_lines) if right_lines else None,
+            "first_added_line": min(added_lines) if added_lines else None,
             "status": item.get("status"),
         }
     return output
@@ -1729,12 +1743,14 @@ def choose_target(path: str | None, line: int | None, diff_index: dict[str, dict
     file_info = diff_index[path]
     right_lines = file_info["right_lines"]
     if line and line in right_lines:
+        entry = entry_for_line(file_info, line)
         return {
             "github_comment_type": "line",
             "path": path,
             "line": line,
             "side": "RIGHT",
-            "anchor_text": entry_text_for_line(file_info, line),
+            "anchor_text": str((entry or {}).get("text") or ""),
+            "line_kind": str((entry or {}).get("kind") or ""),
             "target_reason": "finding line is present in the PR diff",
         }
     return {
@@ -1743,15 +1759,436 @@ def choose_target(path: str | None, line: int | None, diff_index: dict[str, dict
         "line": line,
         "side": None,
         "anchor_text": None,
+        "line_kind": None,
         "target_reason": "finding line is not present in the PR diff",
     }
 
 
+def validate_comment_target(
+    finding: dict[str, Any],
+    target: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    original_path: str | None,
+    original_line: int | None,
+) -> dict[str, Any]:
+    """Final guard before publication: keep inline anchors tied to the cited changed line."""
+
+    if str(finding.get("category") or "") in {"merge_conflict"}:
+        return target
+
+    preferred_path = str(target.get("path") or original_path or "").strip() or None
+    best = best_added_anchor_for_finding(finding, diff_index, preferred_path=preferred_path)
+
+    if target.get("github_comment_type") == "line":
+        path = str(target.get("path") or "")
+        line = normalize_line(target.get("line"))
+        file_info = diff_index.get(path) or {}
+        entry = entry_for_line(file_info, line or 0) if line else None
+        line_kind = str((entry or {}).get("kind") or target.get("line_kind") or "")
+        anchor_text = str((entry or {}).get("text") or target.get("anchor_text") or "")
+        current_score = score_anchor_line_for_finding(finding, path, anchor_text, line_kind, diff_index)
+
+        if best and should_relocate_inline_anchor(
+            current_path=path,
+            current_line=line,
+            current_kind=line_kind,
+            current_text=anchor_text,
+            current_score=current_score,
+            best=best,
+        ):
+            relocated = choose_target(best["path"], best["line"], diff_index)
+            relocated["target_reason"] = (
+                "relocated to the changed line that best matches the finding evidence; "
+                f"original target was {format_optional_location(original_path, original_line)}"
+            )
+            relocated["anchor_validation_status"] = "relocated_exact_changed_line"
+            relocated["anchor_validation_note"] = (
+                f"Relocated from {format_optional_location(original_path, original_line)} "
+                "because the original line did not match the changed-line evidence."
+            )
+            return relocated
+
+        if line_kind == "added" and anchor_line_matches_finding(finding, path, line, anchor_text, diff_index):
+            exact = dict(target)
+            exact["anchor_validation_status"] = "exact_changed_line"
+            exact["anchor_validation_note"] = ""
+            return exact
+
+        return conversation_target_from_unvalidated_inline(
+            target,
+            reason=(
+                "The cited line is present in the diff, but it is not an added changed line "
+                "that directly matches the finding evidence."
+            ),
+        )
+
+    if best and should_promote_conversation_to_inline(finding):
+        inferred = choose_target(best["path"], best["line"], diff_index)
+        inferred["target_reason"] = "inferred exact changed-line anchor from finding evidence"
+        inferred["anchor_validation_status"] = "inferred_exact_changed_line"
+        inferred["anchor_validation_note"] = ""
+        return inferred
+
+    if target.get("github_comment_type") == "conversation" and target.get("path"):
+        annotated = dict(target)
+        annotated["anchor_validation_status"] = "conversation_fallback"
+        annotated["anchor_validation_note"] = (
+            "No exact changed-line anchor matched the finding evidence, so this is kept as a file-level comment."
+        )
+        return annotated
+    return target
+
+
+def should_relocate_inline_anchor(
+    *,
+    current_path: str,
+    current_line: int | None,
+    current_kind: str,
+    current_text: str,
+    current_score: int,
+    best: dict[str, Any],
+) -> bool:
+    if not best:
+        return False
+    if current_path == best.get("path") and current_line == best.get("line"):
+        return False
+    if current_kind != "added":
+        return True
+    if is_low_signal_anchor_line(current_text):
+        return True
+    return int(best.get("score") or 0) >= current_score + 15
+
+
+def should_promote_conversation_to_inline(finding: dict[str, Any]) -> bool:
+    if str(finding.get("category") or "") in {"ci_synthesis", "ci_pipeline_failure", "merge_conflict"}:
+        return False
+    return True
+
+
+def conversation_target_from_unvalidated_inline(target: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "github_comment_type": "conversation",
+        "path": target.get("path"),
+        "line": target.get("line"),
+        "side": None,
+        "anchor_text": None,
+        "line_kind": target.get("line_kind"),
+        "target_reason": "inline anchor failed final evidence validation",
+        "anchor_validation_status": "conversation_fallback",
+        "anchor_validation_note": reason,
+    }
+
+
+def best_added_anchor_for_finding(
+    finding: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    preferred_path: str | None,
+) -> dict[str, Any] | None:
+    text = evidence_anchor_text(finding)
+    explicit_lines = explicit_evidence_line_anchors(finding, diff_index, preferred_path=preferred_path)
+    terms = specific_anchor_terms(finding)
+
+    for path, line in explicit_lines:
+        candidate = added_line_anchor_candidate(
+            finding,
+            diff_index,
+            path=path,
+            line=line,
+            preferred_path=preferred_path,
+            terms=terms,
+            explicit=True,
+        )
+        if candidate:
+            return candidate
+
+    if terms:
+        best = best_added_anchor_by_terms(finding, diff_index, preferred_path=preferred_path, terms=terms)
+        if best:
+            return best
+
+    if explicit_lines:
+        return None
+
+    keywords = target_keywords_for_finding(finding, text, diff_index)
+    if not keywords:
+        return None
+
+    best: dict[str, Any] | None = None
+    for path, info in diff_index.items():
+        if is_review_excluded_path(path) and str(finding.get("category") or "") != "ci_pipeline_failure":
+            continue
+        for entry in info.get("right_entries", []):
+            if entry.get("kind") != "added":
+                continue
+            line_text = str(entry.get("text") or "")
+            if is_low_signal_anchor_line(line_text):
+                continue
+            if not anchor_line_has_evidence_match(line_text, keywords, []):
+                continue
+            score = score_anchor_line_for_finding(finding, path, line_text, "added", diff_index)
+            if preferred_path and path == preferred_path:
+                score += 20
+            if score <= 0:
+                continue
+            candidate = {
+                "score": score,
+                "path": path,
+                "line": int(entry["line"]),
+                "anchor_text": line_text,
+            }
+            if best is None or int(candidate["score"]) > int(best["score"]):
+                best = candidate
+    return best
+
+
+def added_line_anchor_candidate(
+    finding: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    path: str,
+    line: int,
+    preferred_path: str | None,
+    terms: list[str],
+    explicit: bool,
+) -> dict[str, Any] | None:
+    info = diff_index.get(path) or {}
+    entry = entry_for_line(info, line)
+    if not entry or entry.get("kind") != "added":
+        return None
+    line_text = str(entry.get("text") or "")
+    if not anchor_line_content_is_specific(finding, line_text, terms, explicit=explicit):
+        return None
+    score = (250 if explicit else 0) + score_anchor_line_for_finding(finding, path, line_text, "added", diff_index)
+    if preferred_path and path == preferred_path:
+        score += 20
+    return {
+        "score": score,
+        "path": path,
+        "line": line,
+        "anchor_text": line_text,
+    }
+
+
+def best_added_anchor_by_terms(
+    finding: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    preferred_path: str | None,
+    terms: list[str],
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    for path, info in diff_index.items():
+        if is_review_excluded_path(path) and str(finding.get("category") or "") != "ci_pipeline_failure":
+            continue
+        for entry in info.get("right_entries", []):
+            if entry.get("kind") != "added":
+                continue
+            line = normalize_line(entry.get("line"))
+            if line is None:
+                continue
+            candidate = added_line_anchor_candidate(
+                finding,
+                diff_index,
+                path=path,
+                line=line,
+                preferred_path=preferred_path,
+                terms=terms,
+                explicit=False,
+            )
+            if candidate and (best is None or int(candidate["score"]) > int(best["score"])):
+                best = candidate
+    return best
+
+
+def anchor_line_matches_finding(
+    finding: dict[str, Any],
+    path: str,
+    line: int | None,
+    line_text: str,
+    diff_index: dict[str, dict[str, Any]],
+) -> bool:
+    if line is None:
+        return False
+    explicit_lines = explicit_evidence_line_anchors(finding, diff_index, preferred_path=path)
+    terms = specific_anchor_terms(finding)
+    if explicit_lines:
+        if not any(candidate_path == path and candidate_line == line for candidate_path, candidate_line in explicit_lines):
+            return False
+        return anchor_line_content_is_specific(finding, line_text, terms, explicit=True)
+    if terms:
+        return anchor_line_content_is_specific(finding, line_text, terms, explicit=False)
+    suggestion = normalize_suggested_code(finding.get("suggested_code"))
+    if suggestion:
+        return suggestion_is_safe_for_anchor(suggestion, line_text)
+    return not is_low_signal_anchor_line(line_text)
+
+
+def anchor_line_content_is_specific(
+    finding: dict[str, Any],
+    line_text: str,
+    terms: list[str],
+    *,
+    explicit: bool,
+) -> bool:
+    if terms and anchor_line_has_evidence_match(line_text, [], terms):
+        if is_low_signal_anchor_line(line_text):
+            return json_header_key_matches_specific_term(line_text, terms)
+        return True
+    suggestion = normalize_suggested_code(finding.get("suggested_code"))
+    if suggestion and suggestion_is_safe_for_anchor(suggestion, line_text):
+        return True
+    return explicit and not terms and not is_low_signal_anchor_line(line_text)
+
+
+def json_header_key_matches_specific_term(line_text: str, terms: list[str]) -> bool:
+    match = re.fullmatch(r'\s*"(?P<key>[^"]+)"\s*:\s*[\[{],?\s*', line_text)
+    if not match:
+        return False
+    key = match.group("key").lower()
+    lowered_terms = {term.lower() for term in terms}
+    return key in lowered_terms
+
+
+def anchor_line_has_evidence_match(line_text: str, keywords: list[str], snippets: list[str]) -> bool:
+    lowered = line_text.lower()
+    if any(snippet and snippet.lower() in lowered for snippet in snippets):
+        return True
+    return any(keyword and keyword in lowered for keyword in keywords)
+
+
+def score_anchor_line_for_finding(
+    finding: dict[str, Any],
+    path: str,
+    line_text: str,
+    kind: str,
+    diff_index: dict[str, dict[str, Any]],
+) -> int:
+    text = evidence_anchor_text(finding)
+    keywords = target_keywords_for_finding(finding, text, diff_index)
+    score = score_anchor_line(path, line_text.lower(), kind, keywords, str(finding.get("category") or ""))
+    for snippet in exact_anchor_snippets(finding):
+        if snippet and snippet.lower() in line_text.lower():
+            score += 80
+    return score
+
+
+def evidence_anchor_text(finding: dict[str, Any]) -> str:
+    return " ".join(
+        str(finding.get(key) or "")
+        for key in (
+            "title",
+            "evidence",
+            "changed_line_evidence",
+            "root_cause",
+            "code_reference",
+            "execution_path",
+            "trigger",
+            "observable_failure",
+            "suggested_fix",
+            "category",
+        )
+    ).lower()
+
+
+def exact_anchor_snippets(finding: dict[str, Any]) -> list[str]:
+    snippets = []
+    for key in ("changed_line_evidence", "evidence", "code_reference"):
+        text = str(finding.get(key) or "")
+        snippets.extend(match.strip() for match in re.findall(r"`([^`]{2,160})`", text) if match.strip())
+    return dedupe_text(snippets)[:8]
+
+
+def specific_anchor_terms(finding: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    if str(finding.get("category") or "") == "ci_pipeline_failure":
+        text = evidence_anchor_text(finding)
+        if any(term in text for term in ("detect-secrets", "secret keyword", "secret-like", "password")):
+            terms.extend(["secret", "password", "token", "client_secret", "phantom_password"])
+    terms.extend(exact_anchor_snippets(finding))
+    terms.extend(extract_code_like_keywords(evidence_anchor_text(finding)))
+    for key in ("code_reference", "pipeline_source_location"):
+        text = str(finding.get(key) or "")
+        tokens = [token for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text) if is_useful_keyword(token)]
+        if tokens:
+            terms.extend(tokens[-3:])
+    return dedupe_text([term.strip() for term in terms if term.strip()])[:12]
+
+
+def explicit_evidence_line_anchors(
+    finding: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    preferred_path: str | None,
+) -> list[tuple[str, int]]:
+    text_fields = "\n".join(
+        str(finding.get(key) or "")
+        for key in (
+            "evidence",
+            "changed_line_evidence",
+            "root_cause",
+            "code_reference",
+            "execution_path",
+            "observable_failure",
+            "suggested_fix",
+        )
+    )
+    candidates: list[tuple[str, int]] = []
+    known_paths = sorted(diff_index, key=len, reverse=True)
+
+    for path in known_paths:
+        escaped = re.escape(path)
+        for match in re.finditer(rf"{escaped}:(?P<line>\d+)\b", text_fields):
+            line = normalize_line(match.group("line"))
+            if line:
+                candidates.append((path, line))
+
+    search_paths = [preferred_path] if preferred_path else []
+    search_paths.extend(path for path in known_paths if path not in search_paths)
+    for match in re.finditer(r"\bline\s+(?P<line>\d+)\b", text_fields, flags=re.IGNORECASE):
+        line = normalize_line(match.group("line"))
+        if not line:
+            continue
+        for path in search_paths:
+            if path and line in (diff_index.get(path, {}).get("added_lines") or set()):
+                candidates.append((path, line))
+                break
+
+    return dedupe_line_anchors(candidates)
+
+
+def dedupe_line_anchors(candidates: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    seen: set[tuple[str, int]] = set()
+    output: list[tuple[str, int]] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        output.append(candidate)
+    return output
+
+
+def format_optional_location(path: str | None, line: int | None) -> str:
+    if path and line:
+        return f"{path}:{line}"
+    if path:
+        return path
+    if line:
+        return f"line {line}"
+    return "no exact line"
+
+
 def entry_text_for_line(file_info: dict[str, Any], line: int) -> str:
+    entry = entry_for_line(file_info, line)
+    return str((entry or {}).get("text") or "")
+
+
+def entry_for_line(file_info: dict[str, Any], line: int) -> dict[str, Any] | None:
     for entry in file_info.get("right_entries", []):
         if entry.get("line") == line:
-            return str(entry.get("text") or "")
-    return ""
+            return entry
+    return None
 
 
 def should_infer_code_anchor(
@@ -1817,7 +2254,16 @@ def infer_code_anchor(
 def all_finding_text(finding: dict[str, Any]) -> str:
     return " ".join(
         str(finding.get(key) or "")
-        for key in ("title", "evidence", "why_it_matters", "suggested_fix", "code_reference", "category")
+        for key in (
+            "title",
+            "evidence",
+            "changed_line_evidence",
+            "root_cause",
+            "why_it_matters",
+            "suggested_fix",
+            "code_reference",
+            "category",
+        )
     ).lower()
 
 
@@ -1828,6 +2274,8 @@ def is_low_signal_anchor_line(line_text: str) -> bool:
     if stripped in {'"""', "'''", "{", "}", "[", "]", "(", ")"}:
         return True
     if stripped.startswith(('"""', "'''")) and len(stripped) <= 8:
+        return True
+    if re.fullmatch(r'"[^"]+"\s*:\s*[\[{],?', stripped):
         return True
     return False
 
@@ -1874,6 +2322,9 @@ def target_keywords_for_text(text: str) -> list[str]:
 def extract_code_like_keywords(text: str) -> list[str]:
     keywords: list[str] = []
     for match in re.findall(r"`([^`]+)`", text):
+        if is_useful_keyword(match):
+            keywords.append(match.lower())
+    for match in re.findall(r'"([A-Za-z_][A-Za-z0-9_ -]{2,60})"\s*:', text):
         if is_useful_keyword(match):
             keywords.append(match.lower())
     for match in re.findall(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+)+\b", text):
@@ -1957,10 +2408,13 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     code_reference = str(finding.get("code_reference") or "").strip()
     location = format_conversation_location(target)
     anchor_text = concise_anchor_text(str(target.get("anchor_text") or ""))
+    anchor_note = concise_comment_text(str(target.get("anchor_validation_note") or ""), max_chars=300, max_sentences=1)
 
     evidence_parts = []
     if location and target["github_comment_type"] == "conversation":
         evidence_parts.append(f"Location: `{location}`")
+    if anchor_note and target["github_comment_type"] == "conversation":
+        evidence_parts.append(f"Anchor note: {anchor_note}")
     if target["github_comment_type"] == "conversation":
         pipeline_jobs_line = format_pipeline_jobs_line(finding)
         if pipeline_jobs_line:
@@ -1972,13 +2426,15 @@ def render_short_comment(finding: dict[str, Any], finding_type: str, target: dic
     if code_reference:
         evidence_parts.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
-        evidence_parts.append(f"Current line: `{anchor_text}`")
+        anchor_location = format_conversation_location(target)
+        location_prefix = f" ({anchor_location})" if anchor_location else ""
+        evidence_parts.append(f"Changed line{location_prefix}: `{anchor_text}`")
     if evidence:
-        evidence_parts.append(evidence)
+        evidence_parts.append(f"Reason: {evidence}")
     if changed_line_evidence:
         evidence_parts.append(f"Changed behavior: {changed_line_evidence}")
     if failure_scenario:
-        evidence_parts.append(f"Failure scenario: {failure_scenario}")
+        evidence_parts.append(f"Runtime evidence: {failure_scenario}")
 
     lines = [f"Issue: {title}"]
     if evidence_parts:
@@ -2002,11 +2458,14 @@ def render_pipeline_failure_comment(finding: dict[str, Any], target: dict[str, A
     code_reference = str(finding.get("code_reference") or "").strip()
     anchor_text = concise_anchor_text(str(target.get("anchor_text") or ""))
     location = format_conversation_location(target)
+    anchor_note = concise_comment_text(str(target.get("anchor_validation_note") or ""), max_chars=300, max_sentences=1)
     fix = concise_fix_text(finding)
 
     evidence_parts = []
     if location and target["github_comment_type"] == "conversation":
         evidence_parts.append(f"Location: `{location}`")
+    if anchor_note and target["github_comment_type"] == "conversation":
+        evidence_parts.append(f"Anchor note: {anchor_note}")
     if primary_failure:
         evidence_parts.append(f"Primary failure: {primary_failure}")
     if additional_failures:
@@ -2016,7 +2475,9 @@ def render_pipeline_failure_comment(finding: dict[str, Any], target: dict[str, A
     if code_reference:
         evidence_parts.append(f"Code reference: `{code_reference}`")
     if anchor_text and target["github_comment_type"] == "line":
-        evidence_parts.append(f"Current line: `{anchor_text}`")
+        anchor_location = format_conversation_location(target)
+        location_prefix = f" ({anchor_location})" if anchor_location else ""
+        evidence_parts.append(f"Changed line{location_prefix}: `{anchor_text}`")
 
     lines = [f"Issue: {title}"]
     if evidence_parts:
@@ -2224,7 +2685,47 @@ def code_suggestion_for(finding: dict[str, Any], finding_type: str, target: dict
         return ""
     if target.get("github_comment_type") != "line":
         return ""
-    return normalize_suggested_code(finding.get("suggested_code"))
+    if not target_has_exact_added_anchor(target):
+        return ""
+    suggestion = normalize_suggested_code(finding.get("suggested_code"))
+    if not suggestion:
+        return ""
+    if not suggestion_is_safe_for_anchor(suggestion, str(target.get("anchor_text") or "")):
+        return ""
+    return suggestion
+
+
+def target_has_exact_added_anchor(target: dict[str, Any]) -> bool:
+    if target.get("github_comment_type") != "line":
+        return False
+    if target.get("line_kind") != "added":
+        return False
+    return str(target.get("anchor_validation_status") or "") in {
+        "exact_changed_line",
+        "relocated_exact_changed_line",
+        "inferred_exact_changed_line",
+    }
+
+
+def suggestion_is_safe_for_anchor(suggestion: str, anchor_text: str) -> bool:
+    if not suggestion.strip() or not anchor_text.strip():
+        return False
+    if "\n" in suggestion.strip():
+        return False
+    anchor_tokens = code_replacement_tokens(anchor_text)
+    suggestion_tokens = code_replacement_tokens(suggestion)
+    if not anchor_tokens or not suggestion_tokens:
+        return False
+    return bool(anchor_tokens & suggestion_tokens)
+
+
+def code_replacement_tokens(text: str) -> set[str]:
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+", text)
+        if len(token) >= 2
+    }
+    return tokens - {"self", "true", "false", "none", "null", "return"}
 
 
 def normalize_suggested_code(value: Any) -> str:
@@ -2412,6 +2913,17 @@ def publish_comment_plan(
         body = redact_text(body_with_marker(comment))
         try:
             if comment.get("github_comment_type") == "line":
+                if not target_has_exact_added_anchor(comment):
+                    response = client.create_issue_comment(repo, pr_number, body=body)
+                    results.append(
+                        {
+                            "id": comment.get("id"),
+                            "status": "posted_fallback_unvalidated_anchor",
+                            "github_comment_type": "conversation",
+                            "url": response.get("html_url") if isinstance(response, dict) else None,
+                        }
+                    )
+                    continue
                 response = client.create_pull_request_line_comment(
                     repo,
                     pr_number,

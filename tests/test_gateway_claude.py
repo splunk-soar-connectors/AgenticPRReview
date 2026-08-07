@@ -86,7 +86,7 @@ class GatewayClaudeTest(unittest.TestCase):
         large_chunks = [{"diff_chars": 17_000}, {"diff_chars": 500}]
 
         self.assertEqual(normalize_deep_concurrency(0, len(small_chunks), small_chunks), 2)
-        self.assertEqual(normalize_deep_concurrency(0, len(medium_chunks), medium_chunks), 2)
+        self.assertEqual(normalize_deep_concurrency(0, len(medium_chunks), medium_chunks), 3)
         self.assertEqual(normalize_deep_concurrency(0, len(large_chunks), large_chunks), 2)
 
     def test_normalize_deep_concurrency_does_not_serialize_for_one_huge_packet(self):
@@ -104,6 +104,12 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(normalize_deep_concurrency(3, len(chunks), chunks), 3)
         self.assertEqual(normalize_deep_concurrency(1, len(chunks), chunks), 1)
+
+    def test_auto_deep_concurrency_cap_can_allow_four_workers(self):
+        chunks = [{"diff_chars": 700} for _ in range(16)]
+
+        with patch.dict(os.environ, {"AGENTIC_PR_REVIEW_AUTO_DEEP_CONCURRENCY_MAX": "4"}):
+            self.assertEqual(normalize_deep_concurrency(0, len(chunks), chunks), 4)
 
     def test_runtime_config_selects_gateway_provider(self):
         env = {
@@ -123,6 +129,7 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(config.model_provider, "gateway")
         self.assertEqual(config.gateway_model, "claude-sonnet-4-6")
         self.assertEqual(config.gateway_request_timeout_seconds, 600)
+        self.assertEqual(config.gateway_review_request_timeout_seconds, 240)
         self.assertEqual(config.gateway_request_max_attempts, 2)
         config.require_model()
 
@@ -145,8 +152,27 @@ class GatewayClaudeTest(unittest.TestCase):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.gateway_request_timeout_seconds, 420)
+        self.assertEqual(config.gateway_review_request_timeout_seconds, 240)
         self.assertEqual(config.gateway_request_max_attempts, 4)
         self.assertEqual(config.gateway_request_retry_backoff_seconds, 0.25)
+
+    def test_runtime_config_accepts_review_request_timeout_override(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+            "GATEWAY_REVIEW_REQUEST_TIMEOUT_SECONDS": "180",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+
+        self.assertEqual(config.gateway_review_request_timeout_seconds, 180)
 
     def test_runtime_config_accepts_model_cache_dir(self):
         env = {
@@ -165,6 +191,31 @@ class GatewayClaudeTest(unittest.TestCase):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.model_cache_dir, "/tmp/agentic-pr-review-model-cache")
+
+    def test_deep_review_model_call_uses_bounded_review_timeout(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+            "GATEWAY_REQUEST_TIMEOUT_SECONDS": "600",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = RuntimeConfig.from_env()
+        reviewer = GatewayClaudeReviewer(config)
+
+        with patch.object(reviewer, "_post_model_json_once", side_effect=TimeoutError("timed out")) as post_once:
+            with self.assertRaises(GatewayTransientModelError):
+                reviewer._invoke_review("review this", [], request_max_attempts=1)
+
+        self.assertEqual(post_once.call_args.kwargs["timeout_seconds"], 240)
+        metrics = reviewer._model_metrics_snapshot()
+        self.assertEqual(metrics["model_request_timeouts"], 1)
 
     def test_runtime_config_accepts_legacy_circuit_env_names(self):
         env = {
@@ -264,7 +315,7 @@ class GatewayClaudeTest(unittest.TestCase):
         model_request, model_timeout, model_body = calls[1]
         model_headers = {key.lower(): value for key, value in model_request.header_items()}
         model_payload = json.loads(model_body)
-        self.assertEqual(model_timeout, 600)
+        self.assertEqual(model_timeout, 240)
         self.assertEqual(model_request.full_url, "https://gateway.example/deployments/claude/chat/completions")
         self.assertEqual(model_headers["authorization"], "Bearer access-token-test")
         self.assertEqual(model_headers["api-key"], "access-token-test")
@@ -448,7 +499,7 @@ class GatewayClaudeTest(unittest.TestCase):
 
         self.assertEqual(output["overall_status"], "looks_good")
         self.assertEqual([call[0].full_url.endswith("/token") for call in calls], [True, False, False])
-        self.assertEqual([call[1] for call in calls], [60, 420, 420])
+        self.assertEqual([call[1] for call in calls], [60, 240, 240])
 
     def test_gateway_downgrades_response_format_when_gateway_rejects_schema_mode(self):
         env = {
@@ -1096,7 +1147,7 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertNotIn("smaller retry slice", "\n".join(prompts))
         self.assertIn("repeated transient gateway failure", output["chunk_review_outputs"][0]["model_notes"])
 
-    def test_deep_review_proactively_subchunks_timeout_risk_python_chunk(self):
+    def test_deep_review_does_not_proactively_subchunk_timeout_risk_python_chunk(self):
         env = {
             "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
             "MODEL_PROVIDER": "gateway",
@@ -1137,7 +1188,7 @@ class GatewayClaudeTest(unittest.TestCase):
             },
         }
         output_template = {
-            "summary": "proactive ok",
+            "summary": "single packet ok",
             "overall_status": "looks_good",
             "safe_to_publish": True,
             "findings": [],
@@ -1157,12 +1208,14 @@ class GatewayClaudeTest(unittest.TestCase):
             output = reviewer.review_deep(review_input, [], deep_concurrency=1)
 
         self.assertEqual(output["overall_status"], "looks_good")
-        self.assertGreaterEqual(len(prompts), 3)
-        self.assertIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
-        self.assertIn("proactive smaller packet for timeout-risk review", prompts[0])
-        self.assertIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+        self.assertEqual(len(prompts), 2)
+        self.assertNotIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
+        self.assertNotIn("proactive smaller packet for timeout-risk review", prompts[0])
+        self.assertNotIn("smaller focused subchunks", output["chunk_review_outputs"][0]["model_notes"])
+        self.assertEqual(output["deep_review"]["model_metrics"]["adaptive_subchunks_created"], 0)
+        self.assertEqual(output["deep_review"]["model_metrics"]["proactive_subchunks_created"], 0)
 
-    def test_deep_review_uses_eta_prediction_to_proactively_subchunk(self):
+    def test_deep_review_eta_prediction_does_not_proactively_subchunk(self):
         env = {
             "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
             "MODEL_PROVIDER": "gateway",
@@ -1203,7 +1256,7 @@ class GatewayClaudeTest(unittest.TestCase):
             },
         }
         output_template = {
-            "summary": "eta proactive ok",
+            "summary": "eta single packet ok",
             "overall_status": "looks_good",
             "safe_to_publish": True,
             "findings": [],
@@ -1226,8 +1279,9 @@ class GatewayClaudeTest(unittest.TestCase):
             output = reviewer.review_deep(review_input, [], deep_concurrency=1)
 
         self.assertEqual(output["overall_status"], "looks_good")
-        self.assertGreaterEqual(len(prompts), 3)
-        self.assertIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
+        self.assertEqual(len(prompts), 2)
+        self.assertNotIn("proactive smaller slice of a timeout-risk file chunk", prompts[0])
+        self.assertEqual(output["deep_review"]["model_metrics"]["adaptive_subchunks_created"], 0)
 
     def test_deep_review_keeps_deterministic_findings_when_focused_retry_times_out(self):
         env = {
@@ -1603,6 +1657,57 @@ class GatewayClaudeTest(unittest.TestCase):
         self.assertEqual(len(prompts), 3)
         self.assertEqual(second_output["deep_review"]["model_cached_chunk_count"], 1)
         self.assertEqual(second_output["chunk_review_outputs"][0]["chunk_id"], "connector.py:9")
+
+    def test_deep_review_packet_cache_ignores_unrelated_ci_churn(self):
+        env = {
+            "AGENTIC_PR_REVIEW_ENV_FILE": "missing.env",
+            "MODEL_PROVIDER": "gateway",
+            "GATEWAY_BASE_URL": "https://gateway.example/deployments/claude/chat/completions",
+            "GATEWAY_MODEL": "claude-sonnet-4-6",
+            "GATEWAY_APP_KEY": "app-key-test",
+            "GATEWAY_CLIENT_ID": "client-id-test",
+            "GATEWAY_CLIENT_SECRET": "client-secret-test",
+            "GATEWAY_TOKEN_URL": "https://gateway.example/oauth2/default/v1/token",
+        }
+        diff = "@@ -1 +1 @@\n-response = requests.get(url, timeout=30)\n+response = requests.get(url, timeout=60)"
+        first_input = one_chunk_review_input(diff)
+        first_input["ci"] = {
+            "check_runs": [{"name": "compile", "status": "completed", "conclusion": "success"}],
+        }
+        second_input = one_chunk_review_input(diff)
+        second_input["ci"] = {
+            "check_runs": [{"name": "compile", "status": "completed", "conclusion": "failure"}],
+        }
+        output_template = {
+            "summary": "ok",
+            "overall_status": "looks_good",
+            "safe_to_publish": True,
+            "findings": [],
+            "model_notes": "",
+        }
+
+        with TemporaryDirectory() as tmp:
+            env["AGENTIC_PR_REVIEW_MODEL_CACHE_DIR"] = str(Path(tmp) / "model-cache")
+            with patch.dict(os.environ, env, clear=True):
+                config = RuntimeConfig.from_env()
+
+            prompts = []
+
+            def fake_invoke(prompt, *_args, **_kwargs):
+                prompts.append(prompt)
+                return dict(output_template)
+
+            reviewer = GatewayClaudeReviewer(config)
+            with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+                reviewer.review_deep(first_input, [], deep_concurrency=1)
+
+            reviewer = GatewayClaudeReviewer(config)
+            with patch.object(reviewer, "_invoke_review", side_effect=fake_invoke):
+                second_output = reviewer.review_deep(second_input, [], deep_concurrency=1)
+
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(second_output["deep_review"]["model_cached_chunk_count"], 1)
+        self.assertEqual(second_output["deep_review"]["model_metrics"]["packet_cache_hits"], 1)
 
     def test_deep_review_checkpoint_counts_subchunks_separately(self):
         chunks = [{"id": "one.py:1", "path": "one.py"}]
