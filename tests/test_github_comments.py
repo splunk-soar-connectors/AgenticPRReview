@@ -984,6 +984,331 @@ class GitHubCommentsTest(unittest.TestCase):
         self.assertEqual(comment["anchor_validation_status"], "exact_changed_line")
         self.assertIn("Changed line (connector.py:70): `result = client.get_user(user_id)`", comment["body"])
 
+    def test_read_only_json_property_is_selected_instead_of_action_identifier(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -2075,0 +2075,6 @@\n"
+                        "+  \"identifier\": \"get_child_pages\",\n"
+                        "+  \"name\": \"get child pages\",\n"
+                        "+  \"type\": \"investigate\",\n"
+                        "+  \"read_only\": false,\n"
+                        "+  \"parameters\": []\n"
+                        "+}\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "Investigate action is marked non-read-only",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 2075,
+                    "code_reference": "get_child_pages.read_only",
+                    "evidence": "The new get_child_pages action sets `read_only: false`, which makes an investigative action appear write-capable.",
+                    "changed_line_evidence": "`\"read_only\": false` is the changed field that creates the metadata issue.",
+                    "why_it_matters": "SOAR users and playbooks may treat the action as mutating state.",
+                    "suggested_fix": "Set `read_only` to true for this investigate action.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "app.json")
+        self.assertEqual(comment["line"], 2078)
+        self.assertIn("Changed line (app.json:2078): `\"read_only\": false,`", comment["body"])
+
+    def test_stale_current_app_version_finding_is_rejected_before_publication(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": '@@ -1,1 +1,1 @@\n-  "app_version": "3.0.5"\n+  "app_version": "3.1.0"\n',
+                }
+            ],
+            "full_files": {"app.json": '{\n  "app_version": "3.1.0"\n}\n'},
+            "base_files": {"app.json": '{\n  "app_version": "3.0.5"\n}\n'},
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "stale-version",
+                    "title": "Release notes version does not match app metadata",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 2,
+                    "evidence": "app.json currently contains app_version 3.0.6 while the release notes are 3.1.0.",
+                    "why_it_matters": "The packaged app version can diverge from release notes.",
+                    "suggested_fix": "Set app_version to 3.1.0.",
+                    "suggested_code": '"app_version": "3.1.0"',
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        diagnostic = plan["finding_verification"]["diagnostics"][0]
+        self.assertEqual(diagnostic["verification_result"], "rejected")
+        self.assertEqual(diagnostic["rejection_reason"], "current_value_contradicts_head")
+
+    def test_noop_suggested_change_is_not_published(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -10,0 +10,1 @@\n+timeout = 30\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "noop-suggestion",
+                    "title": "Timeout value should be reviewed",
+                    "category": "validation",
+                    "severity": "medium",
+                    "file": "connector.py",
+                    "line": 10,
+                    "evidence": "The added timeout value needs to match the connector convention.",
+                    "why_it_matters": "An incorrect timeout can make actions fail too quickly or hang too long.",
+                    "suggested_fix": "Use the connector-standard timeout.",
+                    "suggested_code": "timeout = 30",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertNotIn("```suggestion", comment["body"])
+        self.assertEqual(plan["finding_verification"]["diagnostics"][0]["suggestion_validation_result"], "invalid_noop_suggestion")
+
+    def test_missing_handler_mapping_claim_is_rejected_against_complete_head_file(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -200,0 +200,2 @@\n"
+                        "+def _handle_get_child_pages(self, param):\n"
+                        "+    return self._get_child_pages(param)\n"
+                    ),
+                }
+            ],
+            "full_files": {
+                "connector.py": (
+                    "class Connector:\n"
+                    "    def handle_action(self, param):\n"
+                    "        action_mapping = {\n"
+                    "            'get_child_pages': self._handle_get_child_pages,\n"
+                    "            'create_attachment': self._handle_create_attachment,\n"
+                    "        }\n"
+                    "        return action_mapping[self.get_action_identifier()](param)\n"
+                    "    def _handle_get_child_pages(self, param):\n"
+                    "        return self._get_child_pages(param)\n"
+                )
+            },
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "missing-map",
+                    "title": "New handler is not registered",
+                    "category": "validation",
+                    "severity": "high",
+                    "file": "connector.py",
+                    "line": 200,
+                    "code_reference": "get_child_pages action_mapping",
+                    "evidence": "`get_child_pages` is missing from `handle_action.action_mapping`, so the handler is unreachable.",
+                    "why_it_matters": "The action would fail at runtime.",
+                    "suggested_fix": "Register `get_child_pages` in action_mapping.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertEqual(
+            plan["finding_verification"]["diagnostics"][0]["rejection_reason"],
+            "negative_claim_contradicted_by_head_action_mapping",
+        )
+
+    def test_indirect_python_version_compatibility_claim_is_downgraded(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": '@@ -5,1 +5,1 @@\n-  "python_version": "3.9, 3.13"\n+  "python_version": "3.13"\n',
+                }
+            ],
+            "full_files": {
+                "pyproject.toml": '[tool.ruff]\ntarget-version = "py39"\n',
+                "app.json": '{\n  "python_version": "3.13"\n}\n',
+            },
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "py39-claim",
+                    "title": "Removing Python 3.9 support is a breaking regression",
+                    "category": "soar_metadata",
+                    "severity": "high",
+                    "confidence": "high",
+                    "publication_destination": "inline_blocking",
+                    "file": "app.json",
+                    "line": 5,
+                    "evidence": "This definitely breaks Python 3.9 users because pyproject.toml still has target-version py39.",
+                    "why_it_matters": "Users on Python 3.9 would be unsupported.",
+                    "suggested_fix": "Restore Python 3.9 in the manifest.",
+                }
+            ]
+        }
+
+        plan = real_build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertEqual(plan["summary_observations"][0]["id"], "py39-claim")
+        self.assertEqual(plan["finding_verification"]["diagnostics"][0]["verification_result"], "downgraded")
+        self.assertEqual(plan["finding_verification"]["diagnostics"][0]["rejection_reason"], "indirect_python_version_evidence")
+
+    def test_quoted_evidence_must_match_actual_head_or_diff_text(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": '@@ -20,0 +20,1 @@\n+  "read_only": true\n',
+                }
+            ],
+            "full_files": {"app.json": '{\n  "read_only": true\n}\n'},
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "bad-quote",
+                    "title": "Read-only metadata is wrong",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 20,
+                    "evidence": "The changed line is `\"read_only\": false`, which marks an investigate action as mutating.",
+                    "why_it_matters": "SOAR may classify the action incorrectly.",
+                    "suggested_fix": "Set read_only to true.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertEqual(
+            plan["finding_verification"]["diagnostics"][0]["rejection_reason"],
+            "quoted_evidence_not_found_in_head_or_diff",
+        )
+
+    def test_base_head_values_cannot_be_reversed(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "app.json",
+                    "status": "modified",
+                    "patch": '@@ -2,1 +2,1 @@\n-  "app_version": "3.0.5"\n+  "app_version": "3.1.0"\n',
+                }
+            ],
+            "full_files": {"app.json": '{\n  "app_version": "3.1.0"\n}\n'},
+            "base_files": {"app.json": '{\n  "app_version": "3.0.5"\n}\n'},
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "reversed-values",
+                    "title": "Version was downgraded",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "file": "app.json",
+                    "line": 2,
+                    "evidence": "The metadata changed from 3.1.0 to 3.0.5.",
+                    "why_it_matters": "A version downgrade would break release ordering.",
+                    "suggested_fix": "Keep app_version at 3.1.0.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(plan["comments"], [])
+        self.assertEqual(
+            plan["finding_verification"]["diagnostics"][0]["rejection_reason"],
+            "base_head_values_reversed",
+        )
+
+    def test_exact_tls_default_changed_line_publishes_inline(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "status": "modified",
+                    "patch": "@@ -44,0 +44,1 @@\n+self._verify_server_cert = config.get('verify_server_cert', False)\n",
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "tls-default",
+                    "title": "TLS verification defaults to disabled",
+                    "category": "api_auth_correctness",
+                    "severity": "high",
+                    "file": "connector.py",
+                    "line": 44,
+                    "evidence": "The changed line `self._verify_server_cert = config.get('verify_server_cert', False)` defaults TLS verification to disabled.",
+                    "why_it_matters": "External API traffic may skip certificate validation unless users opt in.",
+                    "suggested_fix": "Default verify_server_cert to true and pass the setting to requests.",
+                }
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+        comment = plan["comments"][0]
+
+        self.assertEqual(comment["github_comment_type"], "line")
+        self.assertEqual(comment["path"], "connector.py")
+        self.assertEqual(comment["line"], 44)
+        self.assertIn("Changed line (connector.py:44): `self._verify_server_cert = config.get('verify_server_cert', False)`", comment["body"])
+
     def test_inline_anchor_on_context_line_falls_back_to_file_comment_when_no_changed_line_matches(self):
         review_input = {
             "repo": "owner/repo",
@@ -2297,8 +2622,60 @@ class GitHubCommentsTest(unittest.TestCase):
         plan = build_comment_plan(review_output, review_input)
 
         self.assertEqual(len(plan["comments"]), 1)
-        self.assertIn("Action output and indicator metadata", plan["comments"][0]["title"])
+        self.assertIn("Code emits action_result.data", plan["comments"][0]["title"])
         self.assertIn("Related locations", plan["comments"][0]["body"])
+        self.assertNotIn("indicator metadata", plan["comments"][0]["title"].lower())
+
+    def test_unrelated_metadata_evidence_is_not_merged_into_one_comment(self):
+        review_input = {
+            "repo": "owner/repo",
+            "pr": {"number": 1, "head": {"sha": "abc"}},
+            "changed_files": [
+                {
+                    "filename": "connector.py",
+                    "patch": (
+                        "@@ -10,1 +10,5 @@\n"
+                        "+def _handle_get_child_pages(self, param):\n"
+                        "+    action_result.add_data(response)\n"
+                        "+indicator = param.get('indicator')\n"
+                    ),
+                }
+            ],
+        }
+        review_output = {
+            "findings": [
+                {
+                    "id": "f1",
+                    "title": "get_child_pages emits undeclared output data",
+                    "category": "output_schema_mismatch",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 11,
+                    "evidence": "_handle_get_child_pages calls action_result.add_data(response).",
+                    "why_it_matters": "SOAR playbooks cannot select undeclared outputs.",
+                    "suggested_fix": "Declare output paths for get_child_pages.",
+                },
+                {
+                    "id": "f2",
+                    "title": "Indicator parameter lacks contains metadata",
+                    "category": "soar_metadata",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "file": "connector.py",
+                    "line": 12,
+                    "evidence": "The changed indicator parameter path lacks contains metadata.",
+                    "why_it_matters": "SOAR playbooks cannot classify indicator values.",
+                    "suggested_fix": "Add contains metadata for the indicator parameter.",
+                },
+            ]
+        }
+
+        plan = build_comment_plan(review_output, review_input)
+
+        self.assertEqual(len(plan["comments"]), 2)
+        bodies = "\n".join(comment["body"] for comment in plan["comments"])
+        self.assertNotIn("Action output and indicator metadata", bodies)
 
     def test_group_excludes_medium_confidence_member_before_posting(self):
         review_input = {

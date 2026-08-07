@@ -132,16 +132,23 @@ def build_comment_plan(
             "publish_blocked_reason": "review_output.safe_to_publish is false",
         }
 
-    findings = [
+    candidate_findings = [
         calibrate_finding_for_publication(finding, review_input)
         for finding in findings_for_comments(review_output)
         if isinstance(finding, dict)
     ]
-    findings = [
-        finding
-        for finding in findings
-        if not should_skip_finding_for_pr_context(finding, review_input)
-    ]
+    verification = verify_findings_against_pr_data(candidate_findings, review_input)
+    verification_diagnostics: list[dict[str, Any]] = list(verification["diagnostics"])
+    findings = []
+    for finding in verification["findings"]:
+        context_reason = finding_context_filter_reason(finding, review_input)
+        if context_reason:
+            replace_finding_verification_diagnostic(
+                verification_diagnostics,
+                finding_verification_diagnostic(finding, review_input, context_reason),
+            )
+            continue
+        findings.append(finding)
     findings = group_related_findings_for_comments(findings)
     findings.sort(key=lambda item: SEVERITY_ORDER.get(str(item.get("severity", "medium")), 2))
     summary_high_priority = [
@@ -180,6 +187,7 @@ def build_comment_plan(
             continue
         comment = build_comment_for_finding(finding, review_input, diff_index, pipeline_diff_index=pipeline_diff_index)
         if comment:
+            update_finding_verification_diagnostic(verification_diagnostics, finding, comment)
             comments.append(comment)
 
     return {
@@ -196,6 +204,12 @@ def build_comment_plan(
             "summary_high_priority_count": len(summary_high_priority),
             "summary_observation_count": len(summary_observations),
             "artifact_only_count": len(artifact_only),
+        },
+        "finding_verification": {
+            "candidate_count": len(candidate_findings),
+            "accepted_count": sum(1 for item in verification_diagnostics if item.get("verification_result") in {"accepted", "downgraded"}),
+            "rejected_count": sum(1 for item in verification_diagnostics if item.get("verification_result") == "rejected"),
+            "diagnostics": verification_diagnostics[:200],
         },
     }
 
@@ -263,6 +277,559 @@ def findings_for_comments(review_output: dict[str, Any]) -> list[dict[str, Any]]
         findings.append(finding)
         existing_keys.add(key)
     return findings
+
+
+def verify_findings_against_pr_data(findings: list[dict[str, Any]], review_input: dict[str, Any]) -> dict[str, Any]:
+    verified: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for finding in findings:
+        diagnostic = verify_single_finding_against_pr_data(finding, review_input)
+        diagnostics.append(diagnostic)
+        if diagnostic.get("verification_result") == "rejected":
+            continue
+        output_finding = dict(finding)
+        if diagnostic.get("suggestion_validation_result") != "valid":
+            output_finding["suggested_code"] = None
+        if diagnostic.get("verification_result") == "downgraded":
+            output_finding["confidence"] = "medium"
+            output_finding["confidence_score"] = min(float(output_finding.get("confidence_score") or 0.74), 0.74)
+            output_finding["merge_blocking"] = False
+            if str(output_finding.get("publication_destination") or "") in INLINE_PUBLICATION_DESTINATIONS:
+                output_finding["publication_destination"] = "summary_observation"
+            output_finding["finding_category"] = "maintainability_suggestion"
+        verified.append(output_finding)
+    return {"findings": verified, "diagnostics": diagnostics}
+
+
+def verify_single_finding_against_pr_data(finding: dict[str, Any], review_input: dict[str, Any]) -> dict[str, Any]:
+    diff_index = build_diff_index(review_input.get("changed_files", []))
+    path = str(finding.get("file") or "").strip()
+    line = normalize_line(finding.get("line"))
+    head_text = head_text_for_path(review_input, path)
+    base_text = base_text_for_path(review_input, path)
+    best_anchor = best_added_anchor_for_finding(finding, diff_index, preferred_path=path or None)
+    resolved_diff_line = f"{best_anchor.get('path')}:{best_anchor.get('line')}" if best_anchor else ""
+    resolved_head_text = head_line_text(review_input, path, line) if path and line else ""
+    resolved_base_text = base_line_text(review_input, path, line) if path and line else ""
+    diagnostic = {
+        "model_finding_id": finding.get("id"),
+        "title": finding.get("title"),
+        "file": path or None,
+        "line": line,
+        "proposed_primary_evidence": proposed_primary_evidence(finding),
+        "verification_result": "accepted",
+        "resolved_head_text": resolved_head_text,
+        "resolved_base_text": resolved_base_text,
+        "resolved_diff_line": resolved_diff_line,
+        "chosen_github_anchor": None,
+        "publication_target": None,
+        "rejection_reason": None,
+        "suggestion_validation_result": "not_provided",
+    }
+
+    rejection = deterministic_rejection_reason(finding, review_input, diff_index, head_text=head_text, base_text=base_text)
+    if rejection:
+        diagnostic["verification_result"] = "rejected"
+        diagnostic["rejection_reason"] = rejection
+        return diagnostic
+
+    suggestion_result = suggested_change_validation_result(finding, review_input, best_anchor=best_anchor)
+    diagnostic["suggestion_validation_result"] = suggestion_result
+
+    downgrade = deterministic_downgrade_reason(finding, review_input)
+    if downgrade:
+        diagnostic["verification_result"] = "downgraded"
+        diagnostic["rejection_reason"] = downgrade
+    return diagnostic
+
+
+def finding_verification_diagnostic(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+    reason: dict[str, str],
+) -> dict[str, Any]:
+    path = str(finding.get("file") or "").strip()
+    line = normalize_line(finding.get("line"))
+    return {
+        "model_finding_id": finding.get("id"),
+        "title": finding.get("title"),
+        "file": path or None,
+        "line": line,
+        "proposed_primary_evidence": proposed_primary_evidence(finding),
+        "verification_result": "rejected",
+        "resolved_head_text": head_line_text(review_input, path, line) if path and line else "",
+        "resolved_base_text": base_line_text(review_input, path, line) if path and line else "",
+        "resolved_diff_line": None,
+        "chosen_github_anchor": None,
+        "publication_target": None,
+        "rejection_reason": reason.get("reason"),
+        "suggestion_validation_result": "not_checked",
+        "detail": reason.get("detail"),
+        "evidence_source": reason.get("evidence_source"),
+    }
+
+
+def update_finding_verification_diagnostic(
+    diagnostics: list[dict[str, Any]],
+    finding: dict[str, Any],
+    comment: dict[str, Any],
+) -> None:
+    finding_id = finding.get("id")
+    for diagnostic in diagnostics:
+        if diagnostic.get("model_finding_id") != finding_id:
+            continue
+        if comment.get("github_comment_type") == "line":
+            diagnostic["chosen_github_anchor"] = f"{comment.get('path')}:{comment.get('line')}"
+        elif comment.get("path"):
+            diagnostic["chosen_github_anchor"] = str(comment.get("path"))
+        else:
+            diagnostic["chosen_github_anchor"] = "conversation"
+        diagnostic["publication_target"] = comment.get("github_comment_type")
+        diagnostic["anchor_validation_status"] = comment.get("anchor_validation_status")
+        diagnostic["anchor_text"] = comment.get("anchor_text")
+        return
+
+
+def replace_finding_verification_diagnostic(
+    diagnostics: list[dict[str, Any]],
+    replacement: dict[str, Any],
+) -> None:
+    finding_id = replacement.get("model_finding_id")
+    for index, diagnostic in enumerate(diagnostics):
+        if diagnostic.get("model_finding_id") == finding_id:
+            diagnostics[index] = replacement
+            return
+    diagnostics.append(replacement)
+
+
+def deterministic_rejection_reason(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    head_text: str,
+    base_text: str,
+) -> str | None:
+    path = str(finding.get("file") or "").strip()
+    category = str(finding.get("category") or "")
+    if (
+        path
+        and category not in {"ci_pipeline_failure", "merge_conflict", "docs_pr_accuracy", "missing_tests", "precommit"}
+        and not cited_file_exists(review_input, path)
+    ):
+        return "cited_file_missing_from_head_context"
+    reason = quoted_changed_evidence_rejection_reason(finding, review_input, diff_index, head_text=head_text)
+    if reason:
+        return reason
+    reason = base_head_value_rejection_reason(finding, head_text=head_text, base_text=base_text)
+    if reason:
+        return reason
+    reason = stale_current_value_rejection_reason(finding, review_input, head_text=head_text, base_text=base_text)
+    if reason:
+        return reason
+    reason = negative_claim_rejection_reason(finding, review_input)
+    if reason:
+        return reason
+    return None
+
+
+def deterministic_downgrade_reason(finding: dict[str, Any], review_input: dict[str, Any]) -> str | None:
+    text = all_comment_finding_text(finding)
+    if is_indirect_python_version_compatibility_claim(text):
+        return "indirect_python_version_evidence"
+    return None
+
+
+def proposed_primary_evidence(finding: dict[str, Any]) -> str:
+    for key in ("offending_code", "changed_line_evidence", "primary_evidence", "evidence", "code_reference"):
+        text = str(finding.get(key) or "").strip()
+        if text:
+            return clamp_text(text, 300)
+    return ""
+
+
+def cited_file_exists(review_input: dict[str, Any], path: str) -> bool:
+    if path in (review_input.get("full_files") or {}):
+        return True
+    if path in (review_input.get("base_files") or {}):
+        return True
+    return any(str(item.get("filename") or "") == path for item in review_input.get("changed_files", []) or [] if isinstance(item, dict))
+
+
+def head_text_for_path(review_input: dict[str, Any], path: str) -> str:
+    if not path:
+        return ""
+    full_files = review_input.get("full_files") or {}
+    if path in full_files:
+        return str(full_files.get(path) or "")
+    for item in review_input.get("changed_files", []) or []:
+        if isinstance(item, dict) and str(item.get("filename") or "") == path:
+            return head_text_from_patch(str(item.get("patch") or ""))
+    return ""
+
+
+def base_text_for_path(review_input: dict[str, Any], path: str) -> str:
+    if not path:
+        return ""
+    base_files = review_input.get("base_files") or {}
+    if path in base_files:
+        return str(base_files.get(path) or "")
+    for item in review_input.get("changed_files", []) or []:
+        if isinstance(item, dict) and str(item.get("filename") or "") == path:
+            return base_text_from_patch(str(item.get("patch") or ""))
+    return ""
+
+
+def head_text_from_patch(patch: str) -> str:
+    lines = []
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@") or raw_line.startswith("+++") or raw_line.startswith("---"):
+            continue
+        if raw_line.startswith("+") or raw_line.startswith(" "):
+            lines.append(raw_line[1:])
+    return "\n".join(lines)
+
+
+def base_text_from_patch(patch: str) -> str:
+    lines = []
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@") or raw_line.startswith("+++") or raw_line.startswith("---"):
+            continue
+        if raw_line.startswith("-") or raw_line.startswith(" "):
+            lines.append(raw_line[1:])
+    return "\n".join(lines)
+
+
+def head_line_text(review_input: dict[str, Any], path: str, line: int | None) -> str:
+    if not path or line is None:
+        return ""
+    text = head_text_for_path(review_input, path)
+    lines = text.splitlines()
+    if 1 <= line <= len(lines):
+        return lines[line - 1]
+    diff_index = build_diff_index(review_input.get("changed_files", []), include_review_excluded_paths=True)
+    entry = entry_for_line(diff_index.get(path) or {}, line)
+    return str((entry or {}).get("text") or "")
+
+
+def base_line_text(review_input: dict[str, Any], path: str, line: int | None) -> str:
+    if not path or line is None:
+        return ""
+    text = base_text_for_path(review_input, path)
+    lines = text.splitlines()
+    if 1 <= line <= len(lines):
+        return lines[line - 1]
+    return ""
+
+
+def quoted_changed_evidence_rejection_reason(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+    diff_index: dict[str, dict[str, Any]],
+    *,
+    head_text: str,
+) -> str | None:
+    path = str(finding.get("file") or "").strip()
+    changed_text = changed_diff_text(diff_index, path=path)
+    search_text = "\n".join([head_text, changed_text]).lower()
+    for fragment in quoted_code_evidence_fragments(finding):
+        if normalized_fragment(fragment) not in normalized_fragment(search_text):
+            return "quoted_evidence_not_found_in_head_or_diff"
+    for explicit_path, line in explicit_evidence_line_anchors(finding, diff_index, preferred_path=path or None):
+        entry = entry_for_line(diff_index.get(explicit_path) or {}, line)
+        if not entry or entry.get("kind") != "added":
+            return "explicit_evidence_line_not_changed"
+    return None
+
+
+def changed_diff_text(diff_index: dict[str, dict[str, Any]], *, path: str) -> str:
+    pieces = []
+    for item_path, info in diff_index.items():
+        if path and item_path != path:
+            continue
+        for entry in info.get("right_entries", []):
+            if entry.get("kind") == "added":
+                pieces.append(str(entry.get("text") or ""))
+    return "\n".join(pieces)
+
+
+def quoted_code_evidence_fragments(finding: dict[str, Any]) -> list[str]:
+    fragments: list[str] = []
+    for key in ("offending_code", "primary_evidence"):
+        text = str(finding.get(key) or "")
+        if text and "`" not in text and code_fragment_requires_exact_match(text):
+            fragments.append(text.strip())
+    for key in ("changed_line_evidence", "primary_evidence", "evidence"):
+        text = str(finding.get(key) or "")
+        if key == "evidence" and "changed line" not in text.lower():
+            continue
+        for match in re.findall(r"`([^`]{2,220})`", text):
+            if "..." in match:
+                continue
+            if quoted_fragment_is_absent_evidence(text, match):
+                continue
+            if code_fragment_requires_exact_match(match):
+                fragments.append(match.strip())
+    return dedupe_text(fragments)[:12]
+
+
+def quoted_fragment_is_absent_evidence(text: str, fragment: str) -> bool:
+    escaped = re.escape(f"`{fragment}`")
+    match = re.search(escaped, text)
+    if not match:
+        return False
+    window = text[max(0, match.start() - 80) : match.start()].lower()
+    return any(term in window for term in ("without", "missing", "absent", "does not include", "lacks", "no "))
+
+
+def code_fragment_requires_exact_match(fragment: str) -> bool:
+    stripped = fragment.strip()
+    if not stripped or len(stripped) < 4:
+        return False
+    if stripped.startswith(("action_result.data.", "action_result.summary.")):
+        return False
+    return any(char in stripped for char in ('"', "'", "=", ":", "(", ")", "[", "]", "{", "}"))
+
+
+def normalized_fragment(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def base_head_value_rejection_reason(finding: dict[str, Any], *, head_text: str, base_text: str) -> str | None:
+    text = all_comment_finding_text(finding)
+    version_match = re.search(
+        r"changed\s+from\s+`?(?P<old>\d+\.\d+\.\d+(?:[-+._a-zA-Z0-9]*)?)`?\s+to\s+`?(?P<new>\d+\.\d+\.\d+(?:[-+._a-zA-Z0-9]*)?)`?",
+        text,
+    )
+    if version_match:
+        old_version = version_match.group("old").rstrip(".,;")
+        new_version = version_match.group("new").rstrip(".,;")
+        if old_version in head_text and new_version in base_text:
+            return "base_head_values_reversed"
+        if old_version not in base_text and new_version not in head_text:
+            return "base_head_values_not_verified"
+        return None
+    match = re.search(r"changed\s+from\s+`?(?P<old>[^`.\n]+?)`?\s+to\s+`?(?P<new>[^`.\n]+?)`?(?:[\s.]|$)", text)
+    if not match:
+        return None
+    old_value = match.group("old").strip().strip('"')
+    new_value = match.group("new").strip().strip('"')
+    if not old_value or not new_value:
+        return None
+    if old_value in head_text and new_value in base_text:
+        return "base_head_values_reversed"
+    if old_value not in base_text and new_value not in head_text:
+        return "base_head_values_not_verified"
+    return None
+
+
+def stale_current_value_rejection_reason(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+    *,
+    head_text: str,
+    base_text: str,
+) -> str | None:
+    text = all_comment_finding_text(finding)
+    if "app_version" not in text:
+        return None
+    head_version = json_field_string_value(head_text, "app_version") or changed_json_field_value(review_input, "app_version")
+    base_version = json_field_string_value(base_text, "app_version")
+    if not head_version:
+        return None
+    versions = version_literals(text)
+    contradicted = [version for version in versions if version not in {head_version, base_version}]
+    if contradicted and any(term in text for term in ("currently", "contains", "is still", "remains", "set to")):
+        return "current_value_contradicts_head"
+    suggested = normalize_suggested_code(finding.get("suggested_code"))
+    if suggested and head_version in suggested and suggestion_matches_existing_head_line(suggested, head_text):
+        return "suggested_change_is_noop_against_head"
+    return None
+
+
+def json_field_string_value(text: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"(?P<value>[^"]+)"', text)
+    return match.group("value") if match else ""
+
+
+def changed_json_field_value(review_input: dict[str, Any], field: str) -> str:
+    for item in review_input.get("changed_files", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for entry in parse_right_side_diff_entries(str(item.get("patch") or "")):
+            if entry.get("kind") != "added":
+                continue
+            value = json_field_string_value(str(entry.get("text") or ""), field)
+            if value:
+                return value
+    return ""
+
+
+def version_literals(text: str) -> list[str]:
+    return dedupe_text(re.findall(r"\b\d+\.\d+\.\d+(?:[-+._a-zA-Z0-9]*)?\b", text))
+
+
+def suggestion_matches_existing_head_line(suggestion: str, head_text: str) -> bool:
+    normalized = normalized_code_line(suggestion)
+    return any(normalized_code_line(line) == normalized for line in head_text.splitlines())
+
+
+def normalized_code_line(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip())
+
+
+def negative_claim_rejection_reason(finding: dict[str, Any], review_input: dict[str, Any]) -> str | None:
+    text = all_comment_finding_text(finding)
+    if not has_negative_claim(text):
+        return None
+    if action_mapping_claim_contradicted(finding, review_input, text):
+        return "negative_claim_contradicted_by_head_action_mapping"
+    if output_absence_claim_contradicted(finding, review_input, text):
+        return "negative_claim_contradicted_by_head_output_metadata"
+    if missing_tests_claim_contradicted(finding, review_input, text):
+        return "negative_claim_contradicted_by_head_tests"
+    return None
+
+
+def has_negative_claim(text: str) -> bool:
+    return any(
+        phrase in text
+        for phrase in (
+            "missing",
+            "absent",
+            "not registered",
+            "not declared",
+            "never called",
+            "no validation",
+            "no tests",
+            "no output",
+            "unsupported",
+            "unreachable",
+            "does not declare",
+            "is not in",
+        )
+    )
+
+
+def action_mapping_claim_contradicted(finding: dict[str, Any], review_input: dict[str, Any], text: str) -> bool:
+    if "action_mapping" not in text and "not registered" not in text and "unreachable" not in text:
+        return False
+    symbols = candidate_symbols_for_negative_claim(finding)
+    if not symbols:
+        return False
+    head_blobs = relevant_head_texts(review_input, suffixes=(".py",))
+    for symbol in symbols:
+        mapping_patterns = (
+            rf'["\']{re.escape(symbol)}["\']\s*:',
+            rf'action_mapping[\s\S]{{0,3000}}["\']{re.escape(symbol)}["\']',
+        )
+        if any(re.search(pattern, blob) for blob in head_blobs for pattern in mapping_patterns):
+            return True
+    return False
+
+
+def output_absence_claim_contradicted(finding: dict[str, Any], review_input: dict[str, Any], text: str) -> bool:
+    if not any(phrase in text for phrase in ("no output", "not declared", "does not declare", "missing output")):
+        return False
+    symbols = candidate_symbols_for_negative_claim(finding)
+    if not symbols:
+        return False
+    head_blobs = relevant_head_texts(review_input, suffixes=(".json",))
+    return any(symbol in blob for symbol in symbols for blob in head_blobs)
+
+
+def missing_tests_claim_contradicted(finding: dict[str, Any], review_input: dict[str, Any], text: str) -> bool:
+    if "no tests" not in text and "missing tests" not in text:
+        return False
+    symbols = candidate_symbols_for_negative_claim(finding)
+    if not symbols:
+        return False
+    test_blobs = [
+        text
+        for path, text in all_head_files(review_input).items()
+        if "test" in path.lower() or path.startswith("tests/")
+    ]
+    return any(symbol in blob for symbol in symbols for blob in test_blobs)
+
+
+def candidate_symbols_for_negative_claim(finding: dict[str, Any]) -> list[str]:
+    terms = []
+    for key in ("offending_code", "code_reference", "evidence", "changed_line_evidence", "title"):
+        text = str(finding.get(key) or "")
+        terms.extend(match for match in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", text))
+        terms.extend(match for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", text) if "_" in match)
+    blocked = {
+        "action_mapping",
+        "action_result",
+        "current_head",
+        "suggested_fix",
+        "code_reference",
+        "app_version",
+        "read_only",
+        "data_type",
+    }
+    return [term for term in dedupe_text(terms)[:20] if term not in blocked]
+
+
+def relevant_head_texts(review_input: dict[str, Any], *, suffixes: tuple[str, ...]) -> list[str]:
+    return [
+        text
+        for path, text in all_head_files(review_input).items()
+        if path.endswith(suffixes)
+    ]
+
+
+def all_head_files(review_input: dict[str, Any]) -> dict[str, str]:
+    files = {str(path): str(text or "") for path, text in (review_input.get("full_files") or {}).items()}
+    for item in review_input.get("changed_files", []) or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("filename") or "")
+        if path and path not in files:
+            files[path] = head_text_from_patch(str(item.get("patch") or ""))
+    return files
+
+
+def incoherent_evidence_rejection_reason(finding: dict[str, Any]) -> str | None:
+    text = all_comment_finding_text(finding)
+    domains = concern_domains_for_text(text)
+    if len(domains) >= 3:
+        return "multiple_unrelated_evidence_domains"
+    return None
+
+
+def is_indirect_python_version_compatibility_claim(text: str) -> bool:
+    if not any(term in text for term in ("python 3.9", "py39", "python_version")):
+        return False
+    if "pyproject.toml" not in text and "target" not in text:
+        return False
+    definitive = ("definitely", "breaking regression", "will break", "unsupported", "cannot run")
+    return any(term in text for term in definitive)
+
+
+def suggested_change_validation_result(
+    finding: dict[str, Any],
+    review_input: dict[str, Any],
+    *,
+    best_anchor: dict[str, Any] | None,
+) -> str:
+    suggestion = normalize_suggested_code(finding.get("suggested_code"))
+    if not suggestion:
+        return "not_provided"
+    if "\n" in suggestion.strip():
+        return "invalid_multiline_suggestion"
+    anchor_text = str((best_anchor or {}).get("anchor_text") or "")
+    if not anchor_text:
+        path = str(finding.get("file") or "").strip()
+        line = normalize_line(finding.get("line"))
+        anchor_text = head_line_text(review_input, path, line)
+    if not anchor_text:
+        return "invalid_no_verified_target_line"
+    if normalized_code_line(suggestion) == normalized_code_line(anchor_text):
+        return "invalid_noop_suggestion"
+    if not suggestion_is_safe_for_anchor(suggestion, anchor_text):
+        return "invalid_suggestion_does_not_match_anchor"
+    return "valid"
 
 
 def calibrate_finding_for_publication(finding: dict[str, Any], review_input: dict[str, Any]) -> dict[str, Any]:
@@ -679,6 +1246,9 @@ def group_related_findings_for_comments(findings: list[dict[str, Any]]) -> list[
         if str(finding.get("category") or "") == "ci_pipeline_failure":
             passthrough.append(finding)
             continue
+        if str(finding.get("publication_destination") or "") in SUMMARY_PUBLICATION_DESTINATIONS or str(finding.get("publication_destination") or "") == "artifact_only":
+            passthrough.append(finding)
+            continue
         if str(finding.get("severity") or "").lower() == "low":
             continue
         if not has_publishable_confidence(finding):
@@ -722,11 +1292,11 @@ def comment_group_key(finding: dict[str, Any]) -> str | None:
         or "no action_result.data" in text
         or "data.* output" in text
     ):
-        return "action_metadata_contract"
+        return f"same:{category}:{title.strip()}:{file_path}"
     if "indicator action parameters" in text and "contains" in text:
-        return "action_metadata_contract"
+        return None
     if category == "output_schema_mismatch" and "summary" in text and "action_result.data" not in text and ("app json" in text or "output" in text):
-        return "action_metadata_contract"
+        return f"same:{category}:{title.strip()}:{file_path}"
     if (
         "custom view" in text
         and ("actionresult" in text or "action result" in text or "handler" in text)
@@ -963,6 +1533,10 @@ def all_comment_finding_text(finding: dict[str, Any]) -> str:
             "finding_category",
             "file",
             "code_reference",
+            "offending_code",
+            "primary_evidence",
+            "supporting_evidence",
+            "base_evidence",
             "evidence",
             "changed_line_evidence",
             "execution_path",
@@ -2079,6 +2653,10 @@ def evidence_anchor_text(finding: dict[str, Any]) -> str:
         str(finding.get(key) or "")
         for key in (
             "title",
+            "offending_code",
+            "primary_evidence",
+            "supporting_evidence",
+            "base_evidence",
             "evidence",
             "changed_line_evidence",
             "root_cause",
@@ -2087,6 +2665,7 @@ def evidence_anchor_text(finding: dict[str, Any]) -> str:
             "trigger",
             "observable_failure",
             "suggested_fix",
+            "suggested_replacement",
             "category",
         )
     ).lower()
@@ -2094,8 +2673,10 @@ def evidence_anchor_text(finding: dict[str, Any]) -> str:
 
 def exact_anchor_snippets(finding: dict[str, Any]) -> list[str]:
     snippets = []
-    for key in ("changed_line_evidence", "evidence", "code_reference"):
+    for key in ("offending_code", "primary_evidence", "changed_line_evidence", "evidence", "code_reference"):
         text = str(finding.get(key) or "")
+        if key == "offending_code" and text.strip():
+            snippets.append(text.strip())
         snippets.extend(match.strip() for match in re.findall(r"`([^`]{2,160})`", text) if match.strip())
     return dedupe_text(snippets)[:8]
 
@@ -2127,11 +2708,16 @@ def explicit_evidence_line_anchors(
         for key in (
             "evidence",
             "changed_line_evidence",
+            "offending_code",
+            "primary_evidence",
+            "supporting_evidence",
+            "base_evidence",
             "root_cause",
             "code_reference",
             "execution_path",
             "observable_failure",
             "suggested_fix",
+            "suggested_replacement",
         )
     )
     candidates: list[tuple[str, int]] = []
@@ -2712,6 +3298,8 @@ def suggestion_is_safe_for_anchor(suggestion: str, anchor_text: str) -> bool:
         return False
     if "\n" in suggestion.strip():
         return False
+    if normalized_code_line(suggestion) == normalized_code_line(anchor_text):
+        return False
     anchor_tokens = code_replacement_tokens(anchor_text)
     suggestion_tokens = code_replacement_tokens(suggestion)
     if not anchor_tokens or not suggestion_tokens:
@@ -2884,6 +3472,25 @@ def render_comment_plan(plan: dict[str, Any]) -> str:
         lines.append("")
     if plan.get("artifact_only_count"):
         lines.extend(["### Artifact Only", "", f"- `{plan.get('artifact_only_count')}` finding(s) kept out of PR comments.", ""])
+    verification = plan.get("finding_verification") if isinstance(plan.get("finding_verification"), dict) else {}
+    diagnostics = verification.get("diagnostics") or []
+    notable = [
+        item
+        for item in diagnostics
+        if item.get("verification_result") in {"rejected", "downgraded"}
+    ]
+    if notable:
+        lines.extend(["### Finding Verification", ""])
+        for item in notable[:25]:
+            lines.append(
+                "- "
+                f"`{item.get('verification_result')}` "
+                f"`{item.get('model_finding_id')}` "
+                f"{item.get('file') or ''}:{item.get('line') or ''} "
+                f"reason=`{item.get('rejection_reason')}` "
+                f"diff=`{item.get('resolved_diff_line') or ''}`"
+            )
+        lines.append("")
     return redact_text("\n".join(lines).rstrip() + "\n")
 
 

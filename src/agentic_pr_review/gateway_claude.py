@@ -141,6 +141,10 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "line_start": {"type": ["integer", "null"]},
                     "line_end": {"type": ["integer", "null"]},
                     "code_reference": {"type": ["string", "null"]},
+                    "offending_code": {"type": ["string", "null"]},
+                    "primary_evidence": {"type": ["string", "null"]},
+                    "supporting_evidence": {"type": ["string", "null"]},
+                    "base_evidence": {"type": ["string", "null"]},
                     "evidence": {"type": "string"},
                     "changed_line_evidence": {"type": ["string", "null"]},
                     "execution_path": {"type": ["string", "null"]},
@@ -151,6 +155,12 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "why_it_matters": {"type": "string"},
                     "suggested_fix": {"type": "string"},
                     "suggested_code": {"type": ["string", "null"]},
+                    "suggested_replacement": {"type": ["string", "null"]},
+                    "requires_global_verification": {"type": ["boolean", "null"]},
+                    "verification_queries": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                    },
                     "source": {"type": "string"},
                 },
                 "required": [
@@ -169,6 +179,10 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "line_start",
                     "line_end",
                     "code_reference",
+                    "offending_code",
+                    "primary_evidence",
+                    "supporting_evidence",
+                    "base_evidence",
                     "evidence",
                     "changed_line_evidence",
                     "execution_path",
@@ -179,6 +193,9 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "why_it_matters",
                     "suggested_fix",
                     "suggested_code",
+                    "suggested_replacement",
+                    "requires_global_verification",
+                    "verification_queries",
                     "source",
                 ],
             },
@@ -1820,6 +1837,10 @@ def build_json_repair_prompt(previous_response: str) -> str:
         '      "line_start": 123,\n'
         '      "line_end": null,\n'
         '      "code_reference": "reference or null",\n'
+        '      "offending_code": "exact offending fragment or null",\n'
+        '      "primary_evidence": "direct proof or null",\n'
+        '      "supporting_evidence": "related support or null",\n'
+        '      "base_evidence": "base evidence or null",\n'
         '      "evidence": "specific evidence",\n'
         '      "changed_line_evidence": "changed line or null",\n'
         '      "execution_path": "entry point to sink or null",\n'
@@ -1830,6 +1851,9 @@ def build_json_repair_prompt(previous_response: str) -> str:
         '      "why_it_matters": "why this matters",\n'
         '      "suggested_fix": "actionable fix",\n'
         '      "suggested_code": null,\n'
+        '      "suggested_replacement": null,\n'
+        '      "requires_global_verification": false,\n'
+        '      "verification_queries": [],\n'
         '      "source": "claude"\n'
         "    }\n"
         "  ],\n"

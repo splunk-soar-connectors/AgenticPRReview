@@ -218,6 +218,15 @@ Strict output rules:
 - Do not report a finding just because a risky area changed. Report it only
   when the diff, full file, docs, app JSON, comments, or CI excerpts show the
   exact bug or missing artifact.
+- Treat packet context as potentially incomplete. Never infer global absence
+  from one packet; use complete head-file evidence when claiming something is
+  missing, unregistered, undeclared, unsupported, untested, or unreachable.
+- Distinguish direct evidence from circumstantial support. Do not assert runtime
+  behavior unless the relevant code path supports it. Use model_notes for
+  possible concerns when evidence is indirect or ambiguous.
+- One finding must represent one root cause. Do not combine output metadata,
+  indicator metadata, rendering, versioning, TLS, timeout, and tests into a
+  single finding unless they directly prove the same defect.
 - Before returning a finding, verify all of these are true: the issue is
   introduced or modified by this PR, the cited line is the actual source of the
   issue, the failure scenario is supported by code/log evidence, and the
@@ -230,6 +239,10 @@ Strict output rules:
   reviewer will see on GitHub. If multiple changed lines contribute, set `line`
   to the most directly responsible line and mention the remaining changed lines
   in `evidence`.
+- Return the exact offending code fragment in `offending_code` when one exists.
+  Put direct proof in `primary_evidence`; put related schema/docs/config/runtime
+  support in `supporting_evidence`. Do not invent line numbers; application
+  code will resolve the final GitHub anchor from the diff.
 - Clearly separate changed-code evidence from supporting evidence. In
   `evidence`, first state what the changed line does, then separately identify
   supporting schema/docs/config evidence or runtime CI/test evidence.
@@ -404,6 +417,10 @@ Required JSON shape:
       "line_start": 123,
       "line_end": null,
       "code_reference": "function/action/parameter/output path/hook/commit reference when line is null, or null",
+      "offending_code": "exact code fragment responsible for the issue, or null",
+      "primary_evidence": "direct changed-code evidence, or null",
+      "supporting_evidence": "related schema/docs/config/runtime evidence, or null",
+      "base_evidence": "base-version evidence when previous behavior matters, or null",
       "evidence": "specific evidence from code/comment/CI",
       "changed_line_evidence": "the changed line or changed behavior responsible for the issue, or null",
       "execution_path": "runtime path from entry point to sink, or null",
@@ -414,6 +431,9 @@ Required JSON shape:
       "why_it_matters": "why this matters for a SOAR connector",
       "suggested_fix": "actionable fix",
       "suggested_code": "exact replacement code for the GitHub suggestion block, or null",
+      "suggested_replacement": "same as suggested_code when a one-line replacement is safe, or null",
+      "requires_global_verification": false,
+      "verification_queries": ["symbols or paths that must exist/absent in complete head context"],
       "source": "claude"
     }
   ],
